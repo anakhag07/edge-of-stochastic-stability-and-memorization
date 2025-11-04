@@ -202,3 +202,8 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Results
+visualization/
+wandb/
+wandb_checkpoints/
