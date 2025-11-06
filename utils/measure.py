@@ -15,7 +15,7 @@ import time
 import os
 from scipy import stats
 
-__all__ = ['param_vector', 'param_length', 'flatt', 'grads_vector', 
+__all__ = ['compute_train_test_gap_from_tensors','param_vector', 'param_length', 'flatt', 'grads_vector', 
            'calculate_all_the_grads', 'compute_eigenvalues', 'compute_grad_H_grad', 
            'calculate_averaged_lambdamax', 'create_ntk', 
            'compute_fisher_eigenvalues', 'calculate_all_net_grads',
@@ -200,8 +200,6 @@ def calculate_accuracy(predictions, targets):
         # Get the predicted class (sign of the prediction)
         # this is if we have only two classes
         pred_classes = torch.sign(predictions).long()
-
-    
     
     # Check if targets are one-hot encoded or class indices
     if len(targets.shape) > 1 and targets.shape[1] > 1:
@@ -1577,3 +1575,27 @@ def calculate_averaged_lambdamax(net,
     if compute_gHg:
         return sharpnesses, gHg_values
     return sharpnesses
+
+
+################################################################################
+#                                                                              #
+#                                NEW MEMORIZATION METRICS                      #
+#                                                                              #
+################################################################################
+def compute_train_test_gap_from_tensors(net, X_train, Y_train, X_test, Y_test) -> dict:
+    with torch.no_grad():
+        train_logits = net(X_train).squeeze(dim=-1)  # Add this squeeze
+        test_logits  = net(X_test).squeeze(dim=-1)   # Add this squeeze
+
+    train_acc = float(calculate_accuracy(train_logits, Y_train))
+    test_acc = float(calculate_accuracy(test_logits,  Y_test))
+    gap = train_acc - test_acc
+    
+    try:
+        wandb.log({"memorization/train_acc": train_acc, 
+                    "memorization/test_acc": test_acc, "train_test_gap": gap}, commit=False)
+    except Exception:
+        pass
+   
+    return {"train_acc": train_acc, "test_acc": test_acc, "gap": gap}
+
