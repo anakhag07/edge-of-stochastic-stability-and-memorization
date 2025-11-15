@@ -74,6 +74,7 @@ class MeasurementRunner:
         gd_noise,
         proj_switch_step,
         quad_approx,
+        memorization_outlier_frac: float,
     ):
         self.net = net
         self.loss_fn = loss_fn
@@ -92,6 +93,7 @@ class MeasurementRunner:
         self.gd_noise = gd_noise
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
+        self.memorization_outlier_frac = memorization_outlier_frac
 
         self.eigenvalues_log = []
         if 'lmax' in measurements and num_eigenvalues > 1:
@@ -138,6 +140,7 @@ class MeasurementRunner:
             'quadratic_loss_gn': None,
             'proj_grad_ratio': None,
             'hessian_trace': np.nan,
+            'memorization_hessian_outliers': None,
         }
 
         epoch_loss_update = None
@@ -277,6 +280,21 @@ class MeasurementRunner:
                     min_estimates=20,
                     eps=0.01,
                 )
+
+        # ----- Memorization via Hessian outliers -----
+        if 'memorization_hessian_outliers' in self.measurements:
+            if frequency_calculator.should_measure('memorization_hessian_outliers', ctx):
+                optimizer.zero_grad()
+                mem_stats = compute_outlier_vs_bulk_stats_hessian(
+                    net=self.net,
+                    X_train=self.X,
+                    Y_train=self.Y,
+                    loss_fn=self.loss_fn,
+                    optimizer=optimizer,
+                    frac=self.memorization_outlier_frac,
+                )
+                if mem_stats:
+                    metrics.update({f"memorization_hessian_outliers/{k}": v for k, v in mem_stats.items()})
 
 
         # ----- Gradient-noise interaction (GNI) -----
@@ -458,6 +476,7 @@ def train(
             quad_switch_lr: float = None,  # lr to use after switching to quadratic approximation
             precise_plots: bool = False,  # Enable more frequent measurements for precise plotting
             rare_measure: bool = False,  # Make expensive measurements rarer
+            memorization_outlier_frac: float = 0.05,  # Fraction of samples marked as outliers for memorization metric
             # Gradient projection configuration
             proj_switch_step: int = None,  # Step to start projecting minibatch gradients
             proj_top_l: int = None,        # Number of top eigendirections to use for projection
@@ -581,6 +600,7 @@ def train(
         gd_noise=gd_noise,
         proj_switch_step=proj_switch_step,
         quad_approx=quad_approx,
+        memorization_outlier_frac=memorization_outlier_frac,
     )
     # ----- Run Identification -----
     run_id = wandb_run_id or generate_run_id()
@@ -997,6 +1017,8 @@ if __name__ == '__main__':
     parser.add_argument('--one-step-loss-change', action='store_true', help='If set, compute the expected one-step change in loss using Monte Carlo estimation')
     parser.add_argument('--gradient-norm', action='store_true', help='If set, compute the Monte Carlo estimate of squared norm of mini-batch gradients')
     parser.add_argument('--final', action='store_true', help='If set, compute the lambda_max and step sharpness at the end')
+    parser.add_argument('--memorization-hessian-outliers', action='store_true', help='Compute memorization stats based on alignment with top Hessian eigenvector (heavy; runs rarely)')
+    parser.add_argument('--memorization-outlier-frac', type=float, default=0.05, help='Fraction of examples treated as outliers for Hessian-alignment memorization stats')
 
     
     # --- Measurement Flags (Tertiary, aka almost completely useless) ---
@@ -1092,6 +1114,8 @@ if __name__ == '__main__':
 
     if args.steps is not None and args.epochs is not None:
         raise ValueError("You should provide either epochs or steps, not both")
+    if args.memorization_outlier_frac <= 0 or args.memorization_outlier_frac >= 1:
+        raise ValueError("--memorization-outlier-frac must be in (0, 1)")
 
     # Validate gradient projection feature flags and conflicts
     if (args.proj_switch_step is not None) or (args.proj_top_l is not None) or args.proj_to_residual:
@@ -1135,6 +1159,7 @@ if __name__ == '__main__':
     ('final', args.final),
     ('param_distance', args.param_distance),
     ('hessian_trace', args.hessian_trace),
+    ('memorization_hessian_outliers', args.memorization_hessian_outliers),
     ] if enabled}
 
     # ----- Result Storage Setup -----
@@ -1267,6 +1292,7 @@ if __name__ == '__main__':
         use_gauss_newton=args.use_gauss_newton,
         precise_plots=args.precise_plots,
         rare_measure=args.rare_measure,
+        memorization_outlier_frac=args.memorization_outlier_frac,
         proj_switch_step=args.proj_switch_step,
         proj_top_l=args.proj_top_l,
         proj_to_residual=args.proj_to_residual,

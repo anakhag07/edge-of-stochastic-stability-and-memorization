@@ -365,6 +365,14 @@ class FrequencyCalculator:
             tuned centrally later without changing training code.
             """
             return True
+
+        def memorization_hessian_outliers_rule(ctx: MeasurementContext) -> bool:
+            """Frequency rule for Hessian-based memorization outlier detection."""
+            base_freq = 2048 if ctx.batch_size >= 64 else 1024
+            if ctx.precise_plots:
+                base_freq = min(base_freq, 1024)
+            base_freq = _rare_scale(ctx, base_freq, heavy=True)
+            return ctx.step_number == 0 or ctx.step_number % base_freq == 0
         
         # Register all default rules
         self.rules.update({
@@ -386,7 +394,8 @@ class FrequencyCalculator:
             'gradient_norm_squared': gradient_norm_squared_rule,
             'one_step_loss_change': one_step_loss_change_rule,
             'grad_projection': grad_projection_rule,
-            'proj_eigens_refresh': proj_eigens_refresh_rule
+            'proj_eigens_refresh': proj_eigens_refresh_rule,
+            'memorization_hessian_outliers': memorization_hessian_outliers_rule
         })
     
     def should_measure(self, measurement_type: str, ctx: MeasurementContext) -> bool:

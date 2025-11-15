@@ -24,7 +24,8 @@ __all__ = ['compute_train_test_gap_from_tensors','param_vector', 'param_length',
            'EigenvectorCache', 'create_hessian_vector_product', 'compute_multiple_eigenvalues_lobpcg',
            'calculate_gradient_norm_squared_mc', 'calculate_expected_one_step_full_loss_change',
            'calculate_expected_one_step_batch_loss_change', 'compute_gradient_projection_ratios',
-           'estimate_hessian_trace', 'gimme_new_rng', 'gimme_random_subset_idx']
+           'estimate_hessian_trace', 'gimme_new_rng', 'gimme_random_subset_idx',
+           'compute_per_example_losses', 'compute_outlier_vs_bulk_stats_hessian']
 
 
 class EigenvectorCache:
@@ -1599,3 +1600,137 @@ def compute_train_test_gap_from_tensors(net, X_train, Y_train, X_test, Y_test) -
    
     return {"train_acc": train_acc, "test_acc": test_acc, "gap": gap}
 
+
+def compute_per_example_losses(net, X, Y, loss_fn) -> torch.Tensor:
+    """
+    Compute per-example losses for a batch, preserving gradients when supported by the loss_fn.
+    """
+    device = next(net.parameters()).device
+    X = X.to(device)
+    Y = Y.to(device)
+
+    logits = net(X).squeeze(dim=-1)
+
+    losses = None
+
+    # Preferred: explicitly request per-sample losses if the signature supports it
+    try:
+        losses = loss_fn(logits, Y, reduction="none")
+    except (TypeError, ValueError):
+        losses = None
+
+    # Fallback: temporarily flip the reduction attribute if present
+    if losses is None and hasattr(loss_fn, "reduction"):
+        original_reduction = loss_fn.reduction
+        try:
+            loss_fn.reduction = "none"
+            losses = loss_fn(logits, Y)
+        except Exception:
+            losses = None
+        finally:
+            loss_fn.reduction = original_reduction
+
+    # Last resort: loop over samples
+    if losses is None:
+        losses_list = []
+        for x_i, y_i in zip(X, Y):
+            loss_i = loss_fn(
+                net(x_i.unsqueeze(0)).squeeze(dim=-1),
+                y_i.unsqueeze(0),
+            )
+            loss_i = loss_i.view(-1)[0] if loss_i.numel() == 1 else loss_i
+            losses_list.append(loss_i)
+        losses = torch.stack(losses_list)
+
+    return losses.view(-1)
+
+
+def compute_outlier_vs_bulk_stats_hessian(
+    net,
+    X_train,
+    Y_train,
+    loss_fn,
+    optimizer,
+    frac: float = 0.05,
+) -> dict:
+    """
+    Identify outlier examples by alignment with the top Hessian eigenvector and
+    report summary statistics for outliers vs the remaining bulk.
+    """
+    device = next(net.parameters()).device
+    X_train = X_train.to(device)
+    Y_train = Y_train.to(device)
+
+    preds_full = net(X_train).squeeze(dim=-1)
+    loss_full = loss_fn(preds_full, Y_train)
+
+    lambdamax, v = compute_eigenvalues(
+        loss_full,
+        net,
+        k=1,
+        max_iterations=100,
+        reltol=1e-2,
+        eigenvector_cache=None,
+        return_eigenvectors=True,
+    )
+    v = v.detach()
+
+    grads = calculate_all_the_grads(
+        net,
+        X_train,
+        Y_train,
+        loss_fn,
+        optimizer,
+        storage_device="cpu",
+    )
+    grads = grads.to(device)
+
+    scores = grads @ v
+    abs_scores = scores.abs()
+    N = abs_scores.shape[0]
+    k = max(1, int(frac * N))
+    threshold = torch.topk(abs_scores, k=k, largest=True).values.min()
+    outlier_mask = abs_scores >= threshold
+    bulk_mask = ~outlier_mask
+
+    if outlier_mask.sum().item() == 0 or bulk_mask.sum().item() == 0:
+        return {}
+
+    losses = compute_per_example_losses(net, X_train, Y_train, loss_fn)
+
+    with torch.no_grad():
+        logits = net(X_train).squeeze(dim=-1)
+        train_acc = calculate_accuracy(logits, Y_train)
+
+    out_idx = outlier_mask.nonzero(as_tuple=False).view(-1)
+    bulk_idx = bulk_mask.nonzero(as_tuple=False).view(-1)
+
+    out_losses = losses[out_idx]
+    bulk_losses = losses[bulk_idx]
+
+    with torch.no_grad():
+        out_acc = calculate_accuracy(logits[out_idx], Y_train[out_idx])
+        bulk_acc = calculate_accuracy(logits[bulk_idx], Y_train[bulk_idx])
+
+    metrics = {
+        "outliers/fraction": float(frac),
+        "outliers/count": int(len(out_idx)),
+        "outliers/mean_loss": float(out_losses.mean().item()),
+        "outliers/mean_alignment": float(abs_scores[out_idx].mean().item()),
+        "outliers/accuracy": float(out_acc),
+        "bulk/mean_loss": float(bulk_losses.mean().item()),
+        "bulk/mean_alignment": float(abs_scores[bulk_idx].mean().item()),
+        "bulk/accuracy": float(bulk_acc),
+        "train/accuracy": float(train_acc),
+        "hessian/lambdamax": float(lambdamax.item()),
+    }
+
+    try:
+        wandb.log(
+            {f"memorization_hessian_outliers/{key}": val for key, val in metrics.items()},
+            commit=False,
+        )
+    except Exception:
+        pass
+
+    return metrics

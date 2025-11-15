@@ -106,7 +106,17 @@ def init_wandb(args, step_to_start):
         "step_sharpness","batch_sharpn","grad_H_grad","batch_fisher_eigenval",
         "total_fisher_eigenval","sharpness_static","GNI","accuracy",
         "hessian_trace",
-        "param_distance","gradient_norm_squared","quadratic_loss_gn","proj_grad_ratio"
+        "param_distance","gradient_norm_squared","quadratic_loss_gn","proj_grad_ratio",
+        "memorization_hessian_outliers/outliers/mean_loss",
+        "memorization_hessian_outliers/outliers/mean_alignment",
+        "memorization_hessian_outliers/outliers/accuracy",
+        "memorization_hessian_outliers/bulk/mean_loss",
+        "memorization_hessian_outliers/bulk/mean_alignment",
+        "memorization_hessian_outliers/bulk/accuracy",
+        "memorization_hessian_outliers/train/accuracy",
+        "memorization_hessian_outliers/hessian/lambdamax",
+        "memorization_hessian_outliers/outliers/fraction",
+        "memorization_hessian_outliers/outliers/count",
     ]:
         wandb.define_metric(m, step_metric="step")
 
