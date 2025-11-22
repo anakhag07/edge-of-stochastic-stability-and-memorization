@@ -13,6 +13,11 @@ import argparse
 
 import time
 
+import imageio.v2 as imageio
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from utils.data import prepare_dataset, get_dataset_presets
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
 from utils.nets import ResNet
@@ -27,8 +32,10 @@ from utils.wandb_utils import (
     is_wandb_available,
     generate_run_id,
 )
+
 from utils.noise import gd_with_noise, GradStorage, sde_integration
 from utils.measure import *
+from utils.measure import compute_train_test_gap_from_tensors
 from utils.frequency import frequency_calculator, MeasurementContext
 from utils.quadratic import QuadraticApproximation, flatten_params, set_model_params, unflatten_params
 
@@ -46,6 +53,90 @@ RES_FOLDER = Path(os.environ.get('RESULTS'))
 
 
 # -------------------------------------
+# NEW: Per-sample histograms setup
+# -------------------------------------
+class PerSampleHistograms:
+    def __init__(self, min_log10, max_log10, bins, metrics):
+        self.min_log10 = min_log10
+        self.max_log10 = max_log10
+        self.bins = bins
+        self.metrics = metrics
+        self.histograms = {metric: np.zeros((bins,)) for metric in metrics}
+        self.counts = {metric: 0 for metric in metrics}
+        self.quantiles = {metric: np.zeros((bins,)) for metric in metrics}
+
+@torch.no_grad()
+def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, device='cuda'):
+    """Return dict of numpy arrays: loss, resid_norm, kappa for dataset (X,Y)."""
+    net.eval()
+    out_loss, out_resid, out_kappa = [], [], []
+    for i in range(0, len(X), batch_size):
+        xb = X[i:i+batch_size].to(device)
+        yb = Y[i:i+batch_size].to(device)
+        z = net(xb)  # logits for CE; prediction for MSE
+        if loss_type == 'ce':
+            # losses per-sample
+            loss = torch.nn.functional.cross_entropy(z, yb, reduction='none')
+            # residual wrt logits: p - y_onehot
+            p = torch.softmax(z, dim=1)
+            y1 = torch.nn.functional.one_hot(yb, num_classes=z.size(1)).float()
+            resid = p - y1                      # dL/dz
+            resid_norm = resid.norm(dim=1)
+            # curvature proxy: Frobenius norm of softmax Hessian
+            # ||diag(p) - p p^T||_F
+            I = torch.eye(p.size(1), device=p.device).unsqueeze(0)   # [1, C, C]
+            Hout = I * p.unsqueeze(2) - p.unsqueeze(2) * p.unsqueeze(1)
+            kappa = torch.linalg.norm(Hout, dim=(1,2))
+        else:
+            # MSE (your SquaredLoss is 0.5*||y - yhat||^2); match that here per-sample
+            if z.ndim == 1 or z.size(-1) == 1:
+                z = z.squeeze(-1)
+            # If Y is class index for 2-class, convert upstream; here assume Y already numeric
+            diff = (z - yb)
+            loss = 0.5*(diff**2)
+            if loss.ndim > 1:
+                loss = loss.sum(dim=1)
+            resid_norm = diff if diff.ndim==1 else diff.norm(dim=1)
+            kappa = torch.ones_like(loss)  # output-space curvature is constant for MSE
+        out_loss.append(loss.detach().cpu())
+        out_resid.append(resid_norm.detach().cpu())
+        out_kappa.append(kappa.detach().cpu())
+    net.train()
+    return {
+        'loss': torch.cat(out_loss).numpy(),
+        'resid': torch.cat(out_resid).numpy(),
+        'kappa': torch.cat(out_kappa).numpy(),
+    }
+
+def _hist_log10(values, bin_edges):
+    v = np.asarray(values)
+    v = np.clip(v, a_min=np.finfo(float).tiny, a_max=None)  # avoid log of 0
+    lv = np.log10(v)
+    counts, _ = np.histogram(lv, bins=bin_edges)
+    return counts
+
+def _quantiles(values, qs=(0.1,0.5,0.9,0.99)):
+    v = np.asarray(values)
+    return np.quantile(v, qs)
+
+def _ensure_dir(p):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def _render_frame(bin_edges, counts_train, counts_test, title, out_png_path):
+    plt.figure(figsize=(6,4))
+    centers = 0.5*(bin_edges[1:]+bin_edges[:-1])
+    plt.step(centers, counts_train, where='mid', label='train', alpha=0.8)
+    plt.step(centers, counts_test, where='mid', label='test', alpha=0.6)
+    plt.yscale('log') # log applied
+    plt.xlabel('log10(value)')
+    plt.ylabel('log10(count)')
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png_path, dpi=140)
+    plt.close()
+
+# -------------------------------------
 # Section: Measurement Runner
 # -------------------------------------
 
@@ -59,6 +150,7 @@ class MeasurementRunner:
         net,
         loss_fn,
         full_inputs,
+        test_inputs = None,
         measurements,
         device,
         batch_size,
@@ -75,10 +167,20 @@ class MeasurementRunner:
         proj_switch_step,
         quad_approx,
         memorization_outlier_frac: float,
+        # NEW:
+        full_inputs_test=None,
+        per_sample_cfg=None,
     ):
         self.net = net
         self.loss_fn = loss_fn
         self.X, self.Y = full_inputs
+
+        # New: Test inputs handling
+        if test_inputs is not None:
+            self.X_test, self.Y_test = test_inputs
+        else:
+            self.X_test, self.Y_test = None, None
+
         self.measurements = measurements
         self.device = device
         self.batch_size = batch_size
@@ -94,6 +196,62 @@ class MeasurementRunner:
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
         self.memorization_outlier_frac = memorization_outlier_frac
+        
+        # NEW: Per-sample config
+        self.full_inputs_test = full_inputs_test
+        self.per_sample_cfg = per_sample_cfg
+        
+        # NEW: Per-sample initialization logic
+        if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
+            self.per_sample_histograms = PerSampleHistograms(
+                min_log10=per_sample_cfg['hist_min_log10'],
+                max_log10=per_sample_cfg['hist_max_log10'],
+                bins=per_sample_cfg['hist_bins'],
+                metrics=per_sample_cfg.get('metrics', per_sample_cfg.get('hist_metrics', ['loss'])))
+            # Initialize bin edges for log10 histogram
+            self.bin_edges = np.linspace(
+                per_sample_cfg['hist_min_log10'],
+                per_sample_cfg['hist_max_log10'],
+                per_sample_cfg['hist_bins'] + 1
+            )
+            # Initialize directories for saving
+            self.ps_dir = save_dir / 'per_sample_histograms'
+            self.frames_dir = self.ps_dir / 'frames'
+            _ensure_dir(self.ps_dir)
+            if not per_sample_cfg.get('no_frames', False):
+                _ensure_dir(self.frames_dir)
+        else:
+            self.per_sample_histograms = None
+            self.bin_edges = None
+            self.ps_dir = None       
+        # NEW: Per-sample config
+        self.full_inputs_test = full_inputs_test
+        self.per_sample_cfg = per_sample_cfg
+        
+        # NEW: Per-sample initialization logic
+        if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
+            self.per_sample_histograms = PerSampleHistograms(
+                min_log10=per_sample_cfg['hist_min_log10'],
+                max_log10=per_sample_cfg['hist_max_log10'],
+                bins=per_sample_cfg['hist_bins'],
+                metrics=per_sample_cfg.get('metrics', per_sample_cfg.get('hist_metrics', ['loss'])))
+            # Initialize bin edges for log10 histogram
+            self.bin_edges = np.linspace(
+                per_sample_cfg['hist_min_log10'],
+                per_sample_cfg['hist_max_log10'],
+                per_sample_cfg['hist_bins'] + 1
+            )
+            # Initialize directories for saving
+            self.ps_dir = save_dir / 'per_sample_histograms'
+            self.frames_dir = self.ps_dir / 'frames'
+            _ensure_dir(self.ps_dir)
+            if not per_sample_cfg.get('no_frames', False):
+                _ensure_dir(self.frames_dir)
+        else:
+            self.per_sample_histograms = None
+            self.bin_edges = None
+            self.ps_dir = None
+            self.frames_dir = None
 
         self.eigenvalues_log = []
         if 'lmax' in measurements and num_eigenvalues > 1:
@@ -141,6 +299,9 @@ class MeasurementRunner:
             'proj_grad_ratio': None,
             'hessian_trace': np.nan,
             'memorization_hessian_outliers': None,
+            'train_acc': np.nan, # NEW
+            'test_acc': np.nan,  # NEW
+            'train_test_gap': np.nan, # NEW
         }
 
         epoch_loss_update = None
@@ -295,6 +456,60 @@ class MeasurementRunner:
                 )
                 if mem_stats:
                     metrics.update({f"memorization_hessian_outliers/{k}": v for k, v in mem_stats.items()})
+        
+        # ----- NEW: Train/Test Gap -----
+        if 'train_test_gap' in self.measurements and self.X_test is not None:
+            if frequency_calculator.should_measure('train_test_gap',ctx):
+                vals = compute_train_test_gap_from_tensors(
+                    self.net, self.X, self.Y, self.X_test, self.Y_test
+                )
+                metrics['train_acc'] = vals['train_acc']
+                metrics['test_acc'] = vals['test_acc']
+                metrics['train_test_gap'] = vals['gap']
+
+        # ----- NEW: Per-sample histograms -----
+        if self.per_sample_cfg and self.per_sample_cfg['enabled']:
+            every = self.per_sample_cfg['every']
+            if step_number % every == 0:
+                loss_type = 'ce' if isinstance(self.loss_fn, nn.CrossEntropyLoss) else 'mse'
+                # train
+                stats_tr = _per_sample_stats(self.net, self.loss_fn, self.X, self.Y, loss_type=loss_type, batch_size=self.batch_size, device=self.device)
+                # test (if present)
+                if (self.X_test is not None) and (len(self.X_test) > 0):
+                    stats_te = _per_sample_stats(self.net, self.loss_fn, self.X_test, self.Y_test, loss_type=loss_type, batch_size=self.batch_size, device=self.device)
+                else:
+                    stats_te = {k: np.zeros_like(v) for k, v in stats_tr.items()}
+
+                # collect metrics
+                for metric in self.per_sample_histograms.metrics:
+                    # Quantiles (log to wandb)
+                    quantiles_tr = _quantiles(stats_tr[metric])
+                    quantiles_te = _quantiles(stats_te[metric])
+                    
+                    for q, name in zip((0.1, 0.5, 0.9, 0.99), ('q10','q50','q90','q99')):
+                        metrics[f'ps_quantiles/{metric}_train_{name}'] = np.quantile(stats_tr[metric], q)
+                        metrics[f'ps_quantiles/{metric}_test_{name}'] = np.quantile(stats_te[metric], q)
+
+                    # Histograms (save to file)
+                    counts_tr = _hist_log10(stats_tr[metric], self.bin_edges)
+                    counts_te = _hist_log10(stats_te[metric], self.bin_edges)
+
+                    # Store for saving to file later
+                    np.savez(
+                        self.ps_dir / f'step_{step_number:05d}_{metric}.npz',
+                        bin_edges=self.bin_edges,
+                        counts_train=counts_tr,
+                        counts_test=counts_te,
+                        quantiles_train=quantiles_tr,
+                        quantiles_test=quantiles_te
+                    )
+
+                    # Render frame
+                    if not self.per_sample_cfg.get('no_frames', False):
+                        title = f'Step {step_number}: log10({metric})'
+                        out_path = self.frames_dir / f'{step_number:05d}_{metric}.png'
+                        _render_frame(self.bin_edges, counts_tr, counts_te, title, out_path)
+
 
 
         # ----- Gradient-noise interaction (GNI) -----
@@ -484,7 +699,8 @@ def train(
             wandb_run=None,
             wandb_enabled: bool = False,
             wandb_run_id: str = None,
-            ):
+            per_sample_cfg=None, #NEW 
+    ):
     
     # -------------------------------------
     # Section: Setup
@@ -505,6 +721,7 @@ def train(
 
     X, Y = X_train, Y_train
 
+
     # ----- Device Alignment -----
     net = net.to(device)
     net.train()
@@ -512,6 +729,9 @@ def train(
     
     X = X.to(device)
     Y = Y.to(device)
+    X_test = X_test.to(device)
+    Y_test = Y_test.to(device)
+
 
     # ----- Storage Preparation -----
     save_to.mkdir(parents=True, exist_ok=True)
@@ -585,6 +805,7 @@ def train(
         net=net,
         loss_fn=loss_fn,
         full_inputs=(X, Y),
+        test_inputs=(X_test, Y_test),
         measurements=measurements,
         device=device,
         batch_size=batch_size,
@@ -880,7 +1101,8 @@ def train(
                 msg += (
                     f"{batch_loss:7.6f}, {metrics['full_loss']:7.6f}, {metrics['lmax']:6.2f}, "
                     f"{metrics['step_sharpness']:6.1f}, {metrics['batch_sharpness']:6.1f}, "
-                    f"{metrics['gni']:6.2f}, {metrics['full_accuracy']:6.2f}"
+                    f"{metrics['gni']:6.2f}, {metrics['full_accuracy']:6.2f},"
+                    f"{metrics['train_test_gap']:6.3f}" 
                 )
                 results_file.write(msg + "\n")
                 
@@ -1070,6 +1292,18 @@ if __name__ == '__main__':
     parser.add_argument('--wandb-notes', type=str, default=None, help='Optional notes/description attached to the wandb run')
     parser.add_argument('--disable-wandb', action='store_true', help='Disable Weights & Biases logging for debugging/testing')
 
+    # --- New Measurement Flag ---
+    parser.add_argument('--train-test-gap', action='store_true', help='If set, compute the training and testing accuracy and gap (heavy, runs rarely)')
+
+    # --- NEW: Per-Sample Histogram Configuration ---
+    parser.add_argument('--per-sample', action='store_true', help='If set, compute per-sample histograms (heavy; runs rarely)')
+    parser.add_argument('--per-sample-freq', type=float, default=None, help='Frequency of per-sample histograms, as fraction of max_steps (default: 0.01 = every 100 steps for 10k max_steps)')
+    parser.add_argument('--per-sample-min-log10', type=float, default=-8, help='Min log10 value for log10 histograms (default: -8)')
+    parser.add_argument('--per-sample-max-log10', type=float, default=0, help='Max log10 value for log10 histograms (default: 0)')
+    parser.add_argument('--per-sample-bins', type=int, default=80, help='Number of bins for log10 histograms (default: 80)')
+    parser.add_argument('--per-sample-metrics', type=str, nargs='+', default=['loss','resid','kappa'], choices=['loss','resid','kappa'], help='Which metrics to histogram (default: loss resid kappa)')
+    parser.add_argument('--no-frames', action='store_true', help='Only save counts/quantiles as .npz; do not render PNG frames')
+
     # ----- Argument Parsing -----
     args = parser.parse_args()
 
@@ -1160,6 +1394,7 @@ if __name__ == '__main__':
     ('param_distance', args.param_distance),
     ('hessian_trace', args.hessian_trace),
     ('memorization_hessian_outliers', args.memorization_hessian_outliers),
+    ('train_test_gap', args.train_test_gap),
     ] if enabled}
 
     # ----- Result Storage Setup -----
@@ -1299,4 +1534,7 @@ if __name__ == '__main__':
         wandb_run=wandb_run,
         wandb_enabled=wandb_enabled,
         wandb_run_id=wandb_run_id,
+        #NEW
+        per_sample_cfg=None,
+
     )
