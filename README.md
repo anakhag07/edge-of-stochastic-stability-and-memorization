@@ -1,6 +1,10 @@
 # edge-of-stochastic-stability-and-memorization
 This repository builds on edge-of-stochastic-stability repo to quantify memorization during training and relationship to edge of stochastic stability and progressive sharpening. The information on the original repository follows here. 
 
+## Example Usage for New Metrics
+Args: 
+--
+
 ## Edge of Stochastic Stability (EoSS)
 
 This repository accompanies the paper [Edge of Stochastic Stability: Revisiting the Edge of Stability for SGD](https://arxiv.org/abs/2412.20553) by Arseniy Andreyev and Pierfrancesco Beneventano. Feel free to reuse it in any way - if you ended up using this code, please consider citing it by citing our paper.
