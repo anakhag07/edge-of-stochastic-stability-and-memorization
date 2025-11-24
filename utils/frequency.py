@@ -368,9 +368,9 @@ class FrequencyCalculator:
 
         def memorization_hessian_outliers_rule(ctx: MeasurementContext) -> bool:
             """Frequency rule for Hessian-based memorization outlier detection."""
-            base_freq = 2048 if ctx.batch_size >= 64 else 1024
+            base_freq = 128 if ctx.batch_size >= 64 else 64
             if ctx.precise_plots:
-                base_freq = min(base_freq, 1024)
+                base_freq = min(base_freq, 64)
             base_freq = _rare_scale(ctx, base_freq, heavy=True)
             return ctx.step_number == 0 or ctx.step_number % base_freq == 0
         
