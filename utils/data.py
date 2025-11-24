@@ -453,4 +453,107 @@ def prepare_dataset(dataset: str, dataset_folder: Union[str, Path], num_data: in
         return prepare_fmnist(dataset_folder, num_data, dataset_seed=dataset_seed, loss_type=loss_type)
     if dataset == 'imagenet32':
         return prepare_imagenet32(dataset_folder, num_data, dataset_seed=dataset_seed, loss_type=loss_type)
+   
+## NEW FUNCTION: Genearte centroids, boundary points, x-outlier, y-outlier based on class selection
+
+N_PROTOTYPE = 50
+EXTRAPOLATION_FACTOR = 5.0
+
+def generate_prototype_sets(X_train: T.Tensor, Y_train: T.Tensor, classes: tuple):
+    """
+    Generates prototype sets: boundary, x_outlier, y_outlier.
+    Works with image tensors [N, C, H, W] and one-hot labels.
+    """
+
+    # Convert one-hot labels to class indices if needed
+    if Y_train.ndim > 1:
+        Y_train = Y_train.argmax(dim=1)
+
+    X_train = X_train.cpu()
+    Y_train = Y_train.cpu()
+
+    class_0, class_1 = classes
+
+    # Split by class
+    X_0 = X_train[Y_train == class_0]
+    X_1 = X_train[Y_train == class_1]
+
+    n0, n1 = X_0.size(0), X_1.size(0)
+    if n0 == 0 or n1 == 0:
+        raise ValueError(f"One of the classes {classes} has zero samples: n0={n0}, n1={n1}")
+
+    # How many prototypes per class we can actually take
+    k0 = min(N_PROTOTYPE, n0)
+    k1 = min(N_PROTOTYPE, n1)
+
+    # Centroids in image space
+    centroid_0 = X_0.mean(dim=0, keepdim=True)  # [1, C, H, W]
+    centroid_1 = X_1.mean(dim=0, keepdim=True)  # [1, C, H, W]
+
+    # Flatten for distance computations
+    X0_flat = X_0.view(n0, -1)
+    X1_flat = X_1.view(n1, -1)
+    c0_flat = centroid_0.view(1, -1)
+    c1_flat = centroid_1.view(1, -1)
+
+    v_diff_flat = c1_flat - c0_flat  # [1, D]
+
+    # ---------- 1. Boundary points ----------
+    dist_0_to_1 = T.cdist(X0_flat, c1_flat).squeeze(1)  # [n0]
+    dist_1_to_0 = T.cdist(X1_flat, c0_flat).squeeze(1)  # [n1]
+
+    _, idx_0_boundary = T.topk(dist_0_to_1, k=k0, largest=False)
+    _, idx_1_boundary = T.topk(dist_1_to_0, k=k1, largest=False)
+
+    X_boundary = T.cat([X_0[idx_0_boundary], X_1[idx_1_boundary]], dim=0)
+    Y_boundary = T.cat([
+        T.full((k0,), class_0, dtype=Y_train.dtype),
+        T.full((k1,), class_1, dtype=Y_train.dtype),
+    ])
+
+    # ---------- 2. X-outliers (extrapolate along centroid diff) ----------
+    dist_0_to_0 = T.cdist(X0_flat, c0_flat).squeeze(1)  # [n0]
+    _, idx_0_near = T.topk(dist_0_to_0, k=k0, largest=False)
+
+    X_seed = X0_flat[idx_0_near]                             # [k0, D]
+    X_x_outlier_flat = X_seed + EXTRAPOLATION_FACTOR * v_diff_flat  # [k0, D]
+    X_x_outlier = X_x_outlier_flat.view(k0, *X_0.shape[1:])  # back to [k0, C, H, W]
+
+    Y_x_outlier = T.full((k0,), class_0, dtype=Y_train.dtype)
+
+    # ---------- 3. Y-outliers (flip labels near centroids) ----------
+    # C0 near its own centroid, relabeled as class_1
+    X_y_outlier_0 = X_0[idx_0_near]
+    Y_y_outlier_0 = T.full((k0,), class_1, dtype=Y_train.dtype)
+
+    # C1 near its centroid, relabeled as class_0
+    dist_1_to_1 = T.cdist(X1_flat, c1_flat).squeeze(1)  # [n1]
+    _, idx_1_near = T.topk(dist_1_to_1, k=k1, largest=False)
+
+    X_y_outlier_1 = X_1[idx_1_near]
+    Y_y_outlier_1 = T.full((k1,), class_0, dtype=Y_train.dtype)
+
+    X_y_outlier = T.cat([X_y_outlier_0, X_y_outlier_1], dim=0)
+    Y_y_outlier = T.cat([Y_y_outlier_0, Y_y_outlier_1], dim=0)
+
     
+    # ---------- 4. Inliers (close to centroids) ----------
+    # Class 0 Inliers (Features from C0, Label = C0)
+    X_inlier_0 = X_0[idx_0_near] 
+    Y_inlier_0 = T.full((N_PROTOTYPE,), class_0, dtype=Y_train.dtype) 
+
+    # Class 1 Inliers (Features from C1, Label = C1)
+    X_inlier_1 = X_1[idx_1_near] 
+    Y_inlier_1 = T.full((N_PROTOTYPE,), class_1, dtype=Y_train.dtype)
+    
+    # Concatenate to form the final Inlier set
+    X_inlier = T.cat([X_inlier_0, X_inlier_1], dim=0)
+    Y_inlier = T.cat([Y_inlier_0, Y_inlier_1], dim=0)
+
+    return {
+        'boundary': (X_boundary, Y_boundary),
+        'x_outlier': (X_x_outlier, Y_x_outlier),
+        'y_outlier': (X_y_outlier, Y_y_outlier),
+        'inliers': (X_inlier, Y_inlier),
+    }
+
