@@ -25,6 +25,7 @@ from utils.storage import initialize_folders
 from utils.wandb_utils import (
     init_wandb,
     log_metrics,
+    log_knn_outlier_results,
     save_checkpoint_wandb,
     find_closest_checkpoint_wandb,
     load_checkpoint_wandb,
@@ -170,6 +171,7 @@ class MeasurementRunner:
         # NEW:
         full_inputs_test=None,
         per_sample_cfg=None,
+        outlier_tracking_cfg=None,
     ):
         self.net = net
         self.loss_fn = loss_fn
@@ -252,6 +254,29 @@ class MeasurementRunner:
             self.bin_edges = None
             self.ps_dir = None
             self.frames_dir = None
+
+        self.outlier_tracking = None
+        if outlier_tracking_cfg and outlier_tracking_cfg.get('subsets'):
+            tracked_subsets = []
+            for subset in outlier_tracking_cfg['subsets']:
+                indices = subset.get('indices')
+                if not torch.is_tensor(indices):
+                    indices = torch.tensor(indices, dtype=torch.long, device=self.X.device)
+                else:
+                    indices = indices.to(device=self.X.device, dtype=torch.long)
+                tracked_subsets.append({
+                    "name": subset.get('name', f"class_{subset.get('class_id', 'unknown')}"),
+                    "class_id": subset.get('class_id'),
+                    "indices": indices,
+                })
+
+            if tracked_subsets:
+                self.outlier_tracking = {
+                    "subsets": tracked_subsets,
+                    "metrics": outlier_tracking_cfg.get('metrics', ["full_loss", "accuracy", "lambda_max"]),
+                    "metric_kwargs": outlier_tracking_cfg.get('metric_kwargs', {}),
+                    "log_prefix": outlier_tracking_cfg.get('log_prefix', "knn_outlier"),
+                }
 
         self.eigenvalues_log = []
         if 'lmax' in measurements and num_eigenvalues > 1:
@@ -466,6 +491,25 @@ class MeasurementRunner:
                 metrics['train_acc'] = vals['train_acc']
                 metrics['test_acc'] = vals['test_acc']
                 metrics['train_test_gap'] = vals['gap']
+
+        if self.outlier_tracking and frequency_calculator.should_measure('knn_outlier_metrics', ctx):
+            metric_kwargs = self.outlier_tracking.get('metric_kwargs', {})
+            for subset in self.outlier_tracking['subsets']:
+                subset_results = compute_subset_metrics(
+                    net=self.net,
+                    loss_fn=self.loss_fn,
+                    X=self.X,
+                    Y=self.Y,
+                    indices=subset['indices'],
+                    metrics=self.outlier_tracking['metrics'],
+                    eigenvector_cache=self.eigenvector_cache,
+                    num_eigenvalues=self.num_eigenvalues,
+                    use_power_iteration=self.use_power_iteration,
+                    metric_kwargs=metric_kwargs,
+                )
+                prefix = f"{self.outlier_tracking['log_prefix']}/{subset['name']}"
+                for key, value in subset_results.items():
+                    metrics[f"{prefix}/{key}"] = value
 
         # ----- NEW: Per-sample histograms -----
         if self.per_sample_cfg and self.per_sample_cfg['enabled']:
@@ -700,6 +744,8 @@ def train(
             wandb_enabled: bool = False,
             wandb_run_id: str = None,
             per_sample_cfg=None, #NEW 
+            knn_outlier_cfg=None,
+            outlier_tracking_cfg=None,
     ):
     
     # -------------------------------------
@@ -822,6 +868,7 @@ def train(
         proj_switch_step=proj_switch_step,
         quad_approx=quad_approx,
         memorization_outlier_frac=memorization_outlier_frac,
+        outlier_tracking_cfg=outlier_tracking_cfg,
     )
     # ----- Run Identification -----
     run_id = wandb_run_id or generate_run_id()
@@ -1165,6 +1212,105 @@ def train(
     print(f"Training finished at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
     print(f"Total training time: {end_time - start_time:.2f} seconds")
 
+    if knn_outlier_cfg and knn_outlier_cfg.get('enabled', False):
+        print("Computing k-NN neighbor-mix outliers...")
+        feature_batch = knn_outlier_cfg.get('feature_batch_size', 512)
+        k_neighbors = knn_outlier_cfg.get('k_neighbors', 32)
+        top_k_per_class = knn_outlier_cfg.get('top_k_per_class', 5)
+        balance_target = knn_outlier_cfg.get('balance_target', 0.5)
+        chunk_size = knn_outlier_cfg.get('chunk_size', 1024)
+        normalize = knn_outlier_cfg.get('normalize', True)
+        return_indices = knn_outlier_cfg.get('return_neighbor_indices', True)
+
+        features = extract_feature_matrix(
+            net,
+            X,
+            batch_size=feature_batch,
+            flatten_outputs=True,
+        )
+        label_tensor = Y.detach().cpu()
+
+        outlier_summary = identify_knn_outliers_by_neighbor_mix(
+            features,
+            label_tensor,
+            k_neighbors=k_neighbors,
+            top_k_per_class=top_k_per_class,
+            balance_target=balance_target,
+            chunk_size=chunk_size,
+            normalize=normalize,
+            return_neighbor_indices=return_indices,
+        )
+
+        per_class_indices = {}
+        per_class_stats = {}
+        flattened_rows = []
+        global_balance_dev = []
+        global_entropy = []
+        global_gap = []
+
+        for class_id, entries in outlier_summary.get("outliers", {}).items():
+            if not entries:
+                continue
+            per_class_indices[int(class_id)] = [int(e["dataset_index"]) for e in entries]
+
+            ratios = np.array([e["same_class_ratio"] for e in entries], dtype=np.float32)
+            devs = np.array([e["balance_deviation"] for e in entries], dtype=np.float32)
+            entropies = np.array([e["neighbor_entropy"] for e in entries], dtype=np.float32)
+            gaps = np.array([e["top_two_gap"] for e in entries], dtype=np.float32)
+
+            per_class_stats[int(class_id)] = {
+                "count": len(entries),
+                "mean_same_class_ratio": float(ratios.mean()),
+                "mean_balance_deviation": float(devs.mean()),
+                "mean_neighbor_entropy": float(entropies.mean()),
+                "mean_top_two_gap": float(gaps.mean()),
+            }
+
+            global_balance_dev.extend(devs.tolist())
+            global_entropy.extend(entropies.tolist())
+            global_gap.extend(gaps.tolist())
+
+            for entry in entries:
+                flattened_rows.append({
+                    "dataset_index": int(entry["dataset_index"]),
+                    "class_id": int(class_id),
+                    "same_class_ratio": float(entry["same_class_ratio"]),
+                    "balance_deviation": float(entry["balance_deviation"]),
+                    "neighbor_entropy": float(entry["neighbor_entropy"]),
+                    "top_two_gap": float(entry["top_two_gap"]),
+                    "avg_neighbor_distance": float(entry["avg_neighbor_distance"]),
+                })
+
+        outlier_path = save_to / 'knn_outliers.json'
+        with open(outlier_path, 'w') as f:
+            json.dump(outlier_summary, f, indent=2)
+
+        indices_payload = {
+            "k_neighbors": k_neighbors,
+            "top_k_per_class": top_k_per_class,
+            "class_ids": outlier_summary.get("class_ids", []),
+            "per_class_indices": {str(k): v for k, v in per_class_indices.items()},
+            "flat_indices": sorted({idx for v in per_class_indices.values() for idx in v}),
+        }
+        with open(save_to / 'knn_outlier_indices.json', 'w') as f:
+            json.dump(indices_payload, f, indent=2)
+
+        if wandb_enabled and wandb_run is not None:
+            total_flagged = len(flattened_rows)
+            wandb_metrics = {
+                "knn_outliers/total_flagged": total_flagged,
+                "knn_outliers/mean_balance_deviation": float(np.mean(global_balance_dev)) if global_balance_dev else float('nan'),
+                "knn_outliers/mean_neighbor_entropy": float(np.mean(global_entropy)) if global_entropy else float('nan'),
+                "knn_outliers/mean_top_two_gap": float(np.mean(global_gap)) if global_gap else float('nan'),
+            }
+            for class_id, stats in per_class_stats.items():
+                prefix = f"knn_outliers/class_{class_id}"
+                for name, value in stats.items():
+                    wandb_metrics[f"{prefix}/{name}"] = value
+
+            log_knn_outlier_results(wandb_metrics, flattened_rows)
+
+        print(f"k-NN outlier summary saved to {outlier_path}")
 
 
     # ----- Optional Final Measurements -----
@@ -1239,9 +1385,6 @@ if __name__ == '__main__':
     parser.add_argument('--one-step-loss-change', action='store_true', help='If set, compute the expected one-step change in loss using Monte Carlo estimation')
     parser.add_argument('--gradient-norm', action='store_true', help='If set, compute the Monte Carlo estimate of squared norm of mini-batch gradients')
     parser.add_argument('--final', action='store_true', help='If set, compute the lambda_max and step sharpness at the end')
-    parser.add_argument('--memorization-hessian-outliers', action='store_true', help='Compute memorization stats based on alignment with top Hessian eigenvector (heavy; runs rarely)')
-    parser.add_argument('--memorization-outlier-frac', type=float, default=0.05, help='Fraction of examples treated as outliers for Hessian-alignment memorization stats')
-
     
     # --- Measurement Flags (Tertiary, aka almost completely useless) ---
     parser.add_argument('--batch-sharpness-exp-inside', action='store_true', help='If set, compute the batch sharpness using E[gHg]/E[g²], where the expectation is inside the ratio. Compare with step-sharpness, where the expectation stays outside the ratio.')
@@ -1303,6 +1446,28 @@ if __name__ == '__main__':
     parser.add_argument('--per-sample-bins', type=int, default=80, help='Number of bins for log10 histograms (default: 80)')
     parser.add_argument('--per-sample-metrics', type=str, nargs='+', default=['loss','resid','kappa'], choices=['loss','resid','kappa'], help='Which metrics to histogram (default: loss resid kappa)')
     parser.add_argument('--no-frames', action='store_true', help='Only save counts/quantiles as .npz; do not render PNG frames')
+
+    # --- NEW: Memorization via Outliers identified by Alignment with Top Hessian Eigenvector ---
+    parser.add_argument('--memorization-hessian-outliers', action='store_true', help='Compute memorization stats based on alignment with top Hessian eigenvector (heavy; runs rarely)')
+    parser.add_argument('--memorization-outlier-frac', type=float, default=0.05, help='Fraction of examples treated as outliers for Hessian-alignment memorization stats')
+
+    # --- NEW: Outlier Mining Configuration ---
+    parser.add_argument('--knn-outliers', action='store_true',
+                        help='After training, run a k-NN pass to flag ambiguous samples')
+    parser.add_argument('--knn-neighbors', type=int, default=32,
+                        help='Number of neighbors used for the ambiguity score')
+    parser.add_argument('--knn-top-per-class', type=int, default=10,
+                        help='How many outliers to keep per class')
+    parser.add_argument('--knn-feature-batch', type=int, default=512,
+                        help='Batch size used during the post-hoc embedding pass')
+    parser.add_argument('--knn-chunk-size', type=int, default=1024,
+                        help='Chunk size used while computing the k-NN graph')
+    parser.add_argument('--knn-no-normalize', action='store_true',
+                        help='Disable L2-normalization of feature vectors before k-NN')
+    parser.add_argument('--track-knn-outliers-from', type=str, default=None,
+                        help='Existing plaintext run folder name (e.g., 20251124_0820_35_lr0.01000_b8) whose knn_outlier_indices.json should be tracked during training')
+    parser.add_argument('--track-knn-topk', type=int, default=5,
+                        help='Number of stored outliers per class to track from the reference run')
 
     # ----- Argument Parsing -----
     args = parser.parse_args()
@@ -1494,6 +1659,65 @@ if __name__ == '__main__':
     else:
         checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
     
+    knn_outlier_cfg = None
+    if args.knn_outliers:
+        if args.knn_neighbors < 2:
+            raise ValueError("--knn-neighbors must be >= 2 when --knn-outliers is set")
+        if args.knn_top_per_class < 1:
+            raise ValueError("--knn-top-per-class must be >= 1 when --knn-outliers is set")
+
+        knn_outlier_cfg = {
+            "enabled": True,
+            "k_neighbors": args.knn_neighbors,
+            "top_k_per_class": args.knn_top_per_class,
+            "feature_batch_size": args.knn_feature_batch,
+            "chunk_size": args.knn_chunk_size,
+            "normalize": not args.knn_no_normalize,
+            "return_neighbor_indices": True,
+        }
+
+    outlier_tracking_cfg = None
+    if args.track_knn_outliers_from:
+        plaintext_root = RES_FOLDER / 'plaintext' / f"{dataset}_{args.model}"
+        ref_run_dir = plaintext_root / args.track_knn_outliers_from
+        indices_path = ref_run_dir / 'knn_outlier_indices.json'
+        if not indices_path.exists():
+            raise FileNotFoundError(
+                f"Cannot find knn_outlier_indices.json at {indices_path}. "
+                "Ensure the reference run name is correct."
+            )
+        with open(indices_path, 'r') as f:
+            indices_payload = json.load(f)
+
+        per_class_indices = indices_payload.get('per_class_indices', {})
+        if not per_class_indices:
+            raise ValueError(f"No per-class indices found in {indices_path}")
+
+        track_top = max(1, args.track_knn_topk)
+        tracked_subsets = []
+        for class_key, idx_list in per_class_indices.items():
+            trimmed = idx_list[:track_top]
+            if not trimmed:
+                continue
+            tracked_subsets.append({
+                "name": f"class_{class_key}",
+                "class_id": int(class_key),
+                "indices": torch.tensor(trimmed, dtype=torch.long),
+            })
+
+        if not tracked_subsets:
+            raise ValueError(
+                f"No indices remained after applying --track-knn-topk={track_top} "
+                f"for run {args.track_knn_outliers_from}"
+            )
+
+        outlier_tracking_cfg = {
+            "enabled": True,
+            "subsets": tracked_subsets,
+            "metrics": ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad"],
+            "log_prefix": f"knn_outlier/{args.track_knn_outliers_from}",
+        }
+
     # ----- Training Invocation -----
     train(
         net=net,
@@ -1536,5 +1760,7 @@ if __name__ == '__main__':
         wandb_run_id=wandb_run_id,
         #NEW
         per_sample_cfg=None,
+        knn_outlier_cfg=knn_outlier_cfg,
+        outlier_tracking_cfg=outlier_tracking_cfg,
 
     )
