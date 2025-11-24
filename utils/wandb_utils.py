@@ -155,6 +155,16 @@ def log_metrics(metrics: Mapping[str, Any]) -> None:
     filtered_metrics: Dict[str, Any] = {}
 
     for key, value in metrics_dict.items():
+        if isinstance(value, Mapping):
+            for sub_key, sub_value in value.items():
+                sub_value = _maybe_scalar(sub_value)
+                if sub_value is None:
+                    continue
+                if isinstance(sub_value, (float, np.floating)) and np.isnan(sub_value):
+                    continue
+                filtered_metrics[f"{key}/{sub_key}"] = sub_value
+            continue
+
         value = _maybe_scalar(value)
 
         if value is None:
@@ -192,6 +202,53 @@ def log_metrics(metrics: Mapping[str, Any]) -> None:
 
     if filtered_metrics:
         wandb.log(filtered_metrics)
+
+
+def log_knn_outlier_results(
+    scalar_metrics: Mapping[str, Any],
+    rows: list,
+    *,
+    table_name: str = "knn_outliers/table",
+) -> None:
+    """
+    Log k-NN outlier summary statistics and (optionally) a table of per-example rows.
+    """
+    if not WANDB_AVAILABLE or wandb.run is None:
+        return
+
+    log_payload = {}
+    for key, value in scalar_metrics.items():
+        if value is None:
+            continue
+        if isinstance(value, (float, np.floating)) and np.isnan(value):
+            continue
+        log_payload[key] = value
+
+    if log_payload:
+        wandb.log(log_payload, commit=False)
+
+    if rows:
+        columns = [
+            "dataset_index",
+            "class_id",
+            "same_class_ratio",
+            "balance_deviation",
+            "neighbor_entropy",
+            "top_two_gap",
+            "avg_neighbor_distance",
+        ]
+        table = wandb.Table(columns=columns)
+        for row in rows:
+            table.add_data(
+                row.get("dataset_index"),
+                row.get("class_id"),
+                row.get("same_class_ratio"),
+                row.get("balance_deviation"),
+                row.get("neighbor_entropy"),
+                row.get("top_two_gap"),
+                row.get("avg_neighbor_distance"),
+            )
+        wandb.log({table_name: table}, commit=False)
 
 
 def save_checkpoint_wandb(model, optimizer, step, epoch, loss, run_id=None, save_every_n_steps=None):
