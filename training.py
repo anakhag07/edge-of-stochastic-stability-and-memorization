@@ -10,7 +10,7 @@ from pathlib import Path
 import math
 import random
 import argparse
-
+import torch.nn.functional as F
 import time
 
 import imageio.v2 as imageio
@@ -18,7 +18,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils.data import prepare_dataset, get_dataset_presets
+from utils.data import prepare_dataset, get_dataset_presets,generate_prototype_sets
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
 from utils.nets import ResNet
 from utils.storage import initialize_folders
@@ -31,6 +31,7 @@ from utils.wandb_utils import (
     get_checkpoint_dir_for_run,
     is_wandb_available,
     generate_run_id,
+
 )
 
 from utils.noise import gd_with_noise, GradStorage, sde_integration
@@ -65,47 +66,122 @@ class PerSampleHistograms:
         self.counts = {metric: 0 for metric in metrics}
         self.quantiles = {metric: np.zeros((bins,)) for metric in metrics}
 
-@torch.no_grad()
+# @torch.no_grad()
+
 def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, device='cuda'):
-    """Return dict of numpy arrays: loss, resid_norm, kappa for dataset (X,Y)."""
+    """
+    Return dict of numpy arrays: loss, resid_norm, kappa, grad_norm for dataset (X, Y).
+    loss_type: 'ce' (cross-entropy) or 'mse' (SquaredLoss: 0.5 * ||y - yhat||^2).
+    """
+    was_training = net.training
     net.eval()
-    out_loss, out_resid, out_kappa = [], [], []
+
+    out_loss, out_resid, out_kappa, out_grad_norm = [], [], [], []
+
     for i in range(0, len(X), batch_size):
-        xb = X[i:i+batch_size].to(device)
-        yb = Y[i:i+batch_size].to(device)
-        z = net(xb)  # logits for CE; prediction for MSE
-        if loss_type == 'ce':
-            # losses per-sample
-            loss = torch.nn.functional.cross_entropy(z, yb, reduction='none')
-            # residual wrt logits: p - y_onehot
-            p = torch.softmax(z, dim=1)
-            y1 = torch.nn.functional.one_hot(yb, num_classes=z.size(1)).float()
-            resid = p - y1                      # dL/dz
-            resid_norm = resid.norm(dim=1)
-            # curvature proxy: Frobenius norm of softmax Hessian
-            # ||diag(p) - p p^T||_F
-            I = torch.eye(p.size(1), device=p.device).unsqueeze(0)   # [1, C, C]
-            Hout = I * p.unsqueeze(2) - p.unsqueeze(2) * p.unsqueeze(1)
-            kappa = torch.linalg.norm(Hout, dim=(1,2))
-        else:
-            # MSE (your SquaredLoss is 0.5*||y - yhat||^2); match that here per-sample
-            if z.ndim == 1 or z.size(-1) == 1:
-                z = z.squeeze(-1)
-            # If Y is class index for 2-class, convert upstream; here assume Y already numeric
-            diff = (z - yb)
-            loss = 0.5*(diff**2)
-            if loss.ndim > 1:
-                loss = loss.sum(dim=1)
-            resid_norm = diff if diff.ndim==1 else diff.norm(dim=1)
-            kappa = torch.ones_like(loss)  # output-space curvature is constant for MSE
-        out_loss.append(loss.detach().cpu())
-        out_resid.append(resid_norm.detach().cpu())
-        out_kappa.append(kappa.detach().cpu())
-    net.train()
+        xb = X[i:i + batch_size].to(device)
+        yb = Y[i:i + batch_size].to(device)
+
+        # ----------------------------------------------------
+        # Per-sample gradient norms (requires autograd ON)
+        # ----------------------------------------------------
+        grad_norms_batch = []
+
+        for j in range(xb.shape[0]):
+            xb_j = xb[j:j + 1]  # [1, ...]
+            yb_j = yb[j:j + 1]  # [1] or [1, C]
+
+            net.zero_grad()
+
+            z_j = net(xb_j)
+
+            if loss_type == 'ce':
+                # Cross-entropy for a single sample
+                loss_j = F.cross_entropy(z_j, yb_j.long(), reduction='sum')
+            else:
+                # MSE: 0.5 * ||y - yhat||^2
+                zf = z_j
+                yf = yb_j
+
+                if zf.ndim > 1 and zf.size(-1) == 1:
+                    zf = zf.squeeze(-1)
+                if yf.ndim > 1 and yf.size(-1) == 1:
+                    yf = yf.squeeze(-1)
+
+                loss_j = 0.5 * (zf - yf).pow(2).sum()
+
+            loss_j.backward()
+
+            grads = []
+            for param in net.parameters():
+                if param.grad is not None:
+                    grads.append(param.grad.view(-1))
+
+            if grads:
+                g = torch.cat(grads)
+                grad_norms_batch.append(torch.linalg.norm(g).item())
+            else:
+                grad_norms_batch.append(0.0)
+
+        out_grad_norm.extend(grad_norms_batch)
+
+        # ----------------------------------------------------
+        # Loss / resid_norm / kappa (no gradients needed)
+        # ----------------------------------------------------
+        with torch.no_grad():
+            z = net(xb)
+
+            if loss_type == 'ce':
+                # Per-sample CE loss
+                loss = F.cross_entropy(z, yb.long(), reduction='none')
+
+                # Residual wrt logits: p - y_onehot
+                p = torch.softmax(z, dim=1)
+                y1 = F.one_hot(yb.long(), num_classes=z.size(1)).float()
+                resid = p - y1
+                resid_norm = resid.norm(dim=1)
+
+                # Curvature proxy: Frobenius norm of softmax Hessian
+                C = p.size(1)
+                I = torch.eye(C, device=p.device).unsqueeze(0)  # [1, C, C]
+                Hout = I * p.unsqueeze(2) - p.unsqueeze(2) * p.unsqueeze(1)
+                kappa = torch.linalg.norm(Hout, dim=(1, 2))
+
+            else:
+                # MSE: SquaredLoss 0.5 * ||y - yhat||^2
+                zf = z
+                yf = yb
+
+                if zf.ndim > 1 and zf.size(-1) == 1:
+                    zf = zf.squeeze(-1)
+                if yf.ndim > 1 and yf.size(-1) == 1:
+                    yf = yf.squeeze(-1)
+
+                diff = zf - yf                       # [B] or [B, D]
+                loss = 0.5 * (diff ** 2)
+                if loss.ndim > 1:
+                    loss = loss.sum(dim=1)
+
+                if diff.ndim > 1:
+                    resid_norm = diff.norm(dim=1)
+                else:
+                    resid_norm = diff.abs()
+
+                # For plain MSE, output-space curvature is constant
+                kappa = torch.ones_like(loss)
+
+        out_loss.append(loss.cpu())
+        out_resid.append(resid_norm.cpu())
+        out_kappa.append(kappa.cpu())
+
+    if was_training:
+        net.train()
+
     return {
         'loss': torch.cat(out_loss).numpy(),
         'resid': torch.cat(out_resid).numpy(),
         'kappa': torch.cat(out_kappa).numpy(),
+        'grad_norm': np.asarray(out_grad_norm),
     }
 
 def _hist_log10(values, bin_edges):
@@ -168,6 +244,7 @@ class MeasurementRunner:
         quad_approx,
         memorization_outlier_frac: float,
         # NEW:
+        prototype_data,
         full_inputs_test=None,
         per_sample_cfg=None,
     ):
@@ -195,35 +272,8 @@ class MeasurementRunner:
         self.gd_noise = gd_noise
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
-        self.memorization_outlier_frac = memorization_outlier_frac
-        
-        # NEW: Per-sample config
-        self.full_inputs_test = full_inputs_test
-        self.per_sample_cfg = per_sample_cfg
-        
-        # NEW: Per-sample initialization logic
-        if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
-            self.per_sample_histograms = PerSampleHistograms(
-                min_log10=per_sample_cfg['hist_min_log10'],
-                max_log10=per_sample_cfg['hist_max_log10'],
-                bins=per_sample_cfg['hist_bins'],
-                metrics=per_sample_cfg.get('metrics', per_sample_cfg.get('hist_metrics', ['loss'])))
-            # Initialize bin edges for log10 histogram
-            self.bin_edges = np.linspace(
-                per_sample_cfg['hist_min_log10'],
-                per_sample_cfg['hist_max_log10'],
-                per_sample_cfg['hist_bins'] + 1
-            )
-            # Initialize directories for saving
-            self.ps_dir = save_dir / 'per_sample_histograms'
-            self.frames_dir = self.ps_dir / 'frames'
-            _ensure_dir(self.ps_dir)
-            if not per_sample_cfg.get('no_frames', False):
-                _ensure_dir(self.frames_dir)
-        else:
-            self.per_sample_histograms = None
-            self.bin_edges = None
-            self.ps_dir = None       
+        self.memorization_outlier_frac = memorization_outlier_frac 
+
         # NEW: Per-sample config
         self.full_inputs_test = full_inputs_test
         self.per_sample_cfg = per_sample_cfg
@@ -260,7 +310,7 @@ class MeasurementRunner:
             self.eigenvalues_file.write('[\n')
         else:
             self.eigenvalues_file = None
-
+        self.prototype_data = prototype_data #NEW
     def close(self):
         if self.eigenvalues_file is not None:
             self.eigenvalues_file.write('\n]')
@@ -647,11 +697,34 @@ class MeasurementRunner:
             )
     
 
+        # ----- NEW: Prototype per-sample stats over time -----
+        if self.prototype_data is not None and self.per_sample_cfg and self.per_sample_cfg['enabled']:
+            proto_every = self.per_sample_cfg["every"]  # or a separate config
+            if step_number % proto_every == 0:
+                loss_type = 'ce' if isinstance(self.loss_fn, nn.CrossEntropyLoss) else 'mse'
+
+                proto_dir = self.ps_dir / "prototypes"
+                _ensure_dir(proto_dir)
+
+                for name, (X_p, Y_p) in self.prototype_data.items():
+                    X_p = X_p.to(self.device)
+                    Y_p = Y_p.to(self.device)
+
+                    stats = _per_sample_stats(
+                        self.net,
+                        self.loss_fn,
+                        X_p,
+                        Y_p,
+                        loss_type=loss_type,
+                        batch_size=len(X_p),   # small sets, just use full
+                        device=self.device,
+                    )
+                    out_path = proto_dir / f"step_{step_number:05d}_{name}.npz"
+                    np.savez(out_path, **stats)
+
         metrics['epoch_loss_update'] = epoch_loss_update
         return metrics
-    
-        
-
+ 
 
 # -------------------------------------
 # Section: Training Function
@@ -668,7 +741,7 @@ def train(
             save_to, #folder
             device,
             verbose=True,
-            loss_fn=nn.MSELoss(),
+            loss_fn=nn.CrossEntropyLoss(),
             permute=True,
             stop_loss=None,
             epoch_to_start=0,
@@ -699,8 +772,10 @@ def train(
             wandb_run=None,
             wandb_enabled: bool = False,
             wandb_run_id: str = None,
-            per_sample_cfg=None, #NEW 
-    ):
+            per_sample_cfg=None, #NEW
+            prototype_data=None,
+
+          ):
     
     # -------------------------------------
     # Section: Setup
@@ -720,8 +795,7 @@ def train(
     X_train, Y_train, X_test, Y_test = data
 
     X, Y = X_train, Y_train
-
-
+   
     # ----- Device Alignment -----
     net = net.to(device)
     net.train()
@@ -737,7 +811,6 @@ def train(
     save_to.mkdir(parents=True, exist_ok=True)
 
     model_save_path = save_to / 'checkpoints'
-
     results_file = save_to / 'results.txt'
     if device == 'cpu':
         # No buffering on CPU to ensure writes happen immediately
@@ -822,6 +895,10 @@ def train(
         proj_switch_step=proj_switch_step,
         quad_approx=quad_approx,
         memorization_outlier_frac=memorization_outlier_frac,
+        prototype_data=prototype_data,    
+        full_inputs_test=None,
+        per_sample_cfg=per_sample_cfg,
+
     )
     # ----- Run Identification -----
     run_id = wandb_run_id or generate_run_id()
@@ -1152,6 +1229,33 @@ def train(
     )
     print(f"Final checkpoint saved: {final_checkpoint_path}")
 
+
+    # ----- NEW: per-sample stats on prototype sets -----
+    if prototype_data is not None:
+        print("Computing per-sample metrics for prototype sets...")
+        loss_type = 'ce' if isinstance(loss_fn, nn.CrossEntropyLoss) else 'mse'
+
+        proto_dir = save_to / "prototype_final"
+        _ensure_dir(proto_dir)
+
+        for name, (X_p, Y_p) in prototype_data.items():
+            X_p = X_p.to(device)
+            Y_p = Y_p.to(device)
+
+            stats = _per_sample_stats(
+                net,
+                loss_fn,
+                X_p,
+                Y_p,
+                loss_type='ce',
+                batch_size=batch_size,
+                device=device,
+            )
+            out_path = proto_dir / f"final_{name}.npz"
+            np.savez(out_path, **stats)
+            print(f"  saved {name} -> {out_path}")
+
+
     results_file.close()
 
     measurement_runner.close()
@@ -1296,13 +1400,24 @@ if __name__ == '__main__':
     parser.add_argument('--train-test-gap', action='store_true', help='If set, compute the training and testing accuracy and gap (heavy, runs rarely)')
 
     # --- NEW: Per-Sample Histogram Configuration ---
-    parser.add_argument('--per-sample', action='store_true', help='If set, compute per-sample histograms (heavy; runs rarely)')
-    parser.add_argument('--per-sample-freq', type=float, default=None, help='Frequency of per-sample histograms, as fraction of max_steps (default: 0.01 = every 100 steps for 10k max_steps)')
-    parser.add_argument('--per-sample-min-log10', type=float, default=-8, help='Min log10 value for log10 histograms (default: -8)')
-    parser.add_argument('--per-sample-max-log10', type=float, default=0, help='Max log10 value for log10 histograms (default: 0)')
-    parser.add_argument('--per-sample-bins', type=int, default=80, help='Number of bins for log10 histograms (default: 80)')
-    parser.add_argument('--per-sample-metrics', type=str, nargs='+', default=['loss','resid','kappa'], choices=['loss','resid','kappa'], help='Which metrics to histogram (default: loss resid kappa)')
-    parser.add_argument('--no-frames', action='store_true', help='Only save counts/quantiles as .npz; do not render PNG frames')
+
+    parser.add_argument('--per-sample', action='store_true',
+                        help='Track per-sample loss/residual/curvature histograms over time and save frames')
+    parser.add_argument('--per-sample-every', type=int, default=100,
+                        help='Snapshot cadence in steps for per-sample histograms (default: 100)')
+    parser.add_argument('--hist-min-log10', type=float, default=-6.0,
+                        help='Left edge for log10 binning (default: -6)')
+    parser.add_argument('--hist-max-log10', type=float, default=2.0,
+                        help='Right edge for log10 binning (default: 2)')
+    parser.add_argument('--hist-bins', type=int, default=80,
+                        help='Number of bins for log10 histograms (default: 80)')
+    parser.add_argument('--per-sample-metrics', type=str, nargs='+',
+                        default=['loss','resid','kappa'],
+                        choices=['loss','resid','kappa'],
+                        help='Which metrics to histogram (default: loss resid kappa)')
+    parser.add_argument('--no-frames', action='store_true',
+                        help='Only save counts/quantiles as .npz; do not render PNG frames')
+
 
     # ----- Argument Parsing -----
     args = parser.parse_args()
@@ -1415,6 +1530,12 @@ if __name__ == '__main__':
     # --- Dataset Preparation ---
     data = prepare_dataset(dataset, DATASET_FOLDER, args.num_data, args.classes, args.dataset_seed, loss_type=args.loss)
 
+    # --- Unpack dataset and build tuple_data ---
+    train_x, train_y, test_x, test_y = data  
+    tuple_data = (train_x, train_y, test_x, test_y)
+
+    prototype_data = generate_prototype_sets(train_x, train_y, args.classes)
+
     # --- Model Construction ---
     name = args.model
     params = model_presets[name]['params']
@@ -1483,7 +1604,7 @@ if __name__ == '__main__':
     if args.param_file is not None:
         param_reference = T.load(args.param_file, map_location=device)
         # param_reference = param_reference['model_state_dict']
-        # param_reference = {k: v.to(device) for k, v in param_reference.items()}
+        # param_reference = {k: v.to(device) for k, v in param_reference.items()} 
 
     # ----- Optimizer Preparation -----
     optimizer = prepare_optimizer(net, args.lr, args.momentum, args.adam)
@@ -1494,11 +1615,25 @@ if __name__ == '__main__':
     else:
         checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
     
+    
+    per_sample_cfg = None
+    if args.per_sample:
+        per_sample_cfg = {
+            'enabled': True,
+            'every': max(1, int(args.per_sample_every)),
+            'hist_min_log10': args.hist_min_log10,
+            'hist_max_log10': args.hist_max_log10,
+            'hist_bins': args.hist_bins,
+            'metrics': args.per_sample_metrics,   # ['loss','resid','kappa']
+            'no_frames': args.no_frames,
+        }
+    
+
     # ----- Training Invocation -----
     train(
         net=net,
         optimizer=optimizer,
-        data=data,
+        data=tuple_data,
         max_epochs=args.epochs,
         max_steps=args.steps,
         batch_size=args.batch,
@@ -1535,6 +1670,6 @@ if __name__ == '__main__':
         wandb_enabled=wandb_enabled,
         wandb_run_id=wandb_run_id,
         #NEW
-        per_sample_cfg=None,
-
+        per_sample_cfg=per_sample_cfg,
+        prototype_data=prototype_data,
     )
