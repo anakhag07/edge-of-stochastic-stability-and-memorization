@@ -3,7 +3,7 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
 
 ## Generating Per-Sample Loss GIFs
 
-You can create an animated GIF showing how the per-sample loss distribution evolves over training. Follow the steps below:
+Create an animated GIF showing how the per-sample loss distribution evolves over training by following the steps below:
 1. Identify the most recent run directory
 Make sure $RESULTS points to your eos_results directory, then run:
   ```bash
