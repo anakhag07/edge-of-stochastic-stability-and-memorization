@@ -1,6 +1,39 @@
 # edge-of-stochastic-stability-and-memorization
 This repository builds on edge-of-stochastic-stability repo to quantify memorization during training and relationship to edge of stochastic stability and progressive sharpening. The information on the original repository follows here. 
 
+## Generating Per-Sample Loss GIFs
+
+You can create an animated GIF showing how the per-sample loss distribution evolves over training. Follow the steps below:
+1. Identify the most recent run directory
+Make sure $RESULTS points to your eos_results directory, then run:
+  ```bash
+RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
+echo "$RUN_DIR"
+  ```
+
+2. Locate the latest per-sample histogram folder
+  ```bash
+LATEST_PS=$(find "$RESULTS"/plaintext/cifar10_mlp -maxdepth 5 -type d -name per_sample_histograms | sort | tail -1)
+echo "$LATEST_PS"
+  ```
+This finds the newest per_sample_histograms directory, which contains the saved PNG frames.
+
+3. Generate the GIF
+Run:
+  ```bash
+python eoss_shared/tools/make_gif.py \
+  --frames-dir "$LATEST_PS/frames" \
+  --metric loss \
+  --out "$RUN_DIR/loss_hist_evolution.gif" \
+  --fps 6
+  ```
+
+
+___
+
+
+
+
 ## Example Usage for New Metrics
 Args: 
 --
