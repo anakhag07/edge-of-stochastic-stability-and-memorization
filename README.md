@@ -4,14 +4,13 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
 ## Generating Per-Sample Loss GIFs
 
 Create an animated GIF showing how the per-sample loss distribution evolves over training by following the steps below:
-1. Identify the most recent run directory
-Make sure $RESULTS points to your eos_results directory, then run:
+1. Identify the most recent run directory:
   ```bash
 RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
 echo "$RUN_DIR"
   ```
 
-2. Locate the latest per-sample histogram folder
+2. Locate the latest per-sample histogram folder:
   ```bash
 LATEST_PS=$(find "$RESULTS"/plaintext/cifar10_mlp -maxdepth 5 -type d -name per_sample_histograms | sort | tail -1)
 echo "$LATEST_PS"
