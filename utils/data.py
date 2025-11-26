@@ -456,8 +456,9 @@ def prepare_dataset(dataset: str, dataset_folder: Union[str, Path], num_data: in
    
 ## NEW FUNCTION: Genearte centroids, boundary points, x-outlier, y-outlier based on class selection
 
-N_PROTOTYPE = 50
-EXTRAPOLATION_FACTOR = 5.0
+N_PROTOTYPE = 5
+EXTRAPOLATION_FACTOR = 3.0
+
 
 def generate_prototype_sets(X_train: T.Tensor, Y_train: T.Tensor, classes: tuple):
     """

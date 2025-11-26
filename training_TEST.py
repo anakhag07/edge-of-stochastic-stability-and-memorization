@@ -417,16 +417,6 @@ class MeasurementRunner:
                     min_estimates=20,
                     eps=0.005,
                 )
-            if self.prototype_data is not None:
-                proto_metrics = compute_prototype_metrics(
-                    net=self.net,
-                    loss_fn=self.loss_fn,
-                    prototype_data=self.prototype_data,
-                    device=self.device,
-                    base_batch_size=self.batch_size,
-                )
-                metrics.update(proto_metrics)
-
         # ----- Instantaneous step sharpness (current-batch Rayleigh quotient) -----
         if 'step_sharpness' in self.measurements:
             if frequency_calculator.should_measure('step_sharpness', ctx):
@@ -756,7 +746,7 @@ class MeasurementRunner:
 
         # ----- NEW: Prototype per-sample stats over time -----
         if self.prototype_data is not None and self.per_sample_cfg and self.per_sample_cfg['enabled']:
-            proto_every = self.per_sample_cfg["every"]  # or a separate config
+            proto_every = self.per_sample_cfg["every"]
             if step_number % proto_every == 0:
                 loss_type = 'ce' if isinstance(self.loss_fn, nn.CrossEntropyLoss) else 'mse'
 
@@ -767,20 +757,43 @@ class MeasurementRunner:
                     X_p = X_p.to(self.device)
                     Y_p = Y_p.to(self.device)
 
+                    # Per-sample stats
                     stats = _per_sample_stats(
                         self.net,
                         self.loss_fn,
                         X_p,
                         Y_p,
                         loss_type=loss_type,
-                        batch_size=len(X_p),   # small sets, just use full
+                        batch_size=len(X_p),
                         device=self.device,
                     )
+                    
+                    # NEW: Add batch sharpness for this prototype set
+                    # Compute full loss on this prototype set
+                    self.net.zero_grad()
+                    preds = self.net(X_p).squeeze(dim=-1)
+                    proto_loss = self.loss_fn(preds, Y_p)
+                    
+                    # Compute batch sharpness (gHg/g²)
+                    batch_sharpness = compute_grad_H_grad(proto_loss, self.net).item()
+                    
+                    # Add to stats
+                    stats['batch_sharpness'] = batch_sharpness
+                    stats['mean_loss'] = np.mean(stats['loss'])
+                    
                     out_path = proto_dir / f"step_{step_number:05d}_{name}.npz"
                     np.savez(out_path, **stats)
 
 
-
+        if self.prototype_data is not None:
+            proto_metrics = compute_prototype_metrics(
+                net=self.net,
+                loss_fn=self.loss_fn,
+                prototype_data=self.prototype_data,
+                device=self.device,
+                base_batch_size=self.batch_size,
+            )
+            metrics.update(proto_metrics)
 
         metrics['epoch_loss_update'] = epoch_loss_update
         return metrics
