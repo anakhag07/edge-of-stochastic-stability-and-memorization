@@ -10,6 +10,7 @@ from pathlib import Path
 import math
 import random
 import argparse
+from typing import Dict, List
 
 import time
 
@@ -51,6 +52,124 @@ if 'RESULTS' not in os.environ:
 DATASET_FOLDER = Path(os.environ.get('DATASETS'))
 # export RESULTS=/scratch/gpfs/andreyev/eoss/results
 RES_FOLDER = Path(os.environ.get('RESULTS'))
+
+KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad"]
+
+
+def _load_reference_knn_indices(dataset_name: str, model_name: str, run_name: str) -> Dict[int, List[int]]:
+    plaintext_root = RES_FOLDER / 'plaintext' / f"{dataset_name}_{model_name}"
+    ref_run_dir = plaintext_root / run_name
+    indices_path = ref_run_dir / 'knn_outlier_indices.json'
+    if not indices_path.exists():
+        raise FileNotFoundError(
+            f"Cannot find knn_outlier_indices.json at {indices_path}. "
+            "Ensure the reference run name is correct."
+        )
+
+    with open(indices_path, 'r') as f:
+        indices_payload = json.load(f)
+
+    per_class_indices = indices_payload.get('per_class_indices', {})
+    if not per_class_indices:
+        raise ValueError(f"No per-class indices found in {indices_path}")
+
+    cleaned = {}
+    for class_key, idx_list in per_class_indices.items():
+        class_id = int(class_key)
+        cleaned[class_id] = [int(idx) for idx in idx_list]
+    return cleaned
+
+
+def _build_tracked_subsets(per_class_indices: Dict[int, List[int]], track_top: int):
+    tracked_subsets = []
+    trimmed_by_class: Dict[int, List[int]] = {}
+    for class_id, idx_list in per_class_indices.items():
+        trimmed = [int(idx) for idx in idx_list[:track_top]]
+        if not trimmed:
+            continue
+        trimmed_by_class[class_id] = trimmed
+        tracked_subsets.append({
+            "name": f"class_{class_id}",
+            "class_id": class_id,
+            "indices": trimmed,
+        })
+    return tracked_subsets, trimmed_by_class
+
+
+def _sample_inlier_subsets(
+    labels: torch.Tensor,
+    excluded_by_class: Dict[int, List[int]],
+    seed: int,
+) -> List[dict]:
+    if labels is None or not excluded_by_class:
+        return []
+
+    label_tensor = labels.detach().cpu()
+    if label_tensor.ndim > 1:
+        label_tensor = label_tensor.argmax(dim=1)
+    label_tensor = label_tensor.to(dtype=torch.long)
+    rng = random.Random(seed)
+
+    subsets = []
+    for class_id, excluded in excluded_by_class.items():
+        class_mask = (label_tensor == class_id)
+        class_indices = class_mask.nonzero(as_tuple=False).view(-1).tolist()
+        if not class_indices:
+            continue
+        excluded_set = set(excluded)
+        candidates = [idx for idx in class_indices if idx not in excluded_set]
+        if not candidates:
+            continue
+        desired = min(len(excluded), len(candidates))
+        if desired <= 0:
+            continue
+        if len(candidates) > desired:
+            sampled = rng.sample(candidates, desired)
+        else:
+            sampled = candidates
+        subsets.append({
+            "name": f"class_{class_id}",
+            "class_id": class_id,
+            "indices": sampled,
+        })
+    return subsets
+
+
+def prepare_knn_subset_tracking_configs(args, dataset_name: str, model_name: str, data) -> List[dict]:
+    if not args.track_knn_outliers_from:
+        return []
+
+    per_class_indices = _load_reference_knn_indices(dataset_name, model_name, args.track_knn_outliers_from)
+    track_top = max(1, args.track_knn_topk)
+
+    tracked_subsets, trimmed_by_class = _build_tracked_subsets(per_class_indices, track_top)
+    if not tracked_subsets:
+        raise ValueError(
+            f"No indices remained after applying --track-knn-topk={track_top} "
+            f"for run {args.track_knn_outliers_from}"
+        )
+
+    configs = [{
+        "enabled": True,
+        "subsets": tracked_subsets,
+        "metrics": KNN_TRACKING_METRICS,
+        "log_prefix": f"knn_outlier/{args.track_knn_outliers_from}",
+    }]
+
+    _, Y_train, _, _ = data
+    inlier_seed = (args.dataset_seed or 0) + 1337
+    inlier_subsets = _sample_inlier_subsets(Y_train, trimmed_by_class, seed=inlier_seed)
+    if inlier_subsets:
+        configs.append({
+            "enabled": True,
+            "subsets": inlier_subsets,
+            "metrics": KNN_TRACKING_METRICS,
+            "log_prefix": f"knn_inlier/{args.track_knn_outliers_from}",
+        })
+    else:
+        print("Warning: Unable to sample knn_inlier subsets; insufficient inlier candidates.")
+
+    return configs
 
 
 
@@ -286,7 +405,7 @@ class MeasurementRunner:
         # NEW:
         full_inputs_test=None,
         per_sample_cfg=None,
-        outlier_tracking_cfg=None,
+        subset_tracking_cfgs=None,
     ):
         self.net = net
         self.loss_fn = loss_fn
@@ -370,28 +489,33 @@ class MeasurementRunner:
             self.ps_dir = None
             self.frames_dir = None
 
-        self.outlier_tracking = None
-        if outlier_tracking_cfg and outlier_tracking_cfg.get('subsets'):
-            tracked_subsets = []
-            for subset in outlier_tracking_cfg['subsets']:
-                indices = subset.get('indices')
-                if not torch.is_tensor(indices):
-                    indices = torch.tensor(indices, dtype=torch.long, device=self.X.device)
-                else:
-                    indices = indices.to(device=self.X.device, dtype=torch.long)
-                tracked_subsets.append({
-                    "name": subset.get('name', f"class_{subset.get('class_id', 'unknown')}"),
-                    "class_id": subset.get('class_id'),
-                    "indices": indices,
-                })
+        self.subset_trackers = []
+        if subset_tracking_cfgs:
+            for cfg in subset_tracking_cfgs:
+                if not cfg or not cfg.get('enabled', False):
+                    continue
+                tracked_subsets = []
+                for subset in cfg.get('subsets', []):
+                    indices = subset.get('indices')
+                    if not torch.is_tensor(indices):
+                        indices = torch.tensor(indices, dtype=torch.long, device=self.X.device)
+                    else:
+                        indices = indices.to(device=self.X.device, dtype=torch.long)
+                    if indices.numel() == 0:
+                        continue
+                    tracked_subsets.append({
+                        "name": subset.get('name', f"class_{subset.get('class_id', 'unknown')}"),
+                        "class_id": subset.get('class_id'),
+                        "indices": indices,
+                    })
 
-            if tracked_subsets:
-                self.outlier_tracking = {
-                    "subsets": tracked_subsets,
-                    "metrics": outlier_tracking_cfg.get('metrics', ["full_loss", "accuracy", "lambda_max"]),
-                    "metric_kwargs": outlier_tracking_cfg.get('metric_kwargs', {}),
-                    "log_prefix": outlier_tracking_cfg.get('log_prefix', "knn_outlier"),
-                }
+                if tracked_subsets:
+                    self.subset_trackers.append({
+                        "subsets": tracked_subsets,
+                        "metrics": cfg.get('metrics', ["full_loss", "accuracy", "lambda_max"]),
+                        "metric_kwargs": cfg.get('metric_kwargs', {}),
+                        "log_prefix": cfg.get('log_prefix', "knn_outlier"),
+                    })
 
         self.eigenvalues_log = []
         if 'lmax' in measurements and num_eigenvalues > 1:
@@ -617,24 +741,25 @@ class MeasurementRunner:
                 metrics['test_acc'] = vals['test_acc']
                 metrics['train_test_gap'] = vals['gap']
 
-        if self.outlier_tracking and frequency_calculator.should_measure('knn_outlier_metrics', ctx):
-            metric_kwargs = self.outlier_tracking.get('metric_kwargs', {})
-            for subset in self.outlier_tracking['subsets']:
-                subset_results = compute_subset_metrics(
-                    net=self.net,
-                    loss_fn=self.loss_fn,
-                    X=self.X,
-                    Y=self.Y,
-                    indices=subset['indices'],
-                    metrics=self.outlier_tracking['metrics'],
-                    eigenvector_cache=self.eigenvector_cache,
-                    num_eigenvalues=self.num_eigenvalues,
-                    use_power_iteration=self.use_power_iteration,
-                    metric_kwargs=metric_kwargs,
-                )
-                prefix = f"{self.outlier_tracking['log_prefix']}/{subset['name']}"
-                for key, value in subset_results.items():
-                    metrics[f"{prefix}/{key}"] = value
+        if self.subset_trackers and frequency_calculator.should_measure('knn_outlier_metrics', ctx):
+            for tracker in self.subset_trackers:
+                metric_kwargs = tracker.get('metric_kwargs', {})
+                for subset in tracker['subsets']:
+                    subset_results = compute_subset_metrics(
+                        net=self.net,
+                        loss_fn=self.loss_fn,
+                        X=self.X,
+                        Y=self.Y,
+                        indices=subset['indices'],
+                        metrics=tracker['metrics'],
+                        eigenvector_cache=self.eigenvector_cache,
+                        num_eigenvalues=self.num_eigenvalues,
+                        use_power_iteration=self.use_power_iteration,
+                        metric_kwargs=metric_kwargs,
+                    )
+                    prefix = f"{tracker['log_prefix']}/{subset['name']}"
+                    for key, value in subset_results.items():
+                        metrics[f"{prefix}/{key}"] = value
 
         # ----- NEW: Per-sample histograms -----
         if self.per_sample_cfg and self.per_sample_cfg['enabled']:
@@ -896,7 +1021,7 @@ def train(
             wandb_run_id: str = None,
             per_sample_cfg=None, #NEW 
             knn_outlier_cfg=None,
-            outlier_tracking_cfg=None,
+            subset_tracking_cfgs=None,
     ):
     
     # -------------------------------------
@@ -1019,7 +1144,8 @@ def train(
         proj_switch_step=proj_switch_step,
         quad_approx=quad_approx,
         memorization_outlier_frac=memorization_outlier_frac,
-        outlier_tracking_cfg=outlier_tracking_cfg,
+        per_sample_cfg=per_sample_cfg,
+        subset_tracking_cfgs=subset_tracking_cfgs,
     )
     # ----- Run Identification -----
     run_id = wandb_run_id or generate_run_id()
@@ -1810,6 +1936,22 @@ if __name__ == '__main__':
     else:
         checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
     
+    per_sample_cfg = None
+    if args.per_sample:
+        freq = args.per_sample_freq if args.per_sample_freq is not None else 0.01
+        if args.steps is None:
+            raise ValueError("--per-sample requires --steps when using --epochs-only mode")
+        every = max(1, int(args.steps * freq))
+        per_sample_cfg = {
+            'enabled': True,
+            'every': every,
+            'hist_min_log10': args.per_sample_min_log10,
+            'hist_max_log10': args.per_sample_max_log10,
+            'hist_bins': args.per_sample_bins,
+            'metrics': args.per_sample_metrics,
+            'no_frames': args.no_frames,
+        }
+
     knn_outlier_cfg = None
     if args.knn_outliers:
         if args.knn_neighbors < 2:
@@ -1827,47 +1969,7 @@ if __name__ == '__main__':
             "return_neighbor_indices": True,
         }
 
-    outlier_tracking_cfg = None
-    if args.track_knn_outliers_from:
-        plaintext_root = RES_FOLDER / 'plaintext' / f"{dataset}_{args.model}"
-        ref_run_dir = plaintext_root / args.track_knn_outliers_from
-        indices_path = ref_run_dir / 'knn_outlier_indices.json'
-        if not indices_path.exists():
-            raise FileNotFoundError(
-                f"Cannot find knn_outlier_indices.json at {indices_path}. "
-                "Ensure the reference run name is correct."
-            )
-        with open(indices_path, 'r') as f:
-            indices_payload = json.load(f)
-
-        per_class_indices = indices_payload.get('per_class_indices', {})
-        if not per_class_indices:
-            raise ValueError(f"No per-class indices found in {indices_path}")
-
-        track_top = max(1, args.track_knn_topk)
-        tracked_subsets = []
-        for class_key, idx_list in per_class_indices.items():
-            trimmed = idx_list[:track_top]
-            if not trimmed:
-                continue
-            tracked_subsets.append({
-                "name": f"class_{class_key}",
-                "class_id": int(class_key),
-                "indices": torch.tensor(trimmed, dtype=torch.long),
-            })
-
-        if not tracked_subsets:
-            raise ValueError(
-                f"No indices remained after applying --track-knn-topk={track_top} "
-                f"for run {args.track_knn_outliers_from}"
-            )
-
-        outlier_tracking_cfg = {
-            "enabled": True,
-            "subsets": tracked_subsets,
-            "metrics": ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad"],
-            "log_prefix": f"knn_outlier/{args.track_knn_outliers_from}",
-        }
+    subset_tracking_cfgs = prepare_knn_subset_tracking_configs(args, dataset, args.model, data) if args.track_knn_outliers_from else []
 
     # ----- Training Invocation -----
     train(
@@ -1910,8 +2012,8 @@ if __name__ == '__main__':
         wandb_enabled=wandb_enabled,
         wandb_run_id=wandb_run_id,
         #NEW
-        per_sample_cfg=None,
+        per_sample_cfg=per_sample_cfg,
         knn_outlier_cfg=knn_outlier_cfg,
-        outlier_tracking_cfg=outlier_tracking_cfg,
+        subset_tracking_cfgs=subset_tracking_cfgs,
 
     )
