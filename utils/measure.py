@@ -4,7 +4,7 @@ import torch.nn as nn
 from einops import rearrange, repeat
 from torch import linalg as LA
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import wandb
 from .lobpcg import torch_lobpcg, _maybe_orthonormalize
@@ -25,7 +25,9 @@ __all__ = ['compute_train_test_gap_from_tensors','param_vector', 'param_length',
            'calculate_gradient_norm_squared_mc', 'calculate_expected_one_step_full_loss_change',
            'calculate_expected_one_step_batch_loss_change', 'compute_gradient_projection_ratios',
            'estimate_hessian_trace', 'gimme_new_rng', 'gimme_random_subset_idx',
-           'compute_per_example_losses', 'compute_outlier_vs_bulk_stats_hessian']
+           'compute_per_example_losses', 'compute_outlier_vs_bulk_stats_hessian',
+           'extract_feature_matrix', 'identify_knn_outliers_by_neighbor_mix',
+           'select_dataset_subset', 'compute_subset_metrics']
 
 
 class EigenvectorCache:
@@ -1734,3 +1736,351 @@ def compute_outlier_vs_bulk_stats_hessian(
         pass
 
     return metrics
+
+
+@torch.no_grad()
+def extract_feature_matrix(
+    net: nn.Module,
+    inputs: torch.Tensor,
+    batch_size: int = 512,
+    flatten_outputs: bool = True,
+    device: Optional[torch.device] = None,
+):
+    """
+    Run `net` over `inputs` and collect a matrix of features/logits.
+
+    Args:
+        net: Trained network.
+        inputs: Tensor containing the dataset to be embedded.
+        batch_size: Mini-batch size used during the forward pass.
+        flatten_outputs: If True, flattens non-vector outputs to 2D.
+        device: Optional override for the computation device.
+
+    Returns:
+        Tensor of shape (N, D) on CPU containing the feature vectors.
+    """
+    if inputs.ndim < 2:
+        raise ValueError("inputs must have at least 2 dimensions (batch, ...)")
+
+    target_device = device or next(net.parameters()).device
+    was_training = net.training
+    net.eval()
+
+    features = []
+    total = inputs.shape[0]
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch = inputs[start:end].to(target_device)
+        outputs = net(batch)
+        if isinstance(outputs, tuple):
+            outputs = outputs[0]
+        if outputs.ndim == 1:
+            outputs = outputs.unsqueeze(1)
+        if flatten_outputs and outputs.ndim > 2:
+            outputs = outputs.view(outputs.shape[0], -1)
+        features.append(outputs.detach().to('cpu', copy=True))
+
+    if was_training:
+        net.train()
+
+    return torch.cat(features, dim=0)
+
+
+def identify_knn_outliers_by_neighbor_mix(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    k_neighbors: int = 32,
+    top_k_per_class: int = 5,
+    balance_target: float = 0.5,
+    chunk_size: int = 1024,
+    normalize: bool = True,
+    return_neighbor_indices: bool = False,
+):
+    """
+    Identify samples whose k-NN neighborhood is closest to a 50/50 class split.
+
+    Args:
+        features: Tensor of shape (N, D) containing feature vectors (e.g., logits).
+        labels: Tensor of shape (N,) or one-hot encoded labels.
+        k_neighbors: Number of nearest neighbors to inspect for each sample.
+        top_k_per_class: Number of outlier candidates to keep per class.
+        balance_target: Desired ratio for same-class neighbors (0.5 = perfect balance).
+        chunk_size: How many query samples to process at once when building the k-NN graph.
+        normalize: If True, L2-normalize feature vectors before computing distances.
+        return_neighbor_indices: If True, include neighbor indices in the output.
+
+    Returns:
+        Dictionary summarizing outliers per class together with k-NN mix statistics.
+    """
+    if features.ndim != 2:
+        raise ValueError("features must be a 2D tensor of shape (N, D)")
+
+    if k_neighbors < 1:
+        raise ValueError("k_neighbors must be >= 1")
+
+    if k_neighbors >= features.shape[0]:
+        raise ValueError("k_neighbors must be smaller than the number of samples")
+
+    feats = features.detach().to(torch.float32)
+    if normalize:
+        feats = torch.nn.functional.normalize(feats, dim=1)
+    if feats.device.type != 'cpu':
+        feats = feats.cpu()
+
+    labels_cpu = labels.detach().cpu()
+    if labels_cpu.ndim > 1:
+        labels_cpu = torch.argmax(labels_cpu, dim=1)
+    labels_cpu = labels_cpu.to(torch.long)
+
+    class_values, mapped_labels = torch.unique(labels_cpu, sorted=True, return_inverse=True)
+    num_classes = class_values.numel()
+    if num_classes == 0:
+        return {}
+
+    n_samples = feats.shape[0]
+    chunk_size = max(1, min(chunk_size, n_samples))
+
+    knn_indices = torch.empty((n_samples, k_neighbors), dtype=torch.long)
+    knn_distances = torch.empty((n_samples, k_neighbors), dtype=feats.dtype)
+
+    for start in range(0, n_samples, chunk_size):
+        end = min(start + chunk_size, n_samples)
+        query = feats[start:end]
+        dists = torch.cdist(query, feats, p=2)
+        rows = torch.arange(end - start, device=dists.device)
+        cols = torch.arange(start, end, device=dists.device)
+        dists[rows, cols] = float('inf')
+        dist_vals, idx = torch.topk(dists, k=k_neighbors, dim=1, largest=False)
+        knn_indices[start:end] = idx
+        knn_distances[start:end] = dist_vals
+
+    neighbor_labels = mapped_labels[knn_indices]
+    neighbor_counts = torch.nn.functional.one_hot(
+        neighbor_labels, num_classes=num_classes
+    ).sum(dim=1)
+
+    same_class_counts = neighbor_counts[torch.arange(n_samples), mapped_labels]
+    same_class_ratio = same_class_counts.to(torch.float32) / float(k_neighbors)
+    balance_deviation = (same_class_ratio - balance_target).abs()
+
+    neighbor_probs = neighbor_counts.to(torch.float32) / float(k_neighbors)
+    entropy = -(neighbor_probs.clamp_min(1e-12) * neighbor_probs.clamp_min(1e-12).log()).sum(dim=1)
+
+    if num_classes >= 2:
+        top_two = torch.topk(neighbor_probs, k=2, dim=1).values
+        mix_gap = (top_two[:, 0] - top_two[:, 1]).abs()
+    else:
+        mix_gap = torch.zeros_like(same_class_ratio)
+
+    per_class_results = {}
+    for class_idx, class_value in enumerate(class_values):
+        class_mask = (mapped_labels == class_idx)
+        class_indices = class_mask.nonzero(as_tuple=False).view(-1)
+        if class_indices.numel() == 0:
+            continue
+
+        class_scores = balance_deviation[class_indices]
+        keep = min(top_k_per_class, class_scores.numel())
+        if keep == 0:
+            continue
+        _, top_local_idx = torch.topk(class_scores, k=keep, largest=False)
+        selected_indices = class_indices[top_local_idx]
+
+        entries = []
+        for idx in selected_indices.tolist():
+            entry = {
+                "dataset_index": int(idx),
+                "same_class_ratio": float(same_class_ratio[idx].item()),
+                "balance_deviation": float(balance_deviation[idx].item()),
+                "neighbor_entropy": float(entropy[idx].item()),
+                "top_two_gap": float(mix_gap[idx].item()),
+                "neighbor_class_counts": {
+                    int(class_values[j].item()): int(neighbor_counts[idx, j].item())
+                    for j in range(num_classes)
+                },
+                "avg_neighbor_distance": float(knn_distances[idx].mean().item()),
+            }
+            if return_neighbor_indices:
+                entry["neighbor_indices"] = knn_indices[idx].tolist()
+            entries.append(entry)
+
+        per_class_results[int(class_value.item())] = entries
+
+    return {
+        "k_neighbors": int(k_neighbors),
+        "top_k_per_class": int(top_k_per_class),
+        "balance_target": float(balance_target),
+        "num_samples": int(n_samples),
+        "class_ids": [int(val.item()) for val in class_values],
+        "outliers": per_class_results,
+    }
+
+
+def select_dataset_subset(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    indices: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Slice tensors X/Y along the first dimension according to `indices`.
+
+    Args:
+        X: Tensor of inputs.
+        Y: Tensor of targets.
+        indices: 1-D tensor/list of indices. If None, returns (X, Y).
+
+    Returns:
+        (X_subset, Y_subset)
+    """
+    if indices is None:
+        return X, Y
+
+    if not torch.is_tensor(indices):
+        indices = torch.tensor(indices, dtype=torch.long, device=X.device)
+    else:
+        indices = indices.to(dtype=torch.long, device=X.device)
+
+    return X.index_select(0, indices), Y.index_select(0, indices)
+
+
+def compute_subset_metrics(
+    net: nn.Module,
+    loss_fn,
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    indices,
+    metrics: Optional[List[str]] = None,
+    *,
+    eigenvector_cache: Optional[EigenvectorCache] = None,
+    num_eigenvalues: int = 1,
+    use_power_iteration: bool = False,
+    metric_kwargs: Optional[dict] = None,
+) -> dict:
+    """
+    Compute measurement-runner style metrics restricted to a subset of examples.
+
+    Args:
+        net: Model under evaluation.
+        loss_fn: Loss function used during training.
+        X, Y: Full dataset tensors.
+        indices: Indices identifying the subset of interest.
+        metrics: List of metric names to compute. Defaults to
+                 ['full_loss','accuracy','lambda_max'].
+        eigenvector_cache, num_eigenvalues, use_power_iteration:
+                 Controls for Hessian eigen computations.
+        metric_kwargs: Optional mapping metric_name -> kwargs for fine control.
+
+    Returns:
+        Dictionary of computed metrics.
+    """
+    if metrics is None:
+        metrics = ["full_loss", "accuracy", "lambda_max"]
+    if metric_kwargs is None:
+        metric_kwargs = {}
+
+    X_subset, Y_subset = select_dataset_subset(X, Y, indices)
+    if X_subset.numel() == 0:
+        raise ValueError("Subset is empty; cannot compute metrics.")
+
+    device = next(net.parameters()).device
+    X_subset = X_subset.to(device)
+    Y_subset = Y_subset.to(device)
+
+    was_training = net.training
+    net.eval()
+
+    results = {}
+
+    preds = net(X_subset).squeeze(dim=-1)
+    loss_value = loss_fn(preds, Y_subset)
+
+    if "full_loss" in metrics:
+        results["full_loss"] = float(loss_value.item())
+
+    if "accuracy" in metrics:
+        with torch.no_grad():
+            results["accuracy"] = float(calculate_accuracy(preds, Y_subset))
+
+    if "lambda_max" in metrics or "all_eigenvalues" in metrics:
+        eig_kwargs = dict(metric_kwargs.get("lambda_max", {}))
+        k = eig_kwargs.pop("k", num_eigenvalues)
+        return_eigenvectors = eig_kwargs.pop("return_eigenvectors", False)
+        eigenvalues = compute_eigenvalues(
+            loss_value,
+            net,
+            k=k,
+            eigenvector_cache=eigenvector_cache,
+            use_power_iteration=eig_kwargs.pop("use_power_iteration", use_power_iteration),
+            **eig_kwargs,
+        )
+        if return_eigenvectors:
+            eigenvalues, eigenvectors = eigenvalues
+            results["all_eigenvalues"] = eigenvalues.detach().cpu().tolist()
+            results["lambda_max"] = float(eigenvalues[0].item())
+            results["eigenvectors"] = eigenvectors
+        else:
+            if torch.is_tensor(eigenvalues):
+                if eigenvalues.numel() == 1:
+                    results["lambda_max"] = float(eigenvalues.item())
+                else:
+                    results["all_eigenvalues"] = eigenvalues.detach().cpu().tolist()
+                    results["lambda_max"] = float(eigenvalues[0].item())
+            elif isinstance(eigenvalues, tuple):
+                vals = eigenvalues[0]
+                results["all_eigenvalues"] = vals.detach().cpu().tolist()
+                results["lambda_max"] = float(vals[0].item())
+
+    if "grad_hessian_grad" in metrics:
+        results["grad_hessian_grad"] = float(compute_grad_H_grad(loss_value, net).item())
+
+    if "gradient_norm_squared" in metrics:
+        gn_kwargs = metric_kwargs.get("gradient_norm_squared", {})
+        results["gradient_norm_squared"] = float(
+            calculate_gradient_norm_squared_mc(
+                net=net,
+                X=X_subset,
+                Y=Y_subset,
+                loss_fn=loss_fn,
+                batch_size=gn_kwargs.get("batch_size", len(X_subset)),
+                n_estimates=gn_kwargs.get("n_estimates", 100),
+                min_estimates=gn_kwargs.get("min_estimates", 10),
+                eps=gn_kwargs.get("eps", 0.01),
+            )
+        )
+
+    if "gni" in metrics:
+        gni_kwargs = metric_kwargs.get("gni", {})
+        results["gni"] = float(
+            calculate_gni(
+                net=net,
+                X=X_subset,
+                Y=Y_subset,
+                loss_fn=loss_fn,
+                batch_size=gni_kwargs.get("batch_size", len(X_subset)),
+                n_estimates=gni_kwargs.get("n_estimates", 200),
+                min_estimates=gni_kwargs.get("min_estimates", 10),
+                tolerance=gni_kwargs.get("tolerance", 0.01),
+                use_subset_of_data=gni_kwargs.get("use_subset_of_data", None),
+            )
+        )
+
+    if "hessian_trace" in metrics:
+        trace_kwargs = metric_kwargs.get("hessian_trace", {})
+        results["hessian_trace"] = float(
+            estimate_hessian_trace(
+                net=net,
+                X=X_subset,
+                Y=Y_subset,
+                loss_fn=loss_fn,
+                max_estimates=trace_kwargs.get("max_estimates", 256),
+                min_estimates=trace_kwargs.get("min_estimates", 10),
+                eps=trace_kwargs.get("eps", 0.01),
+                probe_type=trace_kwargs.get("probe_type", "rademacher"),
+            )
+        )
+
+    if was_training:
+        net.train()
+
+    return results

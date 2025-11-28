@@ -22,3 +22,5 @@ pytest>=7.0.0
 
 # Optional: For visualization (commented out since not actively used)
 # plotly>=5.0.0 
+
+imageio >= 2.0.0
