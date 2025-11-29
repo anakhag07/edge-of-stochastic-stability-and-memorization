@@ -416,6 +416,16 @@ def _quantiles(values, qs=(0.1,0.5,0.9,0.99)):
 def _ensure_dir(p):
     Path(p).mkdir(parents=True, exist_ok=True)
 
+def _format_duration(seconds):
+    seconds = max(int(seconds), 0)
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
 def _render_frame(bin_edges, counts_train, counts_test, title, out_png_path):
     plt.figure(figsize=(6,4))
     centers = 0.5*(bin_edges[1:]+bin_edges[:-1])
@@ -1512,6 +1522,16 @@ def train(
             )
             if checkpoint_path:
                 print(f"Checkpoint saved at step {step_number}: {checkpoint_path}")
+                if max_steps is not None and step_number > step_to_start:
+                    elapsed = time.time() - start_time
+                    steps_done = step_number - step_to_start
+                    avg_step_time = elapsed / steps_done
+                    remaining_steps = max(max_steps - step_number, 0)
+                    eta_seconds = remaining_steps * avg_step_time
+                    eta_str = _format_duration(eta_seconds)
+                    finish_ts = time.time() + eta_seconds
+                    finish_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(finish_ts))
+                    print(f"  Estimated time remaining: {eta_str} (finish ~ {finish_str})")
 
             # -------------------------------------
             # Section: Logging (Step)
