@@ -142,6 +142,15 @@ def prepare_knn_subset_tracking_configs(args, dataset_name: str, model_name: str
         return []
 
     per_class_indices = _load_reference_knn_indices(dataset_name, model_name, args.track_knn_outliers_from)
+    allowed_classes = set(args.classes or [])
+    if allowed_classes:
+        per_class_indices = {cid: idxs for cid, idxs in per_class_indices.items() if cid in allowed_classes}
+        if not per_class_indices:
+            raise ValueError(
+                f"No reference KNN indices for requested classes {sorted(allowed_classes)} "
+                f"in run {args.track_knn_outliers_from}"
+            )
+
     track_top = max(1, args.track_knn_topk)
 
     tracked_subsets, trimmed_by_class = _build_tracked_subsets(per_class_indices, track_top)
