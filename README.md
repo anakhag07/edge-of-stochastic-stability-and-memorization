@@ -20,7 +20,7 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
      --steps 150000 --num-data 8192 \
      --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
      --lambdamax --batch-sharpness \
-     --track-knn-outliers-from 20251124_0820_35_lr0.01000_b8 \
+     --track-knn-outliers-from $RUN_DIR \
      --track-knn-topk 5
    ```
    When `--track-knn-outliers-from` is set, the training loop automatically loads the stored indices, logs per-class metrics for those outliers under the `knn_outlier/<run>/class_*/*` series in Weights & Biases, and also samples the same number of inliers per class that get logged under `knn_inlier/<run>/class_*/*`. This allows you to compare loss/accuracy/λ_max/grad H grad for memorized versus typical points as training progresses.
