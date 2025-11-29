@@ -10,10 +10,15 @@ from pathlib import Path
 import math
 import random
 import argparse
-
+import torch.nn.functional as F
 import time
 
-from utils.data import prepare_dataset, get_dataset_presets
+import imageio.v2 as imageio
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from utils.data import prepare_dataset, get_dataset_presets,generate_prototype_sets
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
 from utils.nets import ResNet
 from utils.storage import initialize_folders
@@ -26,14 +31,17 @@ from utils.wandb_utils import (
     get_checkpoint_dir_for_run,
     is_wandb_available,
     generate_run_id,
+
 )
 
 from utils.noise import gd_with_noise, GradStorage, sde_integration
 from utils.measure import *
+from utils.measure import compute_train_test_gap_from_tensors
+from utils.frequency import frequency_calculator, MeasurementContext
+from utils.quadratic import QuadraticApproximation, flatten_params, set_model_params, unflatten_params
 
 from torch.autograd import grad
 import json
-
 
 if 'DATASETS' not in os.environ:
     raise ValueError("Please set the environment variable 'DATASETS'. Use 'export DATASETS=/path/to/datasets'")
@@ -41,7 +49,58 @@ if 'RESULTS' not in os.environ:
     raise ValueError("Please set the environment variable 'RESULTS'. Use 'export RESULTS=/path/to/results'")
 
 DATASET_FOLDER = Path(os.environ.get('DATASETS'))
+# export RESULTS=/scratch/gpfs/andreyev/eoss/results
 RES_FOLDER = Path(os.environ.get('RESULTS'))
+
+
+
+# -------------------------------------
+# NEW: Sharpness for Prototypes
+# ------------------------------------
+
+def compute_prototype_metrics(net, loss_fn, prototype_data, device, base_batch_size=32):
+    """
+    prototype_data: dict like {
+        'boundary': (X_boundary, Y_boundary),
+        'x_outlier': (X_x, Y_x),
+        'y_outlier': (X_y, Y_y),
+        'inliers': (X_in, Y_in),
+    }
+    """
+    metrics = {}
+
+    for name, (X_p, Y_p) in prototype_data.items():
+        X_p = X_p.to(device)
+        Y_p = Y_p.to(device)
+        n = X_p.shape[0]
+        batch_size = min(base_batch_size, n)
+
+
+        # ---- Prototype Loss ----
+        with torch.no_grad():
+            logits = net(X_p)
+            loss_val = loss_fn(logits, Y_p).item()
+        metrics[f"prototype/{name}/loss"] = loss_val
+
+
+        # ---- Batch sharpness: E[gᵀHg / ||g||²] on the prototype set ----
+        proto_batch_sharp = calculate_averaged_grad_H_grad(
+            net=net,
+            X=X_p,
+            Y=Y_p,
+            loss_fn=loss_fn,
+            batch_size=batch_size,
+            n_estimates=1,       # small set, 1–3 estimates is usually enough
+            min_estimates=1,
+            eps=1.0,             # don't bother with tight MC convergence
+            expectation_inside=False,
+            with_replacement=False,
+            return_confidence_interval=False,
+        )
+        metrics[f"prototype/{name}/batch_sharpness"] = float(proto_batch_sharp)
+
+    return metrics
+
 
 
 # -------------------------------------
@@ -57,47 +116,119 @@ class PerSampleHistograms:
         self.counts = {metric: 0 for metric in metrics}
         self.quantiles = {metric: np.zeros((bins,)) for metric in metrics}
 
-@torch.no_grad()
+# @torch.no_grad()
+
 def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, device='cuda'):
-    """Return dict of numpy arrays: loss, resid_norm, kappa for dataset (X,Y)."""
+    """
+    Return dict of numpy arrays: loss, resid_norm, kappa, grad_norm for dataset (X, Y).
+    loss_type: 'ce' (cross-entropy) or 'mse' (SquaredLoss: 0.5 * ||y - yhat||^2).
+    """
+    was_training = net.training
     net.eval()
-    out_loss, out_resid, out_kappa = [], [], []
+
+    out_loss, out_resid, out_kappa, out_grad_norm = [], [], [], []
+
     for i in range(0, len(X), batch_size):
-        xb = X[i:i+batch_size].to(device)
-        yb = Y[i:i+batch_size].to(device)
-        z = net(xb)  # logits for CE; prediction for MSE
-        if loss_type == 'ce':
-            # losses per-sample
-            loss = torch.nn.functional.cross_entropy(z, yb, reduction='none')
-            # residual wrt logits: p - y_onehot
-            p = torch.softmax(z, dim=1)
-            y1 = torch.nn.functional.one_hot(yb, num_classes=z.size(1)).float()
-            resid = p - y1                      # dL/dz
-            resid_norm = resid.norm(dim=1)
-            # curvature proxy: Frobenius norm of softmax Hessian
-            # ||diag(p) - p p^T||_F
-            I = torch.eye(p.size(1), device=p.device).unsqueeze(0)   # [1, C, C]
-            Hout = I * p.unsqueeze(2) - p.unsqueeze(2) * p.unsqueeze(1)
-            kappa = torch.linalg.norm(Hout, dim=(1,2))
-        else:
-            # MSE (your SquaredLoss is 0.5*||y - yhat||^2); match that here per-sample
-            if z.ndim == 1 or z.size(-1) == 1:
-                z = z.squeeze(-1)
-            # If Y is class index for 2-class, convert upstream; here assume Y already numeric
-            diff = (z - yb)
-            loss = 0.5*(diff**2)
-            if loss.ndim > 1:
-                loss = loss.sum(dim=1)
-            resid_norm = diff if diff.ndim==1 else diff.norm(dim=1)
-            kappa = torch.ones_like(loss)  # output-space curvature is constant for MSE
-        out_loss.append(loss.detach().cpu())
-        out_resid.append(resid_norm.detach().cpu())
-        out_kappa.append(kappa.detach().cpu())
-    net.train()
+        xb = X[i:i + batch_size].to(device)
+        yb = Y[i:i + batch_size].to(device)
+
+        grad_norms_batch = []
+
+        for j in range(xb.shape[0]):
+            xb_j = xb[j:j + 1]  # [1, ...]
+            yb_j = yb[j:j + 1]  # [1] or [1, C]
+
+            net.zero_grad()
+
+            z_j = net(xb_j)
+
+            if loss_type == 'ce':
+                # Cross-entropy for a single sample
+                loss_j = F.cross_entropy(z_j, yb_j.long(), reduction='sum')
+            else:
+                # MSE: 0.5 * ||y - yhat||^2
+                zf = z_j
+                yf = yb_j
+
+                if zf.ndim > 1 and zf.size(-1) == 1:
+                    zf = zf.squeeze(-1)
+                if yf.ndim > 1 and yf.size(-1) == 1:
+                    yf = yf.squeeze(-1)
+
+                loss_j = 0.5 * (zf - yf).pow(2).sum()
+
+            loss_j.backward()
+
+            grads = []
+            for param in net.parameters():
+                if param.grad is not None:
+                    grads.append(param.grad.view(-1))
+
+            if grads:
+                g = torch.cat(grads)
+                grad_norms_batch.append(torch.linalg.norm(g).item())
+            else:
+                grad_norms_batch.append(0.0)
+
+        out_grad_norm.extend(grad_norms_batch)
+
+        # ----------------------------------------------------
+        # Loss / resid_norm / kappa
+        # ----------------------------------------------------
+        with torch.no_grad():
+            z = net(xb)
+
+            if loss_type == 'ce':
+                # Per-sample CE loss
+                loss = F.cross_entropy(z, yb.long(), reduction='none')
+
+                # Residual wrt logits: p - y_onehot
+                p = torch.softmax(z, dim=1)
+                y1 = F.one_hot(yb.long(), num_classes=z.size(1)).float()
+                resid = p - y1
+                resid_norm = resid.norm(dim=1)
+
+                # Curvature proxy: Frobenius norm of softmax Hessian
+                C = p.size(1)
+                I = torch.eye(C, device=p.device).unsqueeze(0)  # [1, C, C]
+                Hout = I * p.unsqueeze(2) - p.unsqueeze(2) * p.unsqueeze(1)
+                kappa = torch.linalg.norm(Hout, dim=(1, 2))
+
+            else:
+                # MSE: SquaredLoss 0.5 * ||y - yhat||^2
+                zf = z
+                yf = yb
+
+                if zf.ndim > 1 and zf.size(-1) == 1:
+                    zf = zf.squeeze(-1)
+                if yf.ndim > 1 and yf.size(-1) == 1:
+                    yf = yf.squeeze(-1)
+
+                diff = zf - yf                       # [B] or [B, D]
+                loss = 0.5 * (diff ** 2)
+                if loss.ndim > 1:
+                    loss = loss.sum(dim=1)
+
+                if diff.ndim > 1:
+                    resid_norm = diff.norm(dim=1)
+                else:
+                    resid_norm = diff.abs()
+
+                # For plain MSE, output-space curvature is constant
+                kappa = torch.ones_like(loss)
+
+        out_loss.append(loss.cpu())
+        out_resid.append(resid_norm.cpu())
+        out_kappa.append(kappa.cpu())
+
+    if was_training:
+        net.train()
+
     return {
         'loss': torch.cat(out_loss).numpy(),
         'resid': torch.cat(out_resid).numpy(),
         'kappa': torch.cat(out_kappa).numpy(),
+        'grad_norm': np.asarray(out_grad_norm),
     }
 
 def _hist_log10(values, bin_edges):
@@ -160,6 +291,7 @@ class MeasurementRunner:
         quad_approx,
         memorization_outlier_frac: float,
         # NEW:
+        prototype_data,
         full_inputs_test=None,
         per_sample_cfg=None,
     ):
@@ -187,35 +319,8 @@ class MeasurementRunner:
         self.gd_noise = gd_noise
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
-        self.memorization_outlier_frac = memorization_outlier_frac
-        
-        # NEW: Per-sample config
-        self.full_inputs_test = full_inputs_test
-        self.per_sample_cfg = per_sample_cfg
-        
-        # NEW: Per-sample initialization logic
-        if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
-            self.per_sample_histograms = PerSampleHistograms(
-                min_log10=per_sample_cfg['hist_min_log10'],
-                max_log10=per_sample_cfg['hist_max_log10'],
-                bins=per_sample_cfg['hist_bins'],
-                metrics=per_sample_cfg.get('metrics', per_sample_cfg.get('hist_metrics', ['loss'])))
-            # Initialize bin edges for log10 histogram
-            self.bin_edges = np.linspace(
-                per_sample_cfg['hist_min_log10'],
-                per_sample_cfg['hist_max_log10'],
-                per_sample_cfg['hist_bins'] + 1
-            )
-            # Initialize directories for saving
-            self.ps_dir = save_dir / 'per_sample_histograms'
-            self.frames_dir = self.ps_dir / 'frames'
-            _ensure_dir(self.ps_dir)
-            if not per_sample_cfg.get('no_frames', False):
-                _ensure_dir(self.frames_dir)
-        else:
-            self.per_sample_histograms = None
-            self.bin_edges = None
-            self.ps_dir = None       
+        self.memorization_outlier_frac = memorization_outlier_frac 
+
         # NEW: Per-sample config
         self.full_inputs_test = full_inputs_test
         self.per_sample_cfg = per_sample_cfg
@@ -252,7 +357,7 @@ class MeasurementRunner:
             self.eigenvalues_file.write('[\n')
         else:
             self.eigenvalues_file = None
-
+        self.prototype_data = prototype_data #NEW
     def close(self):
         if self.eigenvalues_file is not None:
             self.eigenvalues_file.write('\n]')
@@ -639,11 +744,60 @@ class MeasurementRunner:
             )
     
 
+        # ----- NEW: Prototype per-sample stats over time -----
+        if self.prototype_data is not None and self.per_sample_cfg and self.per_sample_cfg['enabled']:
+            proto_every = self.per_sample_cfg["every"]
+            if step_number % proto_every == 0:
+                loss_type = 'ce' if isinstance(self.loss_fn, nn.CrossEntropyLoss) else 'mse'
+
+                proto_dir = self.ps_dir / "prototypes"
+                _ensure_dir(proto_dir)
+
+                for name, (X_p, Y_p) in self.prototype_data.items():
+                    X_p = X_p.to(self.device)
+                    Y_p = Y_p.to(self.device)
+
+                    # Per-sample stats
+                    stats = _per_sample_stats(
+                        self.net,
+                        self.loss_fn,
+                        X_p,
+                        Y_p,
+                        loss_type=loss_type,
+                        batch_size=len(X_p),
+                        device=self.device,
+                    )
+                    
+                    # NEW: Add batch sharpness for this prototype set
+                    # Compute full loss on this prototype set
+                    self.net.zero_grad()
+                    preds = self.net(X_p).squeeze(dim=-1)
+                    proto_loss = self.loss_fn(preds, Y_p)
+                    
+                    # Compute batch sharpness (gHg/g²)
+                    batch_sharpness = compute_grad_H_grad(proto_loss, self.net).item()
+                    
+                    # Add to stats
+                    stats['batch_sharpness'] = batch_sharpness
+                    stats['mean_loss'] = np.mean(stats['loss'])
+                    
+                    out_path = proto_dir / f"step_{step_number:05d}_{name}.npz"
+                    np.savez(out_path, **stats)
+
+
+        if self.prototype_data is not None:
+            proto_metrics = compute_prototype_metrics(
+                net=self.net,
+                loss_fn=self.loss_fn,
+                prototype_data=self.prototype_data,
+                device=self.device,
+                base_batch_size=self.batch_size,
+            )
+            metrics.update(proto_metrics)
+
         metrics['epoch_loss_update'] = epoch_loss_update
         return metrics
-    
-        
-
+ 
 
 # -------------------------------------
 # Section: Training Function
@@ -660,13 +814,11 @@ def train(
             save_to, #folder
             device,
             verbose=True,
-            loss_fn=nn.MSELoss(),
+            loss_fn=nn.CrossEntropyLoss(),
             permute=True,
             stop_loss=None,
-            initial_sharpness=0,
             epoch_to_start=0,
             step_to_start=0,
-            sharpness_every=None,
             gd_noise=False,
             noise_magnitude=None,
             results_rarely: bool = False,
@@ -693,8 +845,10 @@ def train(
             wandb_run=None,
             wandb_enabled: bool = False,
             wandb_run_id: str = None,
-            per_sample_cfg=None, #NEW 
-    ):
+            per_sample_cfg=None, #NEW
+            prototype_data=None,
+
+          ):
     
     # -------------------------------------
     # Section: Setup
@@ -702,35 +856,34 @@ def train(
     start_time = time.time()
     print(f"Training started at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
 
-
-    # COMPUTE_GHG = True
-
+    # ----- Checkpoint Frequency Defaults -----
     NET_SAVES_PER_TRAINING = 200
-
-
-    # if epochs is None:
-    #     epochs = steps // (len(data[0]) // batch_size) + 1
 
     assert max_epochs is not None or max_steps is not None
     if max_epochs is None:
-        max_epochs = 1000000
+        # Set very high epoch limit if only max_steps is used
+        max_epochs = 100000
 
+    # ----- Dataset Wiring -----
     X_train, Y_train, X_test, Y_test = data
 
     X, Y = X_train, Y_train
-
+   
+    # ----- Device Alignment -----
     net = net.to(device)
     net.train()
     net.float()
+    
+    X = X.to(device)
+    Y = Y.to(device)
+    X_test = X_test.to(device)
+    Y_test = Y_test.to(device)
 
-    RECORD_EVERY = 20
 
-    # Create the save_to directory if it doesn't exist
+    # ----- Storage Preparation -----
     save_to.mkdir(parents=True, exist_ok=True)
 
-    # paths
     model_save_path = save_to / 'checkpoints'
-
     results_file = save_to / 'results.txt'
     if device == 'cpu':
         # No buffering on CPU to ensure writes happen immediately
@@ -738,29 +891,44 @@ def train(
         torch.set_num_threads(40)
     else:
         # Use buffering on GPU for better performance
-        # TO CHANGE
-        results_file = open(results_file, 'a', buffering=1_00)
+        results_file = open(results_file, 'a', buffering=1_000)
 
-    final_file = save_to / 'final.json'
-    final_file = open(final_file, 'w')  
-
-
-    X = X.to(device)
-    Y = Y.to(device)
-
+    # ----- State Initialization -----
     step_number = -1 if step_to_start == 0 else step_to_start
 
     if gd_noise is not None:
-        grad_storage = GradStorage(net, recalculate_every=10)
-
-    # calculate epochs to save - total we want at most 100 saves for the whole training
+        grad_storage = GradStorage(net, recalculate_every=30)
     
-    steps_in_epoch = len(X) // batch_size
-    epochs_expected = max_steps // steps_in_epoch
-    save_net_every = max(epochs_expected // NET_SAVES_PER_TRAINING, 1)
+    # ----- Stochastic Dynamics Setup -----
+    if sde_enabled:
+        if sde_eta is None:
+            sde_eta = optimizer.param_groups[0]['lr']  # Use optimizer's learning rate
+        sde_rng = T.Generator(device=device)
+        sde_rng.manual_seed(sde_seed)  # Use the provided SDE seed
 
+    # ----- Checkpoint Interval Selection -----
+    if checkpoint_every_n_steps is None:
+        checkpoint_every_n_steps = max(max_steps // NET_SAVES_PER_TRAINING, 1)
+    print(f"Will save checkpoints every {checkpoint_every_n_steps} steps")
 
-
+    # ----- Quadratic Approximation Setup -----
+    quad_approx = None
+    if quad_switch_step is not None:
+        quad_approx = QuadraticApproximation(net, loss_fn, device, quad_switch_step, use_gauss_newton)
+        
+        # Handle continuation case - if we're starting after the switch step,
+        # we need to initialize the anchor immediately
+        if step_to_start >= quad_switch_step:
+            print(f"Initializing quadratic approximation at continuation step {step_to_start} (switch was at {quad_switch_step})")
+            # Initialize with current model state as anchor
+            quad_approx.anchor_params = flatten_params(net).detach().clone()
+            quad_approx.anchor_loss = 0.0  # Will be computed on first batch
+            quad_approx.delta = torch.zeros_like(quad_approx.anchor_params)
+            quad_approx.is_active = True
+            print("Quadratic approximation initialized as active for continuation")
+        else:
+            print(f"Quadratic approximation will switch at step {quad_switch_step}")
+    # ----- Training State Trackers -----
     epoch_loss = float('+inf')
     stop_training = False
 
@@ -800,6 +968,10 @@ def train(
         proj_switch_step=proj_switch_step,
         quad_approx=quad_approx,
         memorization_outlier_frac=memorization_outlier_frac,
+        prototype_data=prototype_data,    
+        full_inputs_test=None,
+        per_sample_cfg=per_sample_cfg,
+
     )
     # ----- Run Identification -----
     run_id = wandb_run_id or generate_run_id()
@@ -816,8 +988,11 @@ def train(
             print(f"Reached max steps {max_steps}, stopping the training")
             results_file.flush()
             results_file.close()
+            if wandb_run is not None:
+                wandb_run.finish()
             break
 
+        # --- Epoch Data Preparation ---
         shuffle = T.randperm(len(X))
         if permute:
             X_shuffled = X[shuffle]
@@ -826,319 +1001,151 @@ def train(
             X_shuffled = X
             Y_shuffled = Y
 
-        # save the model
-        model_save_fle = model_save_path / f'net_{epoch}.pt'
-        if save_net_every == 0 or epoch % save_net_every == 0:
-            T.save(net.state_dict(), model_save_file)
-
+        # Checkpoint saving happens in the step loop now, based on step number
 
         losses_in_epoch = []
         if stop_training:
             break
 
+        # --- Minibatch Iteration ---
         for i in range(0, len(X) // batch_size): # i runs over steps in a epoch
             step_number += 1
 
             msg = f"{epoch:03d}, {step_number:05d}, "
+            # --- Measurement Context and Sampling ---
+            ctx = MeasurementContext(
+                step_number=step_number,
+                batch_size=batch_size,
+                epoch=epoch,
+                device=str(device),
+                lr=optimizer.param_groups[0]['lr'],
+                precise_plots=precise_plots,
+                rare_measure=rare_measure,
+            )
 
             X_batch = X_shuffled[i*batch_size : (i+1)*batch_size]
             Y_batch = Y_shuffled[i*batch_size : (i+1)*batch_size]
+            # Track batch indices for Gauss-Newton quadratic approximation
+            if permute:
+                batch_indices = shuffle[i*batch_size : (i+1)*batch_size]
+            else:
+                batch_indices = torch.arange(i*batch_size, (i+1)*batch_size, device=device)
 
-            ##### LMBDA MAX WORK ####
+            # -------------------------------------
+            # Section: Measurements
+            # -------------------------------------
+            metrics = measurement_runner.collect(
+                ctx=ctx,
+                optimizer=optimizer,
+                X_batch=X_batch,
+                Y_batch=Y_batch,
+                epoch=epoch,
+                step_in_epoch=i,
+                step_number=step_number,
+            )
 
-            ### condition to calculate the lambda max ###
-            TEMP_OVERRIDE = False
-            if 'gni' in measurements: TEMP_OVERRIDE = True 
-            lmax_now = False
-            
-            if 'lmax' in measurements:
-                if TEMP_OVERRIDE:
-                    def do_lmax():
-                        FIRST_FEW = 256
-                        FIRST_SUPER_FEW = 128
-                        if step_number < FIRST_SUPER_FEW:
-                            return True
-                        
-                        if step_number < FIRST_FEW:
-                            return step_number % 4 == 0
-
-                        how_often = 256
-                        if step_number > 10000:
-                            how_often = how_often * 2
-                        if step_number > 20000:
-                            how_often = how_often * 2
-                        if step_number > 100_000:
-                            how_often = how_often * 2
-                        fullbs_now = step_number % how_often == 0
-                        return fullbs_now
-                    
-                    lmax_now = do_lmax()
-
-                else:
-                    def do_lmax():
-                        if batch_size <= 32:
-                            how_often = 256
-                        else:
-                            how_often = 128
-                        
-                        if step_number > 10000:
-                            how_often = how_often * 2
-                        if step_number > 20000:
-                            how_often = how_often * 2
-                        if step_number > 100_000:
-                            how_often = how_often * 2
-                        return step_number % how_often == 0
-                    
-                    lmax_now = do_lmax()
-
-            if lmax_now:
-                # Clear CUDA cache if we're using GPU
-                if str(device).startswith('cuda'):
-                    torch.cuda.empty_cache()
-                optimizer.zero_grad()
-
-                # # TODO
-                # LMAX_MAX_SIZE = 8192
-                # # Check available CUDA memory before full batch computation
-                # if str(device).startswith('cuda'):
-                #     total_memory = torch.cuda.get_device_properties(0).total_memory
-                #     if total_memory < 20 * 1024**3:  # Less than 20GB
-                #         if isinstance(net, CNN):
-                #             LMAX_MAX_SIZE = 2048 + 512
-                #         if isinstance(net, ResNet):
-                #             LMAX_MAX_SIZE = 512
-                LMAX_MAX_SIZE = 1_000_000 # a placeholder originally used not to compute the lambda max on the whole dataset
-
-                    
-                if len(X) > LMAX_MAX_SIZE:
-                    # If the dataset is too large, take a random subset
-                    subset_indices = np.random.choice(len(X), LMAX_MAX_SIZE, replace=False)
-                    X_subset = X[subset_indices]
-                    Y_subset = Y[subset_indices]
-                else:
-                    # Use the whole dataset
-                    X_subset = X
-                    Y_subset = Y
-
-                preds = net(X_subset).squeeze(dim=-1)
-
-                loss = loss_fn(preds, Y_subset)
-                lmax = compute_lambdamax(loss, net, max_iterations=100, 
-                                              epsilon=1e-4)
-                
-                # if COMPUTE_GHG:
-                #     sharpness, gHg = sharpness
-                #     gHg = gHg.item()
-                # else:
-                #     gHg = np.nan
-
-                lmax = lmax.item()
-                full_gHg = np.nan
-
-                print(f"Epoch {epoch+1}, Step {i}: Total lambda max = {lmax}, Loss = {loss.item()} !!!")
-                # total_lmax = lmax
-                # total_gHg = gHg
-                full_loss = loss.item()
-
-                full_accuracy = calculate_accuracy(preds, Y_subset)
-
-
-
-                if math.isnan(full_loss):
-                    print("Full loss is NaN, the network prolly diverged, stopping the training")
+            # --- Epoch-Level Loss Tracking ---
+            if metrics['epoch_loss_update'] is not None:
+                if math.isnan(metrics['epoch_loss_update']):
+                    print('Full loss is NaN, the network prolly diverged, stopping the training')
                     results_file.flush()
                     results_file.close()
+                    if wandb_run is not None:
+                        wandb_run.finish()
+                    measurement_runner.close()
                     return
-                
-                epoch_loss = full_loss
+                epoch_loss = metrics['epoch_loss_update']
 
-            else:
-                lmax = np.nan
-                # total_lmax = np.nan
-                full_loss = np.nan
-                full_gHg = np.nan
-                # total_gHg = np.nan
-                full_accuracy = np.nan
-            
             if stop_loss is not None and epoch_loss < stop_loss:
                 print(f"Loss {epoch_loss} is below the stop loss {stop_loss}, stopping the training")
                 stop_training = True
                 break
 
-
-            ###### BATCH LAMBDAMAX WORK  ######
-            batch_lmax_now = False
-            if 'batch_lmax' in measurements:
-                if gd_noise is None:
-                    how_often = 16
-                    if step_number > 50_000:
-                        how_often = 32
-                    if step_number > 100_000:
-                        how_often = 64
-                    
-                    batch_lmax_now = step_number % how_often == 0
-                    
-                else:
-                    raise ValueError("There should be some value here, but it is not implemented yet")
-
-            if batch_lmax_now:
-                optimizer.zero_grad()
-                preds = net(X_batch).squeeze(dim=-1)
-
-                loss = loss_fn(preds, Y_batch)
-                batch_lmax = compute_lambdamax(loss, net, max_iterations=50, 
-                                                    epsilon=1e-3)
-                batch_lmax = batch_lmax.item()
-
-                #     gHg = gHg.item()
-                #     batch_gHg = gHg
-                # else:
-                # batch_gHg = np.nan
-                # batch_sharpness = batch_sharpness.item()
-
-                if i % RECORD_EVERY == 0:
-                    print(f"Epoch {epoch+1}, Step {i}: Batch Lambda Max = {batch_lmax}, Loss = {loss.item()}")
-                
-            else:
-                batch_lmax = np.nan
-                # batch_gHg = np.nan
-
-            ###### BATCH SHARPNESS WORK ######
-            batch_sharpness_now = False
-            if 'batch_sharpness' in measurements:
-                how_often = 8
-                batch_sharpness_now = step_number % how_often == 0
-            
-            if batch_sharpness_now:
-                net.zero_grad()
-                preds = net(X_batch).squeeze(dim=-1)
-                loss = loss_fn(preds, Y_batch)
-                batch_sharpness = compute_grad_H_grad(loss,
-                                    net)
-                batch_sharpness = batch_sharpness.item()
-            
-            else:
-                batch_sharpness = np.nan
-            
-            ####### STATIC BATCH SHARPNESS WORK #######
-            # frequency to calculate it
-            batch_sharpness_static_now = False
-            if 'batch_sharpness_static' in measurements:
-                if batch_size < 32:
-                    how_often = 128
-                else:
-                    how_often = 64
-                if step_number > 5000:
-                    how_often = how_often * 2
-                if step_number > 50000:
-                    how_often = how_often * 2
-                
-                batch_sharpness_static_now = step_number % how_often == 0
-
-
-            batch_sharpness_static = np.nan
-            if batch_sharpness_static_now:
-                batch_sharpness_static = calculate_averaged_grad_H_grad(net,
-                                                  X,
-                                                  Y,
-                                                  loss_fn,
-                                                  batch_size=batch_size,
-                                                  n_estimates=600,
-                                                  tolerance = 0.01
-                )
-            
-
-            ##### FISHER WORK #####
-
-            fisher_total_eigenval = np.nan
-            fisher_batch_eigenval = np.nan
-
-            if 'fisher' in measurements:
-                if calculate_fisher_total_condition(i, step_number, batch_size, initial_sharpness, sharpness_every):
-                    fisher_total_eigenval = compute_fisher_eigenvalues(net, X).item()
-                
-                if calculate_fisher_batch_condition(i, step_number, batch_size, initial_sharpness, sharpness_every):
-                    fisher_batch_eigenval = compute_fisher_eigenvalues(net, X_batch).item()
-            
-
-            ##### GNI work ####
-            # frequency to calculate it
-            gni_now = False
-            if 'gni' in measurements:
-                if batch_size < 32:
-                    how_often = 256
-                else:
-                    how_often = 64
-                
-                if step_number > 5000:
-                    pass
-                    # how_often = how_often * 2
-                
-                gni_now = step_number % how_often == 0
-
-                if step_number - step_to_start < 8:
-                    gni_now = True
-            
-            gni = np.nan
-            if gni_now:
-                gni = calculate_averaged_gni(
-                    net=net,
-                    X=X,
-                    Y=Y,
-                    loss_fn=loss_fn,
-                    batch_size=batch_size,
-                    n_estimates=500,
-                    tolerance=0.01
-                )
-            
-            ##### WEIGHT DISTANCE WORK ####
-
-            param_distance = np.nan
-
-            param_distance_now = False
-            if 'param_distance' in measurements:
-                if param_reference is None:
-                    raise ValueError("You should provide a reference weights to measure distance from")
-                if batch_size < 32:
-                    how_often = 1
-                else:
-                    how_often = 1
-                
-                param_distance_now = step_number % how_often == 0
-
-            if param_distance_now:
-                # calculate the distance from the reference weights
-                param_distance = calculate_param_distance(net, param_reference)
-                param_distance = param_distance.item()
-
-
-
-            
-            # now calculate the total loss for GNI
-            FIRST_FEW = 32
-            full_loss_now = False
-            if 'gni' in measurements:
-                if step_number - step_to_start < FIRST_FEW:
-                    full_loss_now = True
-                
-                how_often = 32
-                if step_number % how_often == 0:
-                    full_loss_now = True
-
-
-                if full_loss_now:
-                    X_subset = X
-                    Y_subset = Y
-                    preds = net(X_subset).squeeze(dim=-1)
-
-                    loss = loss_fn(preds, Y_subset)
-                    full_loss = loss.item()
-
-
-            ######## SGD STEP #######
+            # -------------------------------------
+            # Section: Training Step (Update)
+            # -------------------------------------
             optimizer.zero_grad()
 
-            if not gd_noise:
+            if sde_enabled:
+                # SDE integration step - uses full dataset X, Y
+                # integrates it for the time [0, eta]
+                loss = sde_integration(net=net, X=X, Y=Y, loss_fn=loss_fn, 
+                                     batch_size=batch_size, h=sde_h, eta=sde_eta, 
+                                     rng=sde_rng)
+                
+                if math.isinf(loss) or math.isnan(loss):
+                    results_file.flush()
+                    results_file.close()
+                    if wandb_run is not None:
+                        wandb_run.finish()
+                    raise ValueError("Loss is inf or NaN, stopping the training")
+                    
+                    
+            elif gd_noise:
+                # this is the GD with noise
+                # the whole thing is done in the function, including updating the weights
+                loss = gd_with_noise(net=net, X = X, Y=Y, loss_fn=loss_fn, noise_type=gd_noise, 
+                                     optimizer=optimizer, batch_size=batch_size, step_number=step_number, 
+                                     grad_storage=grad_storage, noise_magnitude=noise_magnitude)
+            
+            elif quad_approx is not None and quad_approx.is_active:
+                # Quadratic approximation dynamics
+                quad_gradient = quad_approx.compute_quadratic_gradient(X_batch, Y_batch, batch_indices)
+                
+                # Get current learning rate from optimizer
+                current_lr = optimizer.param_groups[0]['lr']
+                if quad_switch_lr is not None:
+                    current_lr = quad_switch_lr
+
+                # Update delta using quadratic gradient
+                quad_approx.update_delta(current_lr, quad_gradient)
+                
+                # Set model parameters to current quadratic position
+                current_params = quad_approx.get_current_params()
+                set_model_params(net, current_params)
+                
+                # Compute loss for logging (using current model state)
+                preds = net(X_batch).squeeze(dim=-1)
+                loss = loss_fn(preds, Y_batch)
+                
+            elif proj_switch_step is not None and step_number >= proj_switch_step:
+                # Gradient projection step (only for plain SGD, no momentum/Adam
+                    
+                # Recompute top-l eigendirections at the requested cadence (default: every step)
+                if frequency_calculator.should_measure('proj_eigens_refresh', ctx):
+                    ##### TEMP! 
+                    full_preds = net(X).squeeze(dim=-1)
+                    full_loss_for_eigs = loss_fn(full_preds, Y)
+                    _eigvals, eigvecs_block = compute_eigenvalues(
+                        full_loss_for_eigs, net,
+                        k=proj_top_l if proj_top_l is not None else 1,
+                        max_iterations=500,
+                        reltol=0.005,
+                        eigenvector_cache=eigenvector_cache,
+                        return_eigenvectors=True,
+                        use_power_iteration=False
+                    )
+
+                else:
+                    # Use cached eigenvectors
+                    if eigenvector_cache is not None and hasattr(eigenvector_cache, 'eigenvectors') and len(eigenvector_cache.eigenvectors) > 0:
+                        eigvecs_block = torch.stack(eigenvector_cache.eigenvectors, dim=1).to(device)
+                    else:
+                        eigvecs_block = None
+
+    
+
+                from utils.lobpcg import _maybe_orthonormalize
+                V = eigvecs_block.clone()
+                if V.dim() == 1:
+                    V = V.unsqueeze(1)
+                V = _maybe_orthonormalize(V, assume_ortho=True)
+
+                # --- Projected Step Solve ---
+                optimizer.zero_grad()
+                params_before_step = flatten_params(net).detach().clone()
+
+                # calculate the step
                 preds = net(X_batch).squeeze(dim=-1)
 
                 loss = loss_fn(preds, Y_batch)
@@ -1146,41 +1153,191 @@ def train(
                 if math.isinf(loss.item()) or math.isnan(loss.item()):
                     results_file.flush()
                     results_file.close()
+                    if wandb_run is not None:
+                        wandb_run.finish()
                     raise ValueError("Loss is inf or NaN, stopping the training")
 
-                # Backward pass
+                # Backward pass for minibatch gradient
                 loss.backward()
-                
+
                 optimizer.step()
+                
+                params_after_step = flatten_params(net).clone()
+
+                # --- Gradient Projection Adjustment ---
+                with torch.no_grad():
+                    update = params_after_step - params_before_step
+
+                    coeffs = V.T @ update
+                    update_in_top = V @ coeffs
+
+                    if proj_to_residual:
+                        update_proj = update - update_in_top
+                    else:
+                        update_proj = update_in_top
+
+                    new_params = params_before_step + update_proj
+                    set_model_params(net, new_params)
+
+                    # # Flatten current gradient for logging
+                    # params = [p for p in net.parameters() if p.requires_grad]
+                    # with torch.no_grad():
+                    #     grad_list = [p.grad.reshape(-1) if p.grad is not None else torch.zeros_like(p.reshape(-1)) for p in params]
+                    #     g_flat = torch.cat(grad_list).detach().clone()
+
+                    #     coeffs = V.T @ g_flat
+                    #     g_in_top = V @ coeffs
+
+                    #     if proj_to_residual:
+                    #         g_proj = g_flat - g_in_top
+                    #     else:
+                    #         g_proj = g_in_top
+
+                    #     denom = torch.linalg.vector_norm(g_flat)
+                    #     numer = torch.linalg.vector_norm(g_proj)
+                    #     proj_grad_ratio = (numer / (denom + 1e-12)).item()
+
+                    #     projection_basis = V
+                    #     params_before_step = flatten_params(net).detach().clone()
 
             else:
-                # this is the GD with noise
-                # the whole thing is done in the function, including updating the weights
-                loss = gd_with_noise(net=net, X = X, Y=Y, loss_fn=loss_fn, noise_type=gd_noise, 
-                                     optimizer=optimizer, batch_size=batch_size, step_number=step_number, 
-                                     grad_storage=grad_storage, noise_magnitude=noise_magnitude)
-            
+                # Standard SGD step
+                preds = net(X_batch).squeeze(dim=-1)
 
-            batch_loss = loss.item()
+                loss = loss_fn(preds, Y_batch)
+
+                if math.isinf(loss.item()) or math.isnan(loss.item()):
+                    results_file.flush()
+                    results_file.close()
+                    if wandb_run is not None:
+                        wandb_run.finish()
+                    raise ValueError("Loss is inf or NaN, stopping the training")
+
+                # Check if we should initialize quadratic approximation
+                if quad_approx is not None:
+                    full_dataset = (X, Y) if use_gauss_newton else None
+                    quad_approx.initialize_anchor(step_number, loss.item(), full_dataset)
+
+                # Backward pass for minibatch gradient
+                loss.backward()
+
+                optimizer.step()
+
+
+            # Handle loss value (SDE returns float, others return tensor)
+            batch_loss = loss if isinstance(loss, float) else loss.item()
             losses_in_epoch.append(batch_loss)
 
-            ############## RECORD THE RESULTS ##############
+            # --- Checkpoint Handling ---
+            # Save checkpoint using wandb system
+            checkpoint_path = save_checkpoint_wandb(
+                model=net,
+                optimizer=optimizer,
+                step=step_number,
+                epoch=epoch,
+                loss=batch_loss,
+                run_id=run_id,
+                save_every_n_steps=checkpoint_every_n_steps
+            )
+            if checkpoint_path:
+                print(f"Checkpoint saved at step {step_number}: {checkpoint_path}")
+
+            # -------------------------------------
+            # Section: Logging (Step)
+            # -------------------------------------
             if True: # not results_rarely or (results_rarely and ghg_now):
-                msg += f"{batch_loss:7.6f}, {full_loss:7.6f}, {batch_lmax:6.2f}, {lmax:6.2f}, {batch_sharpness:6.1f}, {full_gHg:6.1f}, {fisher_batch_eigenval:6.2f}, {fisher_total_eigenval:6.1f}, {batch_sharpness_static:6.2f}, {gni:6.2f}, {full_accuracy:6.2f}, {param_distance:.7e}"
+                # (0) epoch, (1) step, (2) batch loss, (3) full loss, (4) lambda max, (5) step sharpness, (6) batch sharpness, (7) Gradient-Noise Interaction, (8) total accuracy"""
+                # Log metrics   
+                msg += (
+                    f"{batch_loss:7.6f}, {metrics['full_loss']:7.6f}, {metrics['lmax']:6.2f}, "
+                    f"{metrics['step_sharpness']:6.1f}, {metrics['batch_sharpness']:6.1f}, "
+                    f"{metrics['gni']:6.2f}, {metrics['full_accuracy']:6.2f},"
+                    f"{metrics['train_test_gap']:6.3f}" 
+                )
                 results_file.write(msg + "\n")
+                
+                if wandb_enabled:
+                    wandb_metrics = metrics.copy()
+                    wandb_metrics.update({
+                        "epoch": epoch,
+                        "step": step_number,
+                        "batch_loss": batch_loss,
+                    })
+                    rename_map = {
+                        "batch_lmax": "batch_lambda_max",
+                        "lmax": "lambda_max",
+                        "batch_sharpness": "batch_sharpn",
+                        "full_gHg": "grad_H_grad",
+                        "fisher_batch_eigenval": "batch_fisher_eigenval",
+                        "fisher_total_eigenval": "total_fisher_eigenval",
+                        "gni": "GNI",
+                        "full_accuracy": "accuracy",
+                    }
+                    for old_key, new_key in rename_map.items():
+                        if old_key in wandb_metrics:
+                            wandb_metrics[new_key] = wandb_metrics.pop(old_key)
+                    wandb_metrics.pop("epoch_loss_update", None)
+                    log_metrics(wandb_metrics)
 
         
-        # end of epoch
+        # --- Epoch Finalization ---
         epoch_loss = np.mean(losses_in_epoch)
         
         results_file.flush()
 
         
-    
-    T.save(net.state_dict(), model_save_path / f'net_final.pt')
+    # -------------------------------------
+    # Section: Logging
+    # -------------------------------------
+    # ----- Final Checkpoint Save -----
+    # Save final checkpoint
+    final_checkpoint_path = save_checkpoint_wandb(
+        model=net,
+        optimizer=optimizer,
+        step=step_number,
+        epoch=epoch,
+        loss=batch_loss,
+        run_id=run_id,
+        save_every_n_steps=1  # Always save final checkpoint
+    )
+    print(f"Final checkpoint saved: {final_checkpoint_path}")
+
+
+    # ----- NEW: per-sample stats on prototype sets -----
+    if prototype_data is not None:
+        print("Computing per-sample metrics for prototype sets...")
+        loss_type = 'ce' if isinstance(loss_fn, nn.CrossEntropyLoss) else 'mse'
+
+        proto_dir = save_to / "prototype_final"
+        _ensure_dir(proto_dir)
+
+        for name, (X_p, Y_p) in prototype_data.items():
+            X_p = X_p.to(device)
+            Y_p = Y_p.to(device)
+
+            stats = _per_sample_stats(
+                net,
+                loss_fn,
+                X_p,
+                Y_p,
+                loss_type='ce',
+                batch_size=batch_size,
+                device=device,
+            )
+            out_path = proto_dir / f"final_{name}.npz"
+            np.savez(out_path, **stats)
+            print(f"  saved {name} -> {out_path}")
+
 
     results_file.close()
 
+    measurement_runner.close()
+
+    # ----- WandB Teardown -----
+    if wandb_run is not None:
+        wandb_run.finish()
+
+    # ----- Final Reporting -----
     end_time = time.time()
     print(f"Training finished at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
     print(f"Total training time: {end_time - start_time:.2f} seconds")
@@ -1199,50 +1356,52 @@ def train(
 
 
 if __name__ == '__main__':
-    seed = 888
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # -------------------------------------
+    # Section: Runtime Setup
+    # -------------------------------------
+    # ----- Reproducibility Seeds -----
+    seed = 88881
+    # torch.backends.cudnn.deterministic = False
+    # torch.backends.cudnn.benchmark = True
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
     
-
-    # Command line arguments
+    # -------------------------------------
+    # Section: Argument Parser
+    # -------------------------------------
     parser = argparse.ArgumentParser(description='Training script')
-    # Training parameters
+    # --- Training Parameters ---
     parser.add_argument('--batch', type=int, default=64, help='Input batch size for training')
     parser.add_argument('--epochs', type=int, help='Number of epochs to train')
     parser.add_argument('--steps', type=int, default=10000, help='Number of steps to train. Either epochs or steps should be provided')
+    parser.add_argument('--cpu', action='store_true', help='Force training to run on CPU even if CUDA is available')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for training')
-    parser.add_argument('--stop_loss', type=float, default=None, help='Stop training if loss goes below this value')
-    # Loss function
+    parser.add_argument('--stop-loss', '--stop_loss', type=float, default=None, help='Stop training if loss goes below this value')
+    # --- Loss Configuration ---
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'ce'], help='Loss function to use (mse or ce)')
 
-    # Dataset configuration
+    # --- Dataset Configuration ---
     parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset to use for training')
     parser.add_argument('--classes', type=int, nargs=2, default=[1, 9], help='Two class labels to use for training. Default is [1, 9], as being probably the most difficult classes to separate')
-    parser.add_argument('--num_data', type=int, default=1024, help='Number of datapoints to train on')
+    parser.add_argument('--num-data', '--num_data', type=int, default=1024, help='Number of datapoints to train on')
 
-    # Model configuration
+    # --- Model Configuration ---
     parser.add_argument('--model', type=str, default='mlp', help='Network architecture to use for training')
-    parser.add_argument('--init_scale', type=float, default=None, help='Initialization scale for network weights')
-    parser.add_argument('--no_init', action='store_true', help='If set, do not initialize network weights')
+    parser.add_argument('--init-scale', '--init_scale', type=float, default=0.2, help='Initialization scale for network weights')
+    parser.add_argument('--no-init', '--no_init', action='store_true', help='If set, do not initialize network weights')
 
-    # Continuation options
-    parser.add_argument('--cont_folder', type=str, default=None, help='Folder to continue training from')
-    parser.add_argument('--cont_epoch', type=int, default=0, help='Epoch to continue training from')
-    parser.add_argument('--cont_last', action='store_true', help='If set, continue training from the last run that fits the parameters')
+    # --- wandb Continuation Options ---
+    parser.add_argument('--cont-run-id', '--cont_run_id', type=str, default=None, help='Wandb run ID to continue training from')
+    parser.add_argument('--cont-step', '--cont_step', type=int, default=None, help='Step to continue training from (uses closest available checkpoint)')
+    parser.add_argument('--checkpoint-every', '--checkpoint_every', type=int, default=None, help='Save checkpoint every N steps (default: auto-calculated based on total steps)')
 
-    # Momentum and adam
+    # --- Optimizer Variants ---
     parser.add_argument('--momentum', type=float, default=None, help='Momentum for SGD optimizer')
     parser.add_argument('--adam', action='store_true', help='If set, use Adam optimizer instead of SGD')
-
-    # Measurement settings
-    parser.add_argument('--sharp_every', type=int, help='Frequency of sharpness computation')
-    parser.add_argument('--init_sharp', type=int, default=0, help='Compute total sharpness for the first n steps')
     
-    # Measurement settings (main)
+    # --- Measurement Flags (Primary) ---
     # parser.add_argument('--fullbs', action='store_true', help='If set, compute the lambda_max, aka FullBS')
     parser.add_argument('--lambdamax', '--lmax', action='store_true', help='If set, compute the lambda_max, aka FullBS')
     parser.add_argument('--batch-sharpness', '--batch-sharpness-step', '--bs', action='store_true', dest='batch_sharpness',
@@ -1264,25 +1423,45 @@ if __name__ == '__main__':
     # --- Measurement Flags (Tertiary, aka almost completely useless) ---
     parser.add_argument('--batch-sharpness-exp-inside', action='store_true', help='If set, compute the batch sharpness using E[gHg]/E[g²], where the expectation is inside the ratio. Compare with step-sharpness, where the expectation stays outside the ratio.')
     parser.add_argument('--batch-lambdamax','--batchlmax', action='store_true', help='If set, compute the batch lambda_max(H_B), aka batch lambda max')
-    parser.add_argument('--batch-sharpness-static', action='store_true', help='If set, compute the ')
-    parser.add_argument('--gni', action='store_true', help='If set, compute the Gradient-Noise Interaction quantity')
-
-    # Measurement settings (secondary)
     parser.add_argument('--fisher', action='store_true', help='If set, compute Fisher information matrix eigenvalue. Currently only works with one-dim output')
-    parser.add_argument('--param_distance', action='store_true', help='If set, compute the distance from the reference weights')
-    parser.add_argument('--param_file', type=str, default=None, help='Path to reference parameters for computing parameter distance')
-    parser.add_argument('--final', action='store_true', help='If set, compute the lambda_max and batch sharpness at the end')
+    parser.add_argument('--param-distance', '--param_distance', action='store_true', help='If set, compute the distance from the reference weights')
+    parser.add_argument('--param-file', '--param_file', type=str, default=None, help='Path to reference parameters for computing parameter distance')
 
+    # --- Measurement Configuration ---
+    parser.add_argument('--disable-cache-eigenvectors', '--disable_cache_eigenvectors', action='store_true', help='If set, disable eigenvector caching for warm starts to improve eigenvalue computation performance')
+    parser.add_argument('--use-power-iteration', '--use_power_iteration', action='store_true', help='If set, use power iteration method instead of LOBPCG for eigenvalue computation')
+    parser.add_argument('--num-eigenvalues', '--num_eigenvalues', '--k', type=int, default=1, help='Number of eigenvalues to compute when computing lambda_max (default: 1)')
 
-    parser.add_argument('--results_rarely', action='store_true', help='If set, results will be recorded less frequently')
+    parser.add_argument('--results-rarely', '--results_rarely', action='store_true', help='If set, results will be recorded less frequently')
+    parser.add_argument('--precise-plots', action='store_true', help='Enable more frequent measurements for precise plotting')
+    parser.add_argument('--rare-measure', dest='rare_measure', action='store_true', help='Activate regime where expensive measurements are performed rarely')
 
-    # Noise configuration
-    parser.add_argument('--gd_noise', type=str, default=None, help='Do GD, but with gaussian noise to simulate SGD. Supoprted noises: sgd, diag, iso, const')
-    parser.add_argument('--noise_mag', type=float, default=None, help='The noise magnitude for the constant noise')
+    # --- Noise Configuration ---
+    parser.add_argument('--gd-noise', '--gd_noise', type=str, default=None, help='Do noisy GD, to simulate SGD. Supported noises: sgd, diag, iso, const')
+    parser.add_argument('--noise-mag', '--noise_mag', type=float, default=None, help='The noise magnitude for the constant noise')
+    
+    # --- SDE Configuration ---
+    parser.add_argument('--sde', action='store_true', help='Simulate the SDE dynamics (the one that correspond to the SGD). It integrates the SDE using the Euler-Maruyama method')
+    parser.add_argument('--sde-h', '--sde_h', type=float, default=0.01, help='SDE *integration* time step size (default: 0.01)')
+    parser.add_argument('--sde-eta', '--sde_eta', type=float, default=None, help='Learning rate for SDE (uses --lr if not specified)')
+    parser.add_argument('--sde-seed', '--sde_seed', type=int, default=888, help='Random seed for SDE noise generation (default: 888)')
 
-    # Randomness settings
-    parser.add_argument('--dataset_seed', type=int, default=888, help='Random seed for dataset preparation')
-    parser.add_argument('--init_seed', type=int, default=8888, help='Random seed for network initialization')
+    # --- Quadratic Approximation Configuration ---
+    parser.add_argument('--quad-switch-step', '--quad_switch_step', type=int, default=None, help='Step at which to switch from true NN dynamics to quadratic Taylor approximation dynamics')
+    parser.add_argument('--use-gauss-newton', '--use_gauss_newton', action='store_true', help='Use Gauss-Newton matrix instead of Hessian for quadratic approximation')
+    parser.add_argument('--quad-switch-lr', '--quad_switch_lr', type=float, default=None, help='lr to use after switching, used to test explosion')
+
+    # --- Gradient Projection Configuration ---
+    parser.add_argument('--proj-switch-step', dest='proj_switch_step', type=int, default=None,
+                        help='Step number to start projecting minibatch gradient onto top-l Hessian eigendirections (full batch)')
+    parser.add_argument('--proj-top-l', dest='proj_top_l', type=int, default=None,
+                        help='Number of top Hessian eigendirections to project against/onto after switch step')
+    parser.add_argument('--proj-to-residual', dest='proj_to_residual', action='store_true',
+                        help='After --proj-switch-step, apply gradient projected to orthogonal complement of top-l eigenspace')
+
+    # --- Randomness Settings ---
+    parser.add_argument('--dataset-seed', '--dataset_seed', type=int, default=888, help='Random seed for dataset preparation')
+    parser.add_argument('--init-seed', '--init_seed', type=int, default=8888, help='Random seed for network initialization')
 
     # --- wandb Settings ---
     parser.add_argument('--wandb-tag', type=str, default=None, help='Tag to add to the wandb run')
@@ -1294,63 +1473,143 @@ if __name__ == '__main__':
     parser.add_argument('--train-test-gap', action='store_true', help='If set, compute the training and testing accuracy and gap (heavy, runs rarely)')
 
     # --- NEW: Per-Sample Histogram Configuration ---
-    parser.add_argument('--per-sample', action='store_true', help='If set, compute per-sample histograms (heavy; runs rarely)')
-    parser.add_argument('--per-sample-freq', type=float, default=None, help='Frequency of per-sample histograms, as fraction of max_steps (default: 0.01 = every 100 steps for 10k max_steps)')
-    parser.add_argument('--per-sample-min-log10', type=float, default=-8, help='Min log10 value for log10 histograms (default: -8)')
-    parser.add_argument('--per-sample-max-log10', type=float, default=0, help='Max log10 value for log10 histograms (default: 0)')
-    parser.add_argument('--per-sample-bins', type=int, default=80, help='Number of bins for log10 histograms (default: 80)')
-    parser.add_argument('--per-sample-metrics', type=str, nargs='+', default=['loss','resid','kappa'], choices=['loss','resid','kappa'], help='Which metrics to histogram (default: loss resid kappa)')
-    parser.add_argument('--no-frames', action='store_true', help='Only save counts/quantiles as .npz; do not render PNG frames')
+
+    parser.add_argument('--per-sample', action='store_true',
+                        help='Track per-sample loss/residual/curvature histograms over time and save frames')
+    parser.add_argument('--per-sample-every', type=int, default=100,
+                        help='Snapshot cadence in steps for per-sample histograms (default: 100)')
+    parser.add_argument('--hist-min-log10', type=float, default=-6.0,
+                        help='Left edge for log10 binning (default: -6)')
+    parser.add_argument('--hist-max-log10', type=float, default=2.0,
+                        help='Right edge for log10 binning (default: 2)')
+    parser.add_argument('--hist-bins', type=int, default=80,
+                        help='Number of bins for log10 histograms (default: 80)')
+    parser.add_argument('--per-sample-metrics', type=str, nargs='+',
+                        default=['loss','resid','kappa'],
+                        choices=['loss','resid','kappa'],
+                        help='Which metrics to histogram (default: loss resid kappa)')
+    parser.add_argument('--no-frames', action='store_true',
+                        help='Only save counts/quantiles as .npz; do not render PNG frames')
+
 
     # ----- Argument Parsing -----
     args = parser.parse_args()
 
+    # ----- wandb Availability Check -----
+    wandb_installed = is_wandb_available()
+    if not wandb_installed and not args.disable_wandb:
+        print("wandb is not installed; proceeding with logging disabled. Re-run with --disable-wandb to silence this message.")
+        args.disable_wandb = True
+    elif args.disable_wandb:
+        print("wandb logging disabled by flag (--disable-wandb).")
 
-    #### deal with all the arguments
-    # set the parameters
+    wandb_enabled = wandb_installed and not args.disable_wandb
+
+
+    # -------------------------------------
+    # Section: Experiment Setup
+    # -------------------------------------
+    # ----- Argument Post-processing -----
+    # --- Parameter Extraction ---
     batch_size = args.batch
     dataset = args.dataset
-    device = (T.device('cuda') if T.cuda.is_available() else 'cpu')
+    if args.cpu:
+        if T.cuda.is_available():
+            print('CUDA is available but running on CPU due to --cpu flag.')
+        device = 'cpu'
+    else:
+        device = T.device('cuda') if T.cuda.is_available() else 'cpu'
+
+    if args.momentum is not None and args.adam:
+        raise ValueError("You should provide either momentum or adam, not both")
+
+    if args.momentum is not None and args.momentum < 1e-4 and not args.adam:
+        args.momentum = None  # if momentum is too small, just use SGD without momentum
+
     
-    
+    # --- Argument Validation ---
+    if args.final:
+        raise ValueError("--final needs to be re-implemented")
+
+    if args.param_distance:
+        raise NotImplementedError("--param-distance needs to be re-implemented")
+
     if args.steps is not None and args.epochs is not None:
         raise ValueError("You should provide either epochs or steps, not both")
+    if args.memorization_outlier_frac <= 0 or args.memorization_outlier_frac >= 1:
+        raise ValueError("--memorization-outlier-frac must be in (0, 1)")
+
+    # Validate gradient projection feature flags and conflicts
+    if (args.proj_switch_step is not None) or (args.proj_top_l is not None) or args.proj_to_residual:
+        if args.proj_switch_step is None or args.proj_top_l is None:
+            raise ValueError("Gradient projection requires both --proj-switch-step and --proj-top-l")
+        if args.proj_top_l < 1:
+            raise ValueError("--proj-top-l must be a positive integer")
+        if args.adam or (args.momentum is not None and args.momentum != 0):
+            raise ValueError("Gradient projection currently supports only plain SGD (no momentum/Adam)")
     
-    ### set which values to compute ####
+    # Validate wandb continuation arguments
+    if (args.cont_run_id is not None) != (args.cont_step is not None):
+        raise ValueError("Both --cont-run-id and --cont-step must be provided together for wandb continuation")
+
+    # Check for mutually exclusive training modes
+    exclusive_modes = []
+    if args.proj_switch_step is not None:
+        exclusive_modes.append("gradient projection (--proj-switch-step)")
+    if args.sde:
+        exclusive_modes.append("SDE dynamics (--sde)")
+    if args.gd_noise is not None:
+        exclusive_modes.append("GD with noise (--gd-noise)")
+    if args.quad_switch_step is not None:
+        exclusive_modes.append("quadratic approximation (--quad-switch-step)")
+    
+    if len(exclusive_modes) > 1:
+        raise ValueError(f"Cannot use multiple training modes simultaneously: {', '.join(exclusive_modes)}. Please choose only one.")
+    
+    # ----- Measurement Selection -----
     measurements = {name for name, enabled in [
     ('lmax', args.lambdamax),
     ('batch_lmax', args.batch_lambdamax),
+    ('step_sharpness', args.step_sharpness),
     ('batch_sharpness', args.batch_sharpness),
-    ('batch_sharpness_static', args.batch_sharpness_static),
+    ('batch_sharpness_exp_inside', args.batch_sharpness_exp_inside),
+    ('grad_projection', args.grad_projection),
+    ('gradient_norm', args.gradient_norm),
+    ('one_step_loss_change', args.one_step_loss_change),
     ('gni', args.gni),
     ('fisher', args.fisher),
     ('final', args.final),
     ('param_distance', args.param_distance),
+    ('hessian_trace', args.hessian_trace),
+    ('memorization_hessian_outliers', args.memorization_hessian_outliers),
+    ('train_test_gap', args.train_test_gap),
     ] if enabled}
 
-    #### result storage ####
+    # ----- Result Storage Setup -----
     RES_FOLDER.mkdir(parents=True, exist_ok=True)
     run_folder = initialize_folders(args, RES_FOLDER)
-
-    if args.cont_folder is not None:
-        run_folder, step_to_start = run_folder
-    else:
-        step_to_start = 0
-
-    #### prepare loss #####
+    step_to_start = 0
+    
+    # ----- Loss Function Selection -----
     if args.loss == 'mse':
         loss_fn = SquaredLoss()
     elif args.loss == 'ce':
         loss_fn = nn.CrossEntropyLoss()
 
-    ##### Prepare dataset and model ####
+    # ----- Dataset and Model Presets -----
     dataset_presets = get_dataset_presets()
     model_presets = get_model_presets()
 
-    ### Prepare dataset ###
+    # --- Dataset Preparation ---
     data = prepare_dataset(dataset, DATASET_FOLDER, args.num_data, args.classes, args.dataset_seed, loss_type=args.loss)
 
-    ### Prepare model ###
+    # --- Unpack dataset and build tuple_data ---
+    train_x, train_y, test_x, test_y = data  
+    tuple_data = (train_x, train_y, test_x, test_y)
+
+    prototype_data = generate_prototype_sets(train_x, train_y, args.classes)
+
+    # --- Model Construction ---
     name = args.model
     params = model_presets[name]['params']
     params['input_dim'] = dataset_presets[dataset]['input_dim']
@@ -1360,18 +1619,51 @@ if __name__ == '__main__':
         params=params
         )
 
-    #### Initialize net #####
+    # --- Model Initialization ---
     if not args.no_init:
         initialize_net(net, scale=args.init_scale, seed=args.init_seed)
 
-    #### Load the model if continuing ####
-    if args.cont_folder is not None:
-        cont_folder = Path(RES_FOLDER / args.cont_folder)
-        state_file = cont_folder / 'checkpoints' / f'net_{args.cont_epoch}.pt'
-        net.load_state_dict(T.load(state_file, map_location=device))
+    # ----- Checkpoint Continuation Handling -----
+    wandb_checkpoint_loaded = False
+    epoch_to_start = 0
+    if args.cont_run_id is not None and args.cont_step is not None:
+        # Continue from wandb checkpoint
+        checkpoint_dir = get_checkpoint_dir_for_run(args.cont_run_id)
+        if checkpoint_dir is None:
+            raise FileNotFoundError(f"Cannot find checkpoint directory for run ID: {args.cont_run_id}")
+        
+        checkpoint_info = find_closest_checkpoint_wandb(args.cont_step, checkpoint_dir=checkpoint_dir)
+        if checkpoint_info is None:
+            raise FileNotFoundError(f"No suitable checkpoint found for step {args.cont_step} in run {args.cont_run_id}")
+        
+        
+        if args.adam:
+            # loaded_data = load_checkpoint_wandb(checkpoint_info, net, optimizer)
+            raise ValueError("Cannot continue from wandb checkpoint with Adam optimizer (only SGD is supported). With Adam need to also keep the state, which is not implemented yet")
+        
+        loaded_data = load_checkpoint_wandb(checkpoint_info, net)
+        step_to_start = loaded_data['step']
+        epoch_to_start = loaded_data['epoch']
+        wandb_checkpoint_loaded = True
+        
+        print(f"Loaded checkpoint from step {loaded_data['step']} (epoch {loaded_data['epoch']}) from run {args.cont_run_id}")
+        print(f"Closest checkpoint to requested step {args.cont_step}: actual step {loaded_data['step']}")
+        
+        # Handle quadratic approximation continuation
+        if args.quad_switch_step is not None and loaded_data['step'] >= args.quad_switch_step:
+            print(f"Warning: Continuing from step {loaded_data['step']} which is at or after quad_switch_step {args.quad_switch_step}")
+            print("Quadratic approximation will be initialized as active from the start.")
 
-    
-    #### Distance from the reference weights ####
+    # ----- wandb Initialization -----
+    wandb_run = None
+    wandb_run_id = None
+    if wandb_enabled:
+        wandb_run = init_wandb(args, step_to_start)
+        wandb_run_id = wandb_run.id
+    else:
+        wandb_run_id = generate_run_id()
+
+    # ----- Reference Parameter Handling -----
     # Load the reference parameters to calculate the distance from (if provided)
     param_reference = None
     if args.param_distance:
@@ -1385,9 +1677,9 @@ if __name__ == '__main__':
     if args.param_file is not None:
         param_reference = T.load(args.param_file, map_location=device)
         # param_reference = param_reference['model_state_dict']
-        # param_reference = {k: v.to(device) for k, v in param_reference.items()}
+        # param_reference = {k: v.to(device) for k, v in param_reference.items()} 
 
-    ### Prepare optimizer ###
+    # ----- Optimizer Preparation -----
     optimizer = prepare_optimizer(net, args.lr, args.momentum, args.adam)
 
     # ----- Checkpoint Cadence Determination -----
@@ -1396,11 +1688,25 @@ if __name__ == '__main__':
     else:
         checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
     
+    
+    per_sample_cfg = None
+    if args.per_sample:
+        per_sample_cfg = {
+            'enabled': True,
+            'every': max(1, int(args.per_sample_every)),
+            'hist_min_log10': args.hist_min_log10,
+            'hist_max_log10': args.hist_max_log10,
+            'hist_bins': args.hist_bins,
+            'metrics': args.per_sample_metrics,   # ['loss','resid','kappa']
+            'no_frames': args.no_frames,
+        }
+    
+
     # ----- Training Invocation -----
     train(
         net=net,
         optimizer=optimizer,
-        data=data,
+        data=tuple_data,
         max_epochs=args.epochs,
         max_steps=args.steps,
         batch_size=args.batch,
@@ -1409,10 +1715,8 @@ if __name__ == '__main__':
         loss_fn=loss_fn,
         verbose=True,
         stop_loss = args.stop_loss,
-        initial_sharpness = args.init_sharp,
-        epoch_to_start=args.cont_epoch,
-        step_to_start = step_to_start,
-        sharpness_every=args.sharp_every,
+        epoch_to_start=epoch_to_start,
+        step_to_start=step_to_start,
         gd_noise=args.gd_noise,
         noise_magnitude=args.noise_mag,
         results_rarely=args.results_rarely,
@@ -1439,6 +1743,6 @@ if __name__ == '__main__':
         wandb_enabled=wandb_enabled,
         wandb_run_id=wandb_run_id,
         #NEW
-        per_sample_cfg=None,
-
+        per_sample_cfg=per_sample_cfg,
+        prototype_data=prototype_data,
     )
