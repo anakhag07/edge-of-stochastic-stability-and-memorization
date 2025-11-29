@@ -10,7 +10,8 @@ from pathlib import Path
 import math
 import random
 import argparse
-import torch.nn.functional as F
+from typing import Dict, List
+
 import time
 
 import imageio.v2 as imageio
@@ -18,20 +19,20 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils.data import prepare_dataset, get_dataset_presets,generate_prototype_sets
+from utils.data import prepare_dataset, get_dataset_presets
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
 from utils.nets import ResNet
 from utils.storage import initialize_folders
 from utils.wandb_utils import (
     init_wandb,
     log_metrics,
+    log_knn_outlier_results,
     save_checkpoint_wandb,
     find_closest_checkpoint_wandb,
     load_checkpoint_wandb,
     get_checkpoint_dir_for_run,
     is_wandb_available,
     generate_run_id,
-
 )
 
 from utils.noise import gd_with_noise, GradStorage, sde_integration
@@ -51,6 +52,124 @@ if 'RESULTS' not in os.environ:
 DATASET_FOLDER = Path(os.environ.get('DATASETS'))
 # export RESULTS=/scratch/gpfs/andreyev/eoss/results
 RES_FOLDER = Path(os.environ.get('RESULTS'))
+
+KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad"]
+
+
+def _load_reference_knn_indices(dataset_name: str, model_name: str, run_name: str) -> Dict[int, List[int]]:
+    plaintext_root = RES_FOLDER / 'plaintext' / f"{dataset_name}_{model_name}"
+    ref_run_dir = plaintext_root / run_name
+    indices_path = ref_run_dir / 'knn_outlier_indices.json'
+    if not indices_path.exists():
+        raise FileNotFoundError(
+            f"Cannot find knn_outlier_indices.json at {indices_path}. "
+            "Ensure the reference run name is correct."
+        )
+
+    with open(indices_path, 'r') as f:
+        indices_payload = json.load(f)
+
+    per_class_indices = indices_payload.get('per_class_indices', {})
+    if not per_class_indices:
+        raise ValueError(f"No per-class indices found in {indices_path}")
+
+    cleaned = {}
+    for class_key, idx_list in per_class_indices.items():
+        class_id = int(class_key)
+        cleaned[class_id] = [int(idx) for idx in idx_list]
+    return cleaned
+
+
+def _build_tracked_subsets(per_class_indices: Dict[int, List[int]], track_top: int):
+    tracked_subsets = []
+    trimmed_by_class: Dict[int, List[int]] = {}
+    for class_id, idx_list in per_class_indices.items():
+        trimmed = [int(idx) for idx in idx_list[:track_top]]
+        if not trimmed:
+            continue
+        trimmed_by_class[class_id] = trimmed
+        tracked_subsets.append({
+            "name": f"class_{class_id}",
+            "class_id": class_id,
+            "indices": trimmed,
+        })
+    return tracked_subsets, trimmed_by_class
+
+
+def _sample_inlier_subsets(
+    labels: torch.Tensor,
+    excluded_by_class: Dict[int, List[int]],
+    seed: int,
+) -> List[dict]:
+    if labels is None or not excluded_by_class:
+        return []
+
+    label_tensor = labels.detach().cpu()
+    if label_tensor.ndim > 1:
+        label_tensor = label_tensor.argmax(dim=1)
+    label_tensor = label_tensor.to(dtype=torch.long)
+    rng = random.Random(seed)
+
+    subsets = []
+    for class_id, excluded in excluded_by_class.items():
+        class_mask = (label_tensor == class_id)
+        class_indices = class_mask.nonzero(as_tuple=False).view(-1).tolist()
+        if not class_indices:
+            continue
+        excluded_set = set(excluded)
+        candidates = [idx for idx in class_indices if idx not in excluded_set]
+        if not candidates:
+            continue
+        desired = min(len(excluded), len(candidates))
+        if desired <= 0:
+            continue
+        if len(candidates) > desired:
+            sampled = rng.sample(candidates, desired)
+        else:
+            sampled = candidates
+        subsets.append({
+            "name": f"class_{class_id}",
+            "class_id": class_id,
+            "indices": sampled,
+        })
+    return subsets
+
+
+def prepare_knn_subset_tracking_configs(args, dataset_name: str, model_name: str, data) -> List[dict]:
+    if not args.track_knn_outliers_from:
+        return []
+
+    per_class_indices = _load_reference_knn_indices(dataset_name, model_name, args.track_knn_outliers_from)
+    track_top = max(1, args.track_knn_topk)
+
+    tracked_subsets, trimmed_by_class = _build_tracked_subsets(per_class_indices, track_top)
+    if not tracked_subsets:
+        raise ValueError(
+            f"No indices remained after applying --track-knn-topk={track_top} "
+            f"for run {args.track_knn_outliers_from}"
+        )
+
+    configs = [{
+        "enabled": True,
+        "subsets": tracked_subsets,
+        "metrics": KNN_TRACKING_METRICS,
+        "log_prefix": f"knn_outlier/{args.track_knn_outliers_from}",
+    }]
+
+    _, Y_train, _, _ = data
+    inlier_seed = (args.dataset_seed or 0) + 1337
+    inlier_subsets = _sample_inlier_subsets(Y_train, trimmed_by_class, seed=inlier_seed)
+    if inlier_subsets:
+        configs.append({
+            "enabled": True,
+            "subsets": inlier_subsets,
+            "metrics": KNN_TRACKING_METRICS,
+            "log_prefix": f"knn_inlier/{args.track_knn_outliers_from}",
+        })
+    else:
+        print("Warning: Unable to sample knn_inlier subsets; insufficient inlier candidates.")
+
+    return configs
 
 
 
@@ -116,18 +235,11 @@ class PerSampleHistograms:
         self.counts = {metric: 0 for metric in metrics}
         self.quantiles = {metric: np.zeros((bins,)) for metric in metrics}
 
-# @torch.no_grad()
-
+@torch.no_grad()
 def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, device='cuda'):
-    """
-    Return dict of numpy arrays: loss, resid_norm, kappa, grad_norm for dataset (X, Y).
-    loss_type: 'ce' (cross-entropy) or 'mse' (SquaredLoss: 0.5 * ||y - yhat||^2).
-    """
-    was_training = net.training
+    """Return dict of numpy arrays: loss, resid_norm, kappa for dataset (X,Y)."""
     net.eval()
-
-    out_loss, out_resid, out_kappa, out_grad_norm = [], [], [], []
-
+    out_loss, out_resid, out_kappa = [], [], []
     for i in range(0, len(X), batch_size):
         xb = X[i:i + batch_size].to(device)
         yb = Y[i:i + batch_size].to(device)
@@ -228,7 +340,7 @@ def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, devic
         'loss': torch.cat(out_loss).numpy(),
         'resid': torch.cat(out_resid).numpy(),
         'kappa': torch.cat(out_kappa).numpy(),
-        'grad_norm': np.asarray(out_grad_norm),
+        'grad_norm': torch.cat(out_grad_norm).numpy()
     }
 
 def _hist_log10(values, bin_edges):
@@ -291,9 +403,9 @@ class MeasurementRunner:
         quad_approx,
         memorization_outlier_frac: float,
         # NEW:
-        prototype_data,
         full_inputs_test=None,
         per_sample_cfg=None,
+        subset_tracking_cfgs=None,
     ):
         self.net = net
         self.loss_fn = loss_fn
@@ -319,8 +431,35 @@ class MeasurementRunner:
         self.gd_noise = gd_noise
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
-        self.memorization_outlier_frac = memorization_outlier_frac 
-
+        self.memorization_outlier_frac = memorization_outlier_frac
+        
+        # NEW: Per-sample config
+        self.full_inputs_test = full_inputs_test
+        self.per_sample_cfg = per_sample_cfg
+        
+        # NEW: Per-sample initialization logic
+        if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
+            self.per_sample_histograms = PerSampleHistograms(
+                min_log10=per_sample_cfg['hist_min_log10'],
+                max_log10=per_sample_cfg['hist_max_log10'],
+                bins=per_sample_cfg['hist_bins'],
+                metrics=per_sample_cfg.get('metrics', per_sample_cfg.get('hist_metrics', ['loss'])))
+            # Initialize bin edges for log10 histogram
+            self.bin_edges = np.linspace(
+                per_sample_cfg['hist_min_log10'],
+                per_sample_cfg['hist_max_log10'],
+                per_sample_cfg['hist_bins'] + 1
+            )
+            # Initialize directories for saving
+            self.ps_dir = save_dir / 'per_sample_histograms'
+            self.frames_dir = self.ps_dir / 'frames'
+            _ensure_dir(self.ps_dir)
+            if not per_sample_cfg.get('no_frames', False):
+                _ensure_dir(self.frames_dir)
+        else:
+            self.per_sample_histograms = None
+            self.bin_edges = None
+            self.ps_dir = None       
         # NEW: Per-sample config
         self.full_inputs_test = full_inputs_test
         self.per_sample_cfg = per_sample_cfg
@@ -350,6 +489,34 @@ class MeasurementRunner:
             self.ps_dir = None
             self.frames_dir = None
 
+        self.subset_trackers = []
+        if subset_tracking_cfgs:
+            for cfg in subset_tracking_cfgs:
+                if not cfg or not cfg.get('enabled', False):
+                    continue
+                tracked_subsets = []
+                for subset in cfg.get('subsets', []):
+                    indices = subset.get('indices')
+                    if not torch.is_tensor(indices):
+                        indices = torch.tensor(indices, dtype=torch.long, device=self.X.device)
+                    else:
+                        indices = indices.to(device=self.X.device, dtype=torch.long)
+                    if indices.numel() == 0:
+                        continue
+                    tracked_subsets.append({
+                        "name": subset.get('name', f"class_{subset.get('class_id', 'unknown')}"),
+                        "class_id": subset.get('class_id'),
+                        "indices": indices,
+                    })
+
+                if tracked_subsets:
+                    self.subset_trackers.append({
+                        "subsets": tracked_subsets,
+                        "metrics": cfg.get('metrics', ["full_loss", "accuracy", "lambda_max"]),
+                        "metric_kwargs": cfg.get('metric_kwargs', {}),
+                        "log_prefix": cfg.get('log_prefix', "knn_outlier"),
+                    })
+
         self.eigenvalues_log = []
         if 'lmax' in measurements and num_eigenvalues > 1:
             eigenvalues_path = save_dir / 'eigenvalues.json'
@@ -357,7 +524,7 @@ class MeasurementRunner:
             self.eigenvalues_file.write('[\n')
         else:
             self.eigenvalues_file = None
-        self.prototype_data = prototype_data #NEW
+
     def close(self):
         if self.eigenvalues_file is not None:
             self.eigenvalues_file.write('\n]')
@@ -564,6 +731,26 @@ class MeasurementRunner:
                 metrics['test_acc'] = vals['test_acc']
                 metrics['train_test_gap'] = vals['gap']
 
+        if self.subset_trackers and frequency_calculator.should_measure('knn_outlier_metrics', ctx):
+            for tracker in self.subset_trackers:
+                metric_kwargs = tracker.get('metric_kwargs', {})
+                for subset in tracker['subsets']:
+                    subset_results = compute_subset_metrics(
+                        net=self.net,
+                        loss_fn=self.loss_fn,
+                        X=self.X,
+                        Y=self.Y,
+                        indices=subset['indices'],
+                        metrics=tracker['metrics'],
+                        eigenvector_cache=self.eigenvector_cache,
+                        num_eigenvalues=self.num_eigenvalues,
+                        use_power_iteration=self.use_power_iteration,
+                        metric_kwargs=metric_kwargs,
+                    )
+                    prefix = f"{tracker['log_prefix']}/{subset['name']}"
+                    for key, value in subset_results.items():
+                        metrics[f"{prefix}/{key}"] = value
+
         # ----- NEW: Per-sample histograms -----
         if self.per_sample_cfg and self.per_sample_cfg['enabled']:
             every = self.per_sample_cfg['every']
@@ -743,7 +930,6 @@ class MeasurementRunner:
                 f"Loss = {loss.item()}"
             )
     
-
         # ----- NEW: Prototype per-sample stats over time -----
         if self.prototype_data is not None and self.per_sample_cfg and self.per_sample_cfg['enabled']:
             proto_every = self.per_sample_cfg["every"]
@@ -797,7 +983,9 @@ class MeasurementRunner:
 
         metrics['epoch_loss_update'] = epoch_loss_update
         return metrics
- 
+    
+        
+
 
 # -------------------------------------
 # Section: Training Function
@@ -814,7 +1002,7 @@ def train(
             save_to, #folder
             device,
             verbose=True,
-            loss_fn=nn.CrossEntropyLoss(),
+            loss_fn=nn.MSELoss(),
             permute=True,
             stop_loss=None,
             epoch_to_start=0,
@@ -845,10 +1033,10 @@ def train(
             wandb_run=None,
             wandb_enabled: bool = False,
             wandb_run_id: str = None,
-            per_sample_cfg=None, #NEW
-            prototype_data=None,
-
-          ):
+            per_sample_cfg=None, #NEW 
+            knn_outlier_cfg=None,
+            subset_tracking_cfgs=None,
+    ):
     
     # -------------------------------------
     # Section: Setup
@@ -868,7 +1056,8 @@ def train(
     X_train, Y_train, X_test, Y_test = data
 
     X, Y = X_train, Y_train
-   
+
+
     # ----- Device Alignment -----
     net = net.to(device)
     net.train()
@@ -884,6 +1073,7 @@ def train(
     save_to.mkdir(parents=True, exist_ok=True)
 
     model_save_path = save_to / 'checkpoints'
+
     results_file = save_to / 'results.txt'
     if device == 'cpu':
         # No buffering on CPU to ensure writes happen immediately
@@ -968,10 +1158,8 @@ def train(
         proj_switch_step=proj_switch_step,
         quad_approx=quad_approx,
         memorization_outlier_frac=memorization_outlier_frac,
-        prototype_data=prototype_data,    
-        full_inputs_test=None,
         per_sample_cfg=per_sample_cfg,
-
+        subset_tracking_cfgs=subset_tracking_cfgs,
     )
     # ----- Run Identification -----
     run_id = wandb_run_id or generate_run_id()
@@ -1302,33 +1490,6 @@ def train(
     )
     print(f"Final checkpoint saved: {final_checkpoint_path}")
 
-
-    # ----- NEW: per-sample stats on prototype sets -----
-    if prototype_data is not None:
-        print("Computing per-sample metrics for prototype sets...")
-        loss_type = 'ce' if isinstance(loss_fn, nn.CrossEntropyLoss) else 'mse'
-
-        proto_dir = save_to / "prototype_final"
-        _ensure_dir(proto_dir)
-
-        for name, (X_p, Y_p) in prototype_data.items():
-            X_p = X_p.to(device)
-            Y_p = Y_p.to(device)
-
-            stats = _per_sample_stats(
-                net,
-                loss_fn,
-                X_p,
-                Y_p,
-                loss_type='ce',
-                batch_size=batch_size,
-                device=device,
-            )
-            out_path = proto_dir / f"final_{name}.npz"
-            np.savez(out_path, **stats)
-            print(f"  saved {name} -> {out_path}")
-
-
     results_file.close()
 
     measurement_runner.close()
@@ -1342,6 +1503,105 @@ def train(
     print(f"Training finished at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
     print(f"Total training time: {end_time - start_time:.2f} seconds")
 
+    if knn_outlier_cfg and knn_outlier_cfg.get('enabled', False):
+        print("Computing k-NN neighbor-mix outliers...")
+        feature_batch = knn_outlier_cfg.get('feature_batch_size', 512)
+        k_neighbors = knn_outlier_cfg.get('k_neighbors', 32)
+        top_k_per_class = knn_outlier_cfg.get('top_k_per_class', 5)
+        balance_target = knn_outlier_cfg.get('balance_target', 0.5)
+        chunk_size = knn_outlier_cfg.get('chunk_size', 1024)
+        normalize = knn_outlier_cfg.get('normalize', True)
+        return_indices = knn_outlier_cfg.get('return_neighbor_indices', True)
+
+        features = extract_feature_matrix(
+            net,
+            X,
+            batch_size=feature_batch,
+            flatten_outputs=True,
+        )
+        label_tensor = Y.detach().cpu()
+
+        outlier_summary = identify_knn_outliers_by_neighbor_mix(
+            features,
+            label_tensor,
+            k_neighbors=k_neighbors,
+            top_k_per_class=top_k_per_class,
+            balance_target=balance_target,
+            chunk_size=chunk_size,
+            normalize=normalize,
+            return_neighbor_indices=return_indices,
+        )
+
+        per_class_indices = {}
+        per_class_stats = {}
+        flattened_rows = []
+        global_balance_dev = []
+        global_entropy = []
+        global_gap = []
+
+        for class_id, entries in outlier_summary.get("outliers", {}).items():
+            if not entries:
+                continue
+            per_class_indices[int(class_id)] = [int(e["dataset_index"]) for e in entries]
+
+            ratios = np.array([e["same_class_ratio"] for e in entries], dtype=np.float32)
+            devs = np.array([e["balance_deviation"] for e in entries], dtype=np.float32)
+            entropies = np.array([e["neighbor_entropy"] for e in entries], dtype=np.float32)
+            gaps = np.array([e["top_two_gap"] for e in entries], dtype=np.float32)
+
+            per_class_stats[int(class_id)] = {
+                "count": len(entries),
+                "mean_same_class_ratio": float(ratios.mean()),
+                "mean_balance_deviation": float(devs.mean()),
+                "mean_neighbor_entropy": float(entropies.mean()),
+                "mean_top_two_gap": float(gaps.mean()),
+            }
+
+            global_balance_dev.extend(devs.tolist())
+            global_entropy.extend(entropies.tolist())
+            global_gap.extend(gaps.tolist())
+
+            for entry in entries:
+                flattened_rows.append({
+                    "dataset_index": int(entry["dataset_index"]),
+                    "class_id": int(class_id),
+                    "same_class_ratio": float(entry["same_class_ratio"]),
+                    "balance_deviation": float(entry["balance_deviation"]),
+                    "neighbor_entropy": float(entry["neighbor_entropy"]),
+                    "top_two_gap": float(entry["top_two_gap"]),
+                    "avg_neighbor_distance": float(entry["avg_neighbor_distance"]),
+                })
+
+        outlier_path = save_to / 'knn_outliers.json'
+        with open(outlier_path, 'w') as f:
+            json.dump(outlier_summary, f, indent=2)
+
+        indices_payload = {
+            "k_neighbors": k_neighbors,
+            "top_k_per_class": top_k_per_class,
+            "class_ids": outlier_summary.get("class_ids", []),
+            "per_class_indices": {str(k): v for k, v in per_class_indices.items()},
+            "flat_indices": sorted({idx for v in per_class_indices.values() for idx in v}),
+        }
+        with open(save_to / 'knn_outlier_indices.json', 'w') as f:
+            json.dump(indices_payload, f, indent=2)
+
+        if wandb_enabled and wandb_run is not None:
+            total_flagged = len(flattened_rows)
+            wandb_metrics = {
+                "knn_outliers/total_flagged": total_flagged,
+                "knn_outliers/mean_balance_deviation": float(np.mean(global_balance_dev)) if global_balance_dev else float('nan'),
+                "knn_outliers/mean_neighbor_entropy": float(np.mean(global_entropy)) if global_entropy else float('nan'),
+                "knn_outliers/mean_top_two_gap": float(np.mean(global_gap)) if global_gap else float('nan'),
+            }
+            for class_id, stats in per_class_stats.items():
+                prefix = f"knn_outliers/class_{class_id}"
+                for name, value in stats.items():
+                    wandb_metrics[f"{prefix}/{name}"] = value
+
+            log_knn_outlier_results(wandb_metrics, flattened_rows)
+
+        print(f"k-NN outlier summary saved to {outlier_path}")
 
 
     # ----- Optional Final Measurements -----
@@ -1416,9 +1676,6 @@ if __name__ == '__main__':
     parser.add_argument('--one-step-loss-change', action='store_true', help='If set, compute the expected one-step change in loss using Monte Carlo estimation')
     parser.add_argument('--gradient-norm', action='store_true', help='If set, compute the Monte Carlo estimate of squared norm of mini-batch gradients')
     parser.add_argument('--final', action='store_true', help='If set, compute the lambda_max and step sharpness at the end')
-    parser.add_argument('--memorization-hessian-outliers', action='store_true', help='Compute memorization stats based on alignment with top Hessian eigenvector (heavy; runs rarely)')
-    parser.add_argument('--memorization-outlier-frac', type=float, default=0.05, help='Fraction of examples treated as outliers for Hessian-alignment memorization stats')
-
     
     # --- Measurement Flags (Tertiary, aka almost completely useless) ---
     parser.add_argument('--batch-sharpness-exp-inside', action='store_true', help='If set, compute the batch sharpness using E[gHg]/E[g²], where the expectation is inside the ratio. Compare with step-sharpness, where the expectation stays outside the ratio.')
@@ -1473,24 +1730,35 @@ if __name__ == '__main__':
     parser.add_argument('--train-test-gap', action='store_true', help='If set, compute the training and testing accuracy and gap (heavy, runs rarely)')
 
     # --- NEW: Per-Sample Histogram Configuration ---
+    parser.add_argument('--per-sample', action='store_true', help='If set, compute per-sample histograms (heavy; runs rarely)')
+    parser.add_argument('--per-sample-freq', type=float, default=None, help='Frequency of per-sample histograms, as fraction of max_steps (default: 0.01 = every 100 steps for 10k max_steps)')
+    parser.add_argument('--per-sample-min-log10', type=float, default=-8, help='Min log10 value for log10 histograms (default: -8)')
+    parser.add_argument('--per-sample-max-log10', type=float, default=0, help='Max log10 value for log10 histograms (default: 0)')
+    parser.add_argument('--per-sample-bins', type=int, default=80, help='Number of bins for log10 histograms (default: 80)')
+    parser.add_argument('--per-sample-metrics', type=str, nargs='+', default=['loss','resid','kappa'], choices=['loss','resid','kappa'], help='Which metrics to histogram (default: loss resid kappa)')
+    parser.add_argument('--no-frames', action='store_true', help='Only save counts/quantiles as .npz; do not render PNG frames')
 
-    parser.add_argument('--per-sample', action='store_true',
-                        help='Track per-sample loss/residual/curvature histograms over time and save frames')
-    parser.add_argument('--per-sample-every', type=int, default=100,
-                        help='Snapshot cadence in steps for per-sample histograms (default: 100)')
-    parser.add_argument('--hist-min-log10', type=float, default=-6.0,
-                        help='Left edge for log10 binning (default: -6)')
-    parser.add_argument('--hist-max-log10', type=float, default=2.0,
-                        help='Right edge for log10 binning (default: 2)')
-    parser.add_argument('--hist-bins', type=int, default=80,
-                        help='Number of bins for log10 histograms (default: 80)')
-    parser.add_argument('--per-sample-metrics', type=str, nargs='+',
-                        default=['loss','resid','kappa'],
-                        choices=['loss','resid','kappa'],
-                        help='Which metrics to histogram (default: loss resid kappa)')
-    parser.add_argument('--no-frames', action='store_true',
-                        help='Only save counts/quantiles as .npz; do not render PNG frames')
+    # --- NEW: Memorization via Outliers identified by Alignment with Top Hessian Eigenvector ---
+    parser.add_argument('--memorization-hessian-outliers', action='store_true', help='Compute memorization stats based on alignment with top Hessian eigenvector (heavy; runs rarely)')
+    parser.add_argument('--memorization-outlier-frac', type=float, default=0.05, help='Fraction of examples treated as outliers for Hessian-alignment memorization stats')
 
+    # --- NEW: Outlier Mining Configuration ---
+    parser.add_argument('--knn-outliers', action='store_true',
+                        help='After training, run a k-NN pass to flag ambiguous samples')
+    parser.add_argument('--knn-neighbors', type=int, default=32,
+                        help='Number of neighbors used for the ambiguity score')
+    parser.add_argument('--knn-top-per-class', type=int, default=10,
+                        help='How many outliers to keep per class')
+    parser.add_argument('--knn-feature-batch', type=int, default=512,
+                        help='Batch size used during the post-hoc embedding pass')
+    parser.add_argument('--knn-chunk-size', type=int, default=1024,
+                        help='Chunk size used while computing the k-NN graph')
+    parser.add_argument('--knn-no-normalize', action='store_true',
+                        help='Disable L2-normalization of feature vectors before k-NN')
+    parser.add_argument('--track-knn-outliers-from', type=str, default=None,
+                        help='Existing plaintext run folder name (e.g., 20251124_0820_35_lr0.01000_b8) whose knn_outlier_indices.json should be tracked during training')
+    parser.add_argument('--track-knn-topk', type=int, default=5,
+                        help='Number of stored outliers per class to track from the reference run')
 
     # ----- Argument Parsing -----
     args = parser.parse_args()
@@ -1603,12 +1871,6 @@ if __name__ == '__main__':
     # --- Dataset Preparation ---
     data = prepare_dataset(dataset, DATASET_FOLDER, args.num_data, args.classes, args.dataset_seed, loss_type=args.loss)
 
-    # --- Unpack dataset and build tuple_data ---
-    train_x, train_y, test_x, test_y = data  
-    tuple_data = (train_x, train_y, test_x, test_y)
-
-    prototype_data = generate_prototype_sets(train_x, train_y, args.classes)
-
     # --- Model Construction ---
     name = args.model
     params = model_presets[name]['params']
@@ -1677,7 +1939,7 @@ if __name__ == '__main__':
     if args.param_file is not None:
         param_reference = T.load(args.param_file, map_location=device)
         # param_reference = param_reference['model_state_dict']
-        # param_reference = {k: v.to(device) for k, v in param_reference.items()} 
+        # param_reference = {k: v.to(device) for k, v in param_reference.items()}
 
     # ----- Optimizer Preparation -----
     optimizer = prepare_optimizer(net, args.lr, args.momentum, args.adam)
@@ -1688,25 +1950,46 @@ if __name__ == '__main__':
     else:
         checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
     
-    
     per_sample_cfg = None
     if args.per_sample:
+        freq = args.per_sample_freq if args.per_sample_freq is not None else 0.01
+        if args.steps is None:
+            raise ValueError("--per-sample requires --steps when using --epochs-only mode")
+        every = max(1, int(args.steps * freq))
         per_sample_cfg = {
             'enabled': True,
-            'every': max(1, int(args.per_sample_every)),
-            'hist_min_log10': args.hist_min_log10,
-            'hist_max_log10': args.hist_max_log10,
-            'hist_bins': args.hist_bins,
-            'metrics': args.per_sample_metrics,   # ['loss','resid','kappa']
+            'every': every,
+            'hist_min_log10': args.per_sample_min_log10,
+            'hist_max_log10': args.per_sample_max_log10,
+            'hist_bins': args.per_sample_bins,
+            'metrics': args.per_sample_metrics,
             'no_frames': args.no_frames,
         }
-    
+
+    knn_outlier_cfg = None
+    if args.knn_outliers:
+        if args.knn_neighbors < 2:
+            raise ValueError("--knn-neighbors must be >= 2 when --knn-outliers is set")
+        if args.knn_top_per_class < 1:
+            raise ValueError("--knn-top-per-class must be >= 1 when --knn-outliers is set")
+
+        knn_outlier_cfg = {
+            "enabled": True,
+            "k_neighbors": args.knn_neighbors,
+            "top_k_per_class": args.knn_top_per_class,
+            "feature_batch_size": args.knn_feature_batch,
+            "chunk_size": args.knn_chunk_size,
+            "normalize": not args.knn_no_normalize,
+            "return_neighbor_indices": True,
+        }
+
+    subset_tracking_cfgs = prepare_knn_subset_tracking_configs(args, dataset, args.model, data) if args.track_knn_outliers_from else []
 
     # ----- Training Invocation -----
     train(
         net=net,
         optimizer=optimizer,
-        data=tuple_data,
+        data=data,
         max_epochs=args.epochs,
         max_steps=args.steps,
         batch_size=args.batch,
@@ -1744,5 +2027,7 @@ if __name__ == '__main__':
         wandb_run_id=wandb_run_id,
         #NEW
         per_sample_cfg=per_sample_cfg,
-        prototype_data=prototype_data,
+        knn_outlier_cfg=knn_outlier_cfg,
+        subset_tracking_cfgs=subset_tracking_cfgs,
+
     )
