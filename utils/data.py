@@ -540,12 +540,12 @@ def generate_prototype_sets(X_train: T.Tensor, Y_train: T.Tensor, classes: tuple
     
     # ---------- 4. Inliers (close to centroids) ----------
     # Class 0 Inliers (Features from C0, Label = C0)
-    X_inlier_0 = X_0[idx_0_near] 
-    Y_inlier_0 = T.full((N_PROTOTYPE,), class_0, dtype=Y_train.dtype) 
+    X_inlier_0 = X_0[idx_0_near]
+    Y_inlier_0 = T.full((k0,), class_0, dtype=Y_train.dtype)
 
     # Class 1 Inliers (Features from C1, Label = C1)
-    X_inlier_1 = X_1[idx_1_near] 
-    Y_inlier_1 = T.full((N_PROTOTYPE,), class_1, dtype=Y_train.dtype)
+    X_inlier_1 = X_1[idx_1_near]
+    Y_inlier_1 = T.full((k1,), class_1, dtype=Y_train.dtype)
     
     # Concatenate to form the final Inlier set
     X_inlier = T.cat([X_inlier_0, X_inlier_1], dim=0)
@@ -557,4 +557,3 @@ def generate_prototype_sets(X_train: T.Tensor, Y_train: T.Tensor, classes: tuple
         'y_outlier': (X_y_outlier, Y_y_outlier),
         'inliers': (X_inlier, Y_inlier),
     }
-
