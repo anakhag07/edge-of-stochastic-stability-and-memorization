@@ -456,7 +456,7 @@ def prepare_dataset(dataset: str, dataset_folder: Union[str, Path], num_data: in
    
 ## NEW FUNCTION: Genearte centroids, boundary points, x-outlier, y-outlier based on class selection
 
-N_PROTOTYPE = 5
+N_PROTOTYPE = 50
 EXTRAPOLATION_FACTOR = 3.0
 
 

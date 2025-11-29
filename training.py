@@ -2075,22 +2075,6 @@ if __name__ == '__main__':
     else:
         checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
     
-    per_sample_cfg = None
-    if args.per_sample:
-        freq = args.per_sample_freq if args.per_sample_freq is not None else 0.01
-        if args.steps is None:
-            raise ValueError("--per-sample requires --steps when using --epochs-only mode")
-        every = max(1, int(args.steps * freq))
-        per_sample_cfg = {
-            'enabled': True,
-            'every': every,
-            'hist_min_log10': args.per_sample_min_log10,
-            'hist_max_log10': args.per_sample_max_log10,
-            'hist_bins': args.per_sample_bins,
-            'metrics': args.per_sample_metrics,
-            'no_frames': args.no_frames,
-        }
-
     knn_outlier_cfg = None
     if args.knn_outliers:
         if args.knn_neighbors < 2:
