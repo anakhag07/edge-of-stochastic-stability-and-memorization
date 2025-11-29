@@ -12,6 +12,7 @@ import random
 import argparse
 from typing import Dict, List
 
+import torch.nn.functional as F
 import time
 
 import imageio.v2 as imageio
@@ -19,7 +20,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils.data import prepare_dataset, get_dataset_presets
+from utils.data import prepare_dataset, get_dataset_presets,generate_prototype_sets
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
 from utils.nets import ResNet
 from utils.storage import initialize_folders
@@ -33,6 +34,7 @@ from utils.wandb_utils import (
     get_checkpoint_dir_for_run,
     is_wandb_available,
     generate_run_id,
+
 )
 
 from utils.noise import gd_with_noise, GradStorage, sde_integration
@@ -222,6 +224,56 @@ def compute_prototype_metrics(net, loss_fn, prototype_data, device, base_batch_s
 
 
 
+
+# -------------------------------------
+# NEW: Sharpness for Prototypes
+# ------------------------------------
+
+def compute_prototype_metrics(net, loss_fn, prototype_data, device, base_batch_size=32):
+    """
+    prototype_data: dict like {
+        'boundary': (X_boundary, Y_boundary),
+        'x_outlier': (X_x, Y_x),
+        'y_outlier': (X_y, Y_y),
+        'inliers': (X_in, Y_in),
+    }
+    """
+    metrics = {}
+
+    for name, (X_p, Y_p) in prototype_data.items():
+        X_p = X_p.to(device)
+        Y_p = Y_p.to(device)
+        n = X_p.shape[0]
+        batch_size = min(base_batch_size, n)
+
+
+        # ---- Prototype Loss ----
+        with torch.no_grad():
+            logits = net(X_p)
+            loss_val = loss_fn(logits, Y_p).item()
+        metrics[f"prototype/{name}/loss"] = loss_val
+
+
+        # ---- Batch sharpness: E[gᵀHg / ||g||²] on the prototype set ----
+        proto_batch_sharp = calculate_averaged_grad_H_grad(
+            net=net,
+            X=X_p,
+            Y=Y_p,
+            loss_fn=loss_fn,
+            batch_size=batch_size,
+            n_estimates=1,       # small set, 1–3 estimates is usually enough
+            min_estimates=1,
+            eps=1.0,             # don't bother with tight MC convergence
+            expectation_inside=False,
+            with_replacement=False,
+            return_confidence_interval=False,
+        )
+        metrics[f"prototype/{name}/batch_sharpness"] = float(proto_batch_sharp)
+
+    return metrics
+
+
+
 # -------------------------------------
 # NEW: Per-sample histograms setup
 # -------------------------------------
@@ -235,11 +287,18 @@ class PerSampleHistograms:
         self.counts = {metric: 0 for metric in metrics}
         self.quantiles = {metric: np.zeros((bins,)) for metric in metrics}
 
-@torch.no_grad()
+# @torch.no_grad()
+
 def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, device='cuda'):
-    """Return dict of numpy arrays: loss, resid_norm, kappa for dataset (X,Y)."""
+    """
+    Return dict of numpy arrays: loss, resid_norm, kappa, grad_norm for dataset (X, Y).
+    loss_type: 'ce' (cross-entropy) or 'mse' (SquaredLoss: 0.5 * ||y - yhat||^2).
+    """
+    was_training = net.training
     net.eval()
-    out_loss, out_resid, out_kappa = [], [], []
+
+    out_loss, out_resid, out_kappa, out_grad_norm = [], [], [], []
+
     for i in range(0, len(X), batch_size):
         xb = X[i:i + batch_size].to(device)
         yb = Y[i:i + batch_size].to(device)
@@ -340,7 +399,7 @@ def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, devic
         'loss': torch.cat(out_loss).numpy(),
         'resid': torch.cat(out_resid).numpy(),
         'kappa': torch.cat(out_kappa).numpy(),
-        'grad_norm': torch.cat(out_grad_norm).numpy()
+        'grad_norm': np.asarray(out_grad_norm),
     }
 
 def _hist_log10(values, bin_edges):
@@ -403,6 +462,7 @@ class MeasurementRunner:
         quad_approx,
         memorization_outlier_frac: float,
         # NEW:
+        prototype_data,
         full_inputs_test=None,
         per_sample_cfg=None,
         subset_tracking_cfgs=None,
@@ -431,35 +491,8 @@ class MeasurementRunner:
         self.gd_noise = gd_noise
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
-        self.memorization_outlier_frac = memorization_outlier_frac
-        
-        # NEW: Per-sample config
-        self.full_inputs_test = full_inputs_test
-        self.per_sample_cfg = per_sample_cfg
-        
-        # NEW: Per-sample initialization logic
-        if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
-            self.per_sample_histograms = PerSampleHistograms(
-                min_log10=per_sample_cfg['hist_min_log10'],
-                max_log10=per_sample_cfg['hist_max_log10'],
-                bins=per_sample_cfg['hist_bins'],
-                metrics=per_sample_cfg.get('metrics', per_sample_cfg.get('hist_metrics', ['loss'])))
-            # Initialize bin edges for log10 histogram
-            self.bin_edges = np.linspace(
-                per_sample_cfg['hist_min_log10'],
-                per_sample_cfg['hist_max_log10'],
-                per_sample_cfg['hist_bins'] + 1
-            )
-            # Initialize directories for saving
-            self.ps_dir = save_dir / 'per_sample_histograms'
-            self.frames_dir = self.ps_dir / 'frames'
-            _ensure_dir(self.ps_dir)
-            if not per_sample_cfg.get('no_frames', False):
-                _ensure_dir(self.frames_dir)
-        else:
-            self.per_sample_histograms = None
-            self.bin_edges = None
-            self.ps_dir = None       
+        self.memorization_outlier_frac = memorization_outlier_frac 
+
         # NEW: Per-sample config
         self.full_inputs_test = full_inputs_test
         self.per_sample_cfg = per_sample_cfg
@@ -524,7 +557,7 @@ class MeasurementRunner:
             self.eigenvalues_file.write('[\n')
         else:
             self.eigenvalues_file = None
-
+        self.prototype_data = prototype_data #NEW
     def close(self):
         if self.eigenvalues_file is not None:
             self.eigenvalues_file.write('\n]')
@@ -981,11 +1014,60 @@ class MeasurementRunner:
             )
             metrics.update(proto_metrics)
 
+        # ----- NEW: Prototype per-sample stats over time -----
+        if self.prototype_data is not None and self.per_sample_cfg and self.per_sample_cfg['enabled']:
+            proto_every = self.per_sample_cfg["every"]
+            if step_number % proto_every == 0:
+                loss_type = 'ce' if isinstance(self.loss_fn, nn.CrossEntropyLoss) else 'mse'
+
+                proto_dir = self.ps_dir / "prototypes"
+                _ensure_dir(proto_dir)
+
+                for name, (X_p, Y_p) in self.prototype_data.items():
+                    X_p = X_p.to(self.device)
+                    Y_p = Y_p.to(self.device)
+
+                    # Per-sample stats
+                    stats = _per_sample_stats(
+                        self.net,
+                        self.loss_fn,
+                        X_p,
+                        Y_p,
+                        loss_type=loss_type,
+                        batch_size=len(X_p),
+                        device=self.device,
+                    )
+                    
+                    # NEW: Add batch sharpness for this prototype set
+                    # Compute full loss on this prototype set
+                    self.net.zero_grad()
+                    preds = self.net(X_p).squeeze(dim=-1)
+                    proto_loss = self.loss_fn(preds, Y_p)
+                    
+                    # Compute batch sharpness (gHg/g²)
+                    batch_sharpness = compute_grad_H_grad(proto_loss, self.net).item()
+                    
+                    # Add to stats
+                    stats['batch_sharpness'] = batch_sharpness
+                    stats['mean_loss'] = np.mean(stats['loss'])
+                    
+                    out_path = proto_dir / f"step_{step_number:05d}_{name}.npz"
+                    np.savez(out_path, **stats)
+
+
+        if self.prototype_data is not None:
+            proto_metrics = compute_prototype_metrics(
+                net=self.net,
+                loss_fn=self.loss_fn,
+                prototype_data=self.prototype_data,
+                device=self.device,
+                base_batch_size=self.batch_size,
+            )
+            metrics.update(proto_metrics)
+
         metrics['epoch_loss_update'] = epoch_loss_update
         return metrics
-    
-        
-
+ 
 
 # -------------------------------------
 # Section: Training Function
@@ -1002,7 +1084,7 @@ def train(
             save_to, #folder
             device,
             verbose=True,
-            loss_fn=nn.MSELoss(),
+            loss_fn=nn.CrossEntropyLoss(),
             permute=True,
             stop_loss=None,
             epoch_to_start=0,
@@ -1036,6 +1118,7 @@ def train(
             per_sample_cfg=None, #NEW 
             knn_outlier_cfg=None,
             subset_tracking_cfgs=None,
+            prototype_data=None,
     ):
     
     # -------------------------------------
@@ -1057,7 +1140,6 @@ def train(
 
     X, Y = X_train, Y_train
 
-
     # ----- Device Alignment -----
     net = net.to(device)
     net.train()
@@ -1073,7 +1155,6 @@ def train(
     save_to.mkdir(parents=True, exist_ok=True)
 
     model_save_path = save_to / 'checkpoints'
-
     results_file = save_to / 'results.txt'
     if device == 'cpu':
         # No buffering on CPU to ensure writes happen immediately
@@ -1160,6 +1241,8 @@ def train(
         memorization_outlier_frac=memorization_outlier_frac,
         per_sample_cfg=per_sample_cfg,
         subset_tracking_cfgs=subset_tracking_cfgs,
+        prototype_data=prototype_data,    
+        full_inputs_test=None,
     )
     # ----- Run Identification -----
     run_id = wandb_run_id or generate_run_id()
@@ -1490,6 +1573,31 @@ def train(
     )
     print(f"Final checkpoint saved: {final_checkpoint_path}")
 
+    # ----- NEW: per-sample stats on prototype sets -----
+    if prototype_data is not None:
+        print("Computing per-sample metrics for prototype sets...")
+        loss_type = 'ce' if isinstance(loss_fn, nn.CrossEntropyLoss) else 'mse'
+
+        proto_dir = save_to / "prototype_final"
+        _ensure_dir(proto_dir)
+
+        for name, (X_p, Y_p) in prototype_data.items():
+            X_p = X_p.to(device)
+            Y_p = Y_p.to(device)
+
+            stats = _per_sample_stats(
+                net,
+                loss_fn,
+                X_p,
+                Y_p,
+                loss_type='ce',
+                batch_size=batch_size,
+                device=device,
+            )
+            out_path = proto_dir / f"final_{name}.npz"
+            np.savez(out_path, **stats)
+            print(f"  saved {name} -> {out_path}")
+
     results_file.close()
 
     measurement_runner.close()
@@ -1730,13 +1838,24 @@ if __name__ == '__main__':
     parser.add_argument('--train-test-gap', action='store_true', help='If set, compute the training and testing accuracy and gap (heavy, runs rarely)')
 
     # --- NEW: Per-Sample Histogram Configuration ---
-    parser.add_argument('--per-sample', action='store_true', help='If set, compute per-sample histograms (heavy; runs rarely)')
-    parser.add_argument('--per-sample-freq', type=float, default=None, help='Frequency of per-sample histograms, as fraction of max_steps (default: 0.01 = every 100 steps for 10k max_steps)')
-    parser.add_argument('--per-sample-min-log10', type=float, default=-8, help='Min log10 value for log10 histograms (default: -8)')
-    parser.add_argument('--per-sample-max-log10', type=float, default=0, help='Max log10 value for log10 histograms (default: 0)')
-    parser.add_argument('--per-sample-bins', type=int, default=80, help='Number of bins for log10 histograms (default: 80)')
-    parser.add_argument('--per-sample-metrics', type=str, nargs='+', default=['loss','resid','kappa'], choices=['loss','resid','kappa'], help='Which metrics to histogram (default: loss resid kappa)')
-    parser.add_argument('--no-frames', action='store_true', help='Only save counts/quantiles as .npz; do not render PNG frames')
+
+    parser.add_argument('--per-sample', action='store_true',
+                        help='Track per-sample loss/residual/curvature histograms over time and save frames')
+    parser.add_argument('--per-sample-every', type=int, default=100,
+                        help='Snapshot cadence in steps for per-sample histograms (default: 100)')
+    parser.add_argument('--hist-min-log10', type=float, default=-6.0,
+                        help='Left edge for log10 binning (default: -6)')
+    parser.add_argument('--hist-max-log10', type=float, default=2.0,
+                        help='Right edge for log10 binning (default: 2)')
+    parser.add_argument('--hist-bins', type=int, default=80,
+                        help='Number of bins for log10 histograms (default: 80)')
+    parser.add_argument('--per-sample-metrics', type=str, nargs='+',
+                        default=['loss','resid','kappa'],
+                        choices=['loss','resid','kappa'],
+                        help='Which metrics to histogram (default: loss resid kappa)')
+    parser.add_argument('--no-frames', action='store_true',
+                        help='Only save counts/quantiles as .npz; do not render PNG frames')
+
 
     # --- NEW: Memorization via Outliers identified by Alignment with Top Hessian Eigenvector ---
     parser.add_argument('--memorization-hessian-outliers', action='store_true', help='Compute memorization stats based on alignment with top Hessian eigenvector (heavy; runs rarely)')
@@ -1871,6 +1990,12 @@ if __name__ == '__main__':
     # --- Dataset Preparation ---
     data = prepare_dataset(dataset, DATASET_FOLDER, args.num_data, args.classes, args.dataset_seed, loss_type=args.loss)
 
+    # --- Unpack dataset and build tuple_data ---
+    train_x, train_y, test_x, test_y = data  
+    tuple_data = (train_x, train_y, test_x, test_y)
+
+    prototype_data = generate_prototype_sets(train_x, train_y, args.classes)
+
     # --- Model Construction ---
     name = args.model
     params = model_presets[name]['params']
@@ -1939,7 +2064,7 @@ if __name__ == '__main__':
     if args.param_file is not None:
         param_reference = T.load(args.param_file, map_location=device)
         # param_reference = param_reference['model_state_dict']
-        # param_reference = {k: v.to(device) for k, v in param_reference.items()}
+        # param_reference = {k: v.to(device) for k, v in param_reference.items()} 
 
     # ----- Optimizer Preparation -----
     optimizer = prepare_optimizer(net, args.lr, args.momentum, args.adam)
@@ -1984,12 +2109,24 @@ if __name__ == '__main__':
         }
 
     subset_tracking_cfgs = prepare_knn_subset_tracking_configs(args, dataset, args.model, data) if args.track_knn_outliers_from else []
+    
+    per_sample_cfg = None
+    if args.per_sample:
+        per_sample_cfg = {
+            'enabled': True,
+            'every': max(1, int(args.per_sample_every)),
+            'hist_min_log10': args.hist_min_log10,
+            'hist_max_log10': args.hist_max_log10,
+            'hist_bins': args.hist_bins,
+            'metrics': args.per_sample_metrics,   # ['loss','resid','kappa']
+            'no_frames': args.no_frames,
+        }
 
     # ----- Training Invocation -----
     train(
         net=net,
         optimizer=optimizer,
-        data=data,
+        data=tuple_data,
         max_epochs=args.epochs,
         max_steps=args.steps,
         batch_size=args.batch,
@@ -2029,5 +2166,5 @@ if __name__ == '__main__':
         per_sample_cfg=per_sample_cfg,
         knn_outlier_cfg=knn_outlier_cfg,
         subset_tracking_cfgs=subset_tracking_cfgs,
-
+        prototype_data=prototype_data,
     )
