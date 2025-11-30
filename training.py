@@ -144,10 +144,17 @@ def _sample_inlier_subsets(
 
 
 FEATURE_PROTOTYPE_TRACKING_MAP = {
-    'feature_boundary': 'knn_outlier',
-    'feature_inliers': 'knn_inlier',
-    'feature_x_outlier': 'synthetic_x_outlier',
-    'feature_y_outlier': 'synthetic_y_outlier',
+    'feature_boundary': 'feature_space_prototypes/knn_outlier',
+    'feature_inliers': 'feature_space_prototypes/knn_inlier',
+    'feature_x_outlier': 'feature_space_prototypes/synthetic_x_outlier',
+    'feature_y_outlier': 'feature_space_prototypes/synthetic_y_outlier',
+}
+
+INPUT_PROTOTYPE_TRACKING_MAP = {
+    'boundary': 'input_space_prototypes/boundary_points',
+    'inliers': 'input_space_prototypes/inlier_points',
+    'x_outlier': 'input_space_prototypes/synthetic_x_outlier',
+    'y_outlier': 'input_space_prototypes/synthetic_y_outlier',
 }
 
 
@@ -169,6 +176,57 @@ def prepare_feature_prototype_subset_configs(prototype_data: dict) -> List[dict]
                 "Y_tensor": Y_p.detach().cpu(),
             }],
             "metrics": KNN_TRACKING_METRICS,
+            "log_prefix": log_prefix,
+        })
+    return configs
+
+
+def prepare_prototype_subset_configs(prototype_data: dict, base_batch_size: int) -> List[dict]:
+    """
+    Reuse the subset-tracking machinery to log prototype metrics instead of relying on
+    the legacy compute_prototype_metrics helper.
+    """
+    if not prototype_data:
+        return []
+
+    configs = []
+    for name, tensors in prototype_data.items():
+        if name is None or tensors is None:
+            continue
+        if name.startswith("feature_"):
+            # Feature-space prototypes are tracked separately with their own prefixes.
+            continue
+        log_prefix = INPUT_PROTOTYPE_TRACKING_MAP.get(name)
+        if log_prefix is None:
+            log_prefix = f"prototype/{name}"
+        X_p, Y_p = tensors
+        if X_p is None or Y_p is None:
+            continue
+        X_cpu = X_p.detach().cpu()
+        Y_cpu = Y_p.detach().cpu()
+        if X_cpu.numel() == 0:
+            continue
+        batch_size = min(base_batch_size, X_cpu.shape[0]) if base_batch_size else X_cpu.shape[0]
+        metrics = list(KNN_TRACKING_METRICS)
+        if "batch_sharpness" not in metrics:
+            metrics.append("batch_sharpness")
+        configs.append({
+            "enabled": True,
+            "subsets": [{
+                "name": name,
+                "class_id": None,
+                "X_tensor": X_cpu,
+                "Y_tensor": Y_cpu,
+            }],
+            "metrics": metrics,
+            "metric_kwargs": {
+                "batch_sharpness": {
+                    "batch_size": batch_size,
+                    "n_estimates": 1,
+                    "min_estimates": 1,
+                    "eps": 1.0,
+                }
+            },
             "log_prefix": log_prefix,
         })
     return configs
@@ -298,19 +356,16 @@ def prepare_knn_subset_tracking_configs(args, dataset_name: str, model_name: str
 
 
 
+"""
 # -------------------------------------
-# NEW: Sharpness for Prototypes
+# NEW: Sharpness for Prototypes (legacy helper, superseded by subset tracking)
 # ------------------------------------
 
 def compute_prototype_metrics(net, loss_fn, prototype_data, device, base_batch_size=32):
-    """
-    prototype_data: dict like {
-        'boundary': (X_boundary, Y_boundary),
-        'x_outlier': (X_x, Y_x),
-        'y_outlier': (X_y, Y_y),
-        'inliers': (X_in, Y_in),
-    }
-    """
+    \"\"\"
+    Legacy helper for logging prototype metrics directly. Subset tracking now
+    handles prototype logging to keep behavior consistent across tracked sets.
+    \"\"\"
     metrics = {}
 
     for name, (X_p, Y_p) in prototype_data.items():
@@ -319,81 +374,28 @@ def compute_prototype_metrics(net, loss_fn, prototype_data, device, base_batch_s
         n = X_p.shape[0]
         batch_size = min(base_batch_size, n)
 
-
-        # ---- Prototype Loss ----
         with torch.no_grad():
             logits = net(X_p)
             loss_val = loss_fn(logits, Y_p).item()
-        metrics[f"prototype/{name}/loss"] = loss_val
+        metrics[f\"prototype/{name}/loss\"] = loss_val
 
-
-        # ---- Batch sharpness: E[gᵀHg / ||g||²] on the prototype set ----
         proto_batch_sharp = calculate_averaged_grad_H_grad(
             net=net,
             X=X_p,
             Y=Y_p,
             loss_fn=loss_fn,
             batch_size=batch_size,
-            n_estimates=1,       # small set, 1–3 estimates is usually enough
+            n_estimates=1,
             min_estimates=1,
-            eps=1.0,             # don't bother with tight MC convergence
+            eps=1.0,
             expectation_inside=False,
             with_replacement=False,
             return_confidence_interval=False,
         )
-        metrics[f"prototype/{name}/batch_sharpness"] = float(proto_batch_sharp)
+        metrics[f\"prototype/{name}/batch_sharpness\"] = float(proto_batch_sharp)
 
     return metrics
-
-
-
-
-# -------------------------------------
-# NEW: Sharpness for Prototypes
-# ------------------------------------
-
-def compute_prototype_metrics(net, loss_fn, prototype_data, device, base_batch_size=32):
-    """
-    prototype_data: dict like {
-        'boundary': (X_boundary, Y_boundary),
-        'x_outlier': (X_x, Y_x),
-        'y_outlier': (X_y, Y_y),
-        'inliers': (X_in, Y_in),
-    }
-    """
-    metrics = {}
-
-    for name, (X_p, Y_p) in prototype_data.items():
-        X_p = X_p.to(device)
-        Y_p = Y_p.to(device)
-        n = X_p.shape[0]
-        batch_size = min(base_batch_size, n)
-
-
-        # ---- Prototype Loss ----
-        with torch.no_grad():
-            logits = net(X_p)
-            loss_val = loss_fn(logits, Y_p).item()
-        metrics[f"prototype/{name}/loss"] = loss_val
-
-
-        # ---- Batch sharpness: E[gᵀHg / ||g||²] on the prototype set ----
-        proto_batch_sharp = calculate_averaged_grad_H_grad(
-            net=net,
-            X=X_p,
-            Y=Y_p,
-            loss_fn=loss_fn,
-            batch_size=batch_size,
-            n_estimates=1,       # small set, 1–3 estimates is usually enough
-            min_estimates=1,
-            eps=1.0,             # don't bother with tight MC convergence
-            expectation_inside=False,
-            with_replacement=False,
-            return_confidence_interval=False,
-        )
-        metrics[f"prototype/{name}/batch_sharpness"] = float(proto_batch_sharp)
-
-    return metrics
+"""
 
 
 
@@ -1168,15 +1170,6 @@ class MeasurementRunner:
                     np.savez(out_path, **stats)
 
 
-        if self.prototype_data is not None:
-            proto_metrics = compute_prototype_metrics(
-                net=self.net,
-                loss_fn=self.loss_fn,
-                prototype_data=self.prototype_data,
-                device=self.device,
-                base_batch_size=self.batch_size,
-            )
-            metrics.update(proto_metrics)
 
         # ----- NEW: Prototype per-sample stats over time -----
         if self.prototype_data is not None and self.per_sample_cfg and self.per_sample_cfg['enabled']:
@@ -1219,15 +1212,6 @@ class MeasurementRunner:
                     np.savez(out_path, **stats)
 
 
-        if self.prototype_data is not None:
-            proto_metrics = compute_prototype_metrics(
-                net=self.net,
-                loss_fn=self.loss_fn,
-                prototype_data=self.prototype_data,
-                device=self.device,
-                base_batch_size=self.batch_size,
-            )
-            metrics.update(proto_metrics)
 
         metrics['epoch_loss_update'] = epoch_loss_update
         return metrics
@@ -2303,6 +2287,7 @@ if __name__ == '__main__':
 
     subset_tracking_cfgs = prepare_knn_subset_tracking_configs(args, dataset, args.model, data) if args.track_knn_outliers_from else []
     subset_tracking_cfgs.extend(prepare_feature_prototype_subset_configs(prototype_data))
+    subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prototype_data, base_batch_size=batch_size))
     
     per_sample_cfg = None
     if args.per_sample:
