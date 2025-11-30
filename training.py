@@ -10,7 +10,7 @@ from pathlib import Path
 import math
 import random
 import argparse
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch.nn.functional as F
 import time
@@ -20,7 +20,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils.data import prepare_dataset, get_dataset_presets,generate_prototype_sets
+from utils.data import (
+    prepare_dataset,
+    get_dataset_presets,
+    generate_prototype_sets,
+    generate_feature_space_prototype_sets,
+    EXTRAPOLATION_FACTOR,
+)
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
 from utils.nets import ResNet
 from utils.storage import initialize_folders
@@ -55,7 +61,7 @@ DATASET_FOLDER = Path(os.environ.get('DATASETS'))
 # export RESULTS=/scratch/gpfs/andreyev/eoss/results
 RES_FOLDER = Path(os.environ.get('RESULTS'))
 
-KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad"]
+KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad", "batch_sharpness"]
 
 
 def _load_reference_knn_indices(dataset_name: str, model_name: str, run_name: str) -> Dict[int, List[int]]:
@@ -135,6 +141,114 @@ def _sample_inlier_subsets(
             "indices": sampled,
         })
     return subsets
+
+
+FEATURE_PROTOTYPE_TRACKING_MAP = {
+    'feature_boundary': 'knn_outlier',
+    'feature_inliers': 'knn_inlier',
+    'feature_x_outlier': 'synthetic_x_outlier',
+    'feature_y_outlier': 'synthetic_y_outlier',
+}
+
+
+def prepare_feature_prototype_subset_configs(prototype_data: dict) -> List[dict]:
+    if not prototype_data:
+        return []
+
+    configs = []
+    for proto_key, log_prefix in FEATURE_PROTOTYPE_TRACKING_MAP.items():
+        if proto_key not in prototype_data:
+            continue
+        X_p, Y_p = prototype_data[proto_key]
+        configs.append({
+            "enabled": True,
+            "subsets": [{
+                "name": None,
+                "class_id": None,
+                "X_tensor": X_p.detach().cpu(),
+                "Y_tensor": Y_p.detach().cpu(),
+            }],
+            "metrics": KNN_TRACKING_METRICS,
+            "log_prefix": log_prefix,
+        })
+    return configs
+
+
+def _feature_prototype_dir(dataset_name: str, model_name: str, run_name: str) -> Path:
+    plaintext_root = RES_FOLDER / 'plaintext' / f"{dataset_name}_{model_name}"
+    return plaintext_root / run_name / 'feature_prototypes'
+
+
+def _metadata_to_cpu(payload):
+    if torch.is_tensor(payload):
+        return payload.detach().cpu()
+    if isinstance(payload, dict):
+        return {k: _metadata_to_cpu(v) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [_metadata_to_cpu(v) for v in payload]
+    return payload
+
+
+def _save_feature_prototype_package(
+    save_dir: Path,
+    prototypes: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    metadata: Dict[str, dict],
+):
+    target_dir = save_dir / 'feature_prototypes'
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    package = {
+        "prototypes": {
+            name: {
+                "inputs": X.detach().cpu(),
+                "labels": Y.detach().cpu(),
+            }
+            for name, (X, Y) in prototypes.items()
+        },
+        "metadata": _metadata_to_cpu(metadata),
+    }
+
+    torch.save(package, target_dir / 'prototypes.pt')
+
+    summary = {
+        "classes": metadata.get("classes"),
+        "counts": {name: int(payload["inputs"].shape[0]) for name, payload in package["prototypes"].items()},
+    }
+    indices = metadata.get("indices")
+    if indices:
+        summary["indices"] = {name: [int(idx) for idx in tensor.tolist()] for name, tensor in indices.items()}
+
+    with open(target_dir / 'summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+
+
+def _load_reference_feature_prototypes(dataset_name: str, model_name: str, run_name: str):
+    proto_dir = _feature_prototype_dir(dataset_name, model_name, run_name)
+    proto_path = proto_dir / 'prototypes.pt'
+    if not proto_path.exists():
+        raise FileNotFoundError(
+            f"Cannot find feature prototype package at {proto_path}. "
+            "Ensure the reference run computed feature-space prototypes."
+        )
+
+    package = torch.load(proto_path, map_location='cpu')
+    proto_payload = package.get("prototypes", {})
+    if not proto_payload:
+        raise ValueError(f"No prototype tensors stored in {proto_path}")
+
+    prototypes = {}
+    for name, payload in proto_payload.items():
+        inputs = payload.get("inputs")
+        labels = payload.get("labels")
+        if inputs is None or labels is None:
+            continue
+        prototypes[name] = (inputs, labels)
+
+    if not prototypes:
+        raise ValueError(f"Feature prototype file {proto_path} did not contain usable tensors.")
+
+    metadata = package.get("metadata", {})
+    return prototypes, metadata
 
 
 def prepare_knn_subset_tracking_configs(args, dataset_name: str, model_name: str, data) -> List[dict]:
@@ -549,17 +663,30 @@ class MeasurementRunner:
                 tracked_subsets = []
                 for subset in cfg.get('subsets', []):
                     indices = subset.get('indices')
-                    if not torch.is_tensor(indices):
-                        indices = torch.tensor(indices, dtype=torch.long, device=self.X.device)
-                    else:
-                        indices = indices.to(device=self.X.device, dtype=torch.long)
-                    if indices.numel() == 0:
+                    X_tensor = subset.get('X_tensor')
+                    Y_tensor = subset.get('Y_tensor')
+
+                    if indices is None and (X_tensor is None or Y_tensor is None):
                         continue
-                    tracked_subsets.append({
+
+                    entry = {
                         "name": subset.get('name', f"class_{subset.get('class_id', 'unknown')}"),
                         "class_id": subset.get('class_id'),
-                        "indices": indices,
-                    })
+                    }
+
+                    if indices is not None:
+                        if not torch.is_tensor(indices):
+                            indices = torch.tensor(indices, dtype=torch.long, device=self.X.device)
+                        else:
+                            indices = indices.to(device=self.X.device, dtype=torch.long)
+                        if indices.numel() == 0:
+                            continue
+                        entry["indices"] = indices
+                    else:
+                        entry["X_tensor"] = X_tensor.detach().clone()
+                        entry["Y_tensor"] = Y_tensor.detach().clone()
+
+                    tracked_subsets.append(entry)
 
                 if tracked_subsets:
                     self.subset_trackers.append({
@@ -787,19 +914,37 @@ class MeasurementRunner:
             for tracker in self.subset_trackers:
                 metric_kwargs = tracker.get('metric_kwargs', {})
                 for subset in tracker['subsets']:
-                    subset_results = compute_subset_metrics(
-                        net=self.net,
-                        loss_fn=self.loss_fn,
-                        X=self.X,
-                        Y=self.Y,
-                        indices=subset['indices'],
-                        metrics=tracker['metrics'],
-                        eigenvector_cache=self.eigenvector_cache,
-                        num_eigenvalues=self.num_eigenvalues,
-                        use_power_iteration=self.use_power_iteration,
-                        metric_kwargs=metric_kwargs,
-                    )
-                    prefix = f"{tracker['log_prefix']}/{subset['name']}"
+                    if 'indices' in subset:
+                        subset_results = compute_subset_metrics(
+                            net=self.net,
+                            loss_fn=self.loss_fn,
+                            X=self.X,
+                            Y=self.Y,
+                            indices=subset['indices'],
+                            metrics=tracker['metrics'],
+                            eigenvector_cache=self.eigenvector_cache,
+                            num_eigenvalues=self.num_eigenvalues,
+                            use_power_iteration=self.use_power_iteration,
+                            metric_kwargs=metric_kwargs,
+                        )
+                    else:
+                        subset_results = compute_subset_metrics_from_tensors(
+                            net=self.net,
+                            loss_fn=self.loss_fn,
+                            X_subset=subset['X_tensor'],
+                            Y_subset=subset['Y_tensor'],
+                            metrics=tracker['metrics'],
+                            eigenvector_cache=self.eigenvector_cache,
+                            num_eigenvalues=self.num_eigenvalues,
+                            use_power_iteration=self.use_power_iteration,
+                            metric_kwargs=metric_kwargs,
+                        )
+
+                    subset_name = subset.get('name')
+                    if subset_name:
+                        prefix = f"{tracker['log_prefix']}/{subset_name}"
+                    else:
+                        prefix = tracker['log_prefix']
                     for key, value in subset_results.items():
                         metrics[f"{prefix}/{key}"] = value
 
@@ -1908,6 +2053,22 @@ if __name__ == '__main__':
     parser.add_argument('--track-knn-topk', type=int, default=5,
                         help='Number of stored outliers per class to track from the reference run')
 
+    # --- NEW: Feature-space Prototype Tracking ---
+    parser.add_argument('--feature-prototypes', action='store_true',
+                        help='After training, export feature-space prototype sets for reuse')
+    parser.add_argument('--feature-prototype-batch', type=int, default=512,
+                        help='Batch size for feature extraction when exporting feature prototypes')
+    parser.add_argument('--feature-prototype-topk', type=int, default=50,
+                        help='Maximum prototypes per class to store from feature space')
+    parser.add_argument('--feature-prototype-kneighbors', type=int, default=32,
+                        help='k-NN neighborhood size when identifying boundary points in feature space')
+    parser.add_argument('--feature-prototype-no-normalize', action='store_true',
+                        help='Disable L2 normalization before computing feature-space prototypes')
+    parser.add_argument('--feature-prototype-extrapolation', type=float, default=EXTRAPOLATION_FACTOR,
+                        help='Extrapolation factor used when building feature-space x-outliers')
+    parser.add_argument('--track-feature-prototypes-from', type=str, default=None,
+                        help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
+
     # ----- Argument Parsing -----
     args = parser.parse_args()
 
@@ -1981,6 +2142,9 @@ if __name__ == '__main__':
     
     if len(exclusive_modes) > 1:
         raise ValueError(f"Cannot use multiple training modes simultaneously: {', '.join(exclusive_modes)}. Please choose only one.")
+
+    if args.feature_prototypes and (args.classes is None or len(args.classes) != 2):
+        raise ValueError("--feature-prototypes requires specifying exactly two classes via --classes")
     
     # ----- Measurement Selection -----
     measurements = {name for name, enabled in [
@@ -2024,6 +2188,22 @@ if __name__ == '__main__':
     tuple_data = (train_x, train_y, test_x, test_y)
 
     prototype_data = generate_prototype_sets(train_x, train_y, args.classes)
+
+    combined_prototype_data = dict(prototype_data)
+    if args.track_feature_prototypes_from:
+        tracked_feature_prototypes, _ = _load_reference_feature_prototypes(
+            dataset,
+            args.model,
+            args.track_feature_prototypes_from,
+        )
+        for name, tensors in tracked_feature_prototypes.items():
+            combined_prototype_data[name] = tensors
+        print(
+            f"Loaded feature-space prototypes from run {args.track_feature_prototypes_from} "
+            f"({len(tracked_feature_prototypes)} subsets)"
+        )
+
+    prototype_data = combined_prototype_data
 
     # --- Model Construction ---
     name = args.model
@@ -2122,6 +2302,7 @@ if __name__ == '__main__':
         }
 
     subset_tracking_cfgs = prepare_knn_subset_tracking_configs(args, dataset, args.model, data) if args.track_knn_outliers_from else []
+    subset_tracking_cfgs.extend(prepare_feature_prototype_subset_configs(prototype_data))
     
     per_sample_cfg = None
     if args.per_sample:
@@ -2181,3 +2362,26 @@ if __name__ == '__main__':
         subset_tracking_cfgs=subset_tracking_cfgs,
         prototype_data=prototype_data,
     )
+
+    if args.feature_prototypes:
+        print("Computing feature-space prototypes for export...")
+        feature_batch = args.feature_prototype_batch
+        features = extract_feature_matrix(
+            net=net,
+            inputs=train_x,
+            batch_size=feature_batch,
+            flatten_outputs=True,
+        )
+        proto_sets, proto_meta = generate_feature_space_prototype_sets(
+            net=None,
+            Y_train=train_y,
+            classes=tuple(args.classes),
+            precomputed_features=features,
+            original_inputs=train_x,
+            normalize_features=not args.feature_prototype_no_normalize,
+            k_neighbors=args.feature_prototype_kneighbors,
+            prototypes_per_class=args.feature_prototype_topk,
+            extrapolation_factor=args.feature_prototype_extrapolation,
+        )
+        _save_feature_prototype_package(run_folder, proto_sets, proto_meta)
+        print(f"Feature-space prototypes saved to {run_folder / 'feature_prototypes'}")
