@@ -10,6 +10,7 @@ To populate the `feature_space_prototypes/*` and `input_space_prototypes/*` pane
    ```bash
 python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --feature-prototypes
    ```
+
    When it finishes, note the latest run directory:
    ```bash
 RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
@@ -20,6 +21,7 @@ echo "$RUN_DIR"
    ```bash
 python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --per-sample --track-feature-prototypes-from "$RUN_DIR" --track-input-prototypes
    ```
+
    W&B will now log `feature_space_prototypes/...` series sourced from the reference run and `input_space_prototypes/...` series computed on-the-fly.
 
 ## Generating Per-Sample Loss GIFs
