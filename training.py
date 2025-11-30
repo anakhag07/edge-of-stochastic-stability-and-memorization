@@ -601,6 +601,7 @@ class MeasurementRunner:
         full_inputs_test=None,
         per_sample_cfg=None,
         subset_tracking_cfgs=None,
+        log_every_step: bool = False,
     ):
         self.net = net
         self.loss_fn = loss_fn
@@ -631,6 +632,7 @@ class MeasurementRunner:
         # NEW: Per-sample config
         self.full_inputs_test = full_inputs_test
         self.per_sample_cfg = per_sample_cfg
+        self.log_every_step = log_every_step
         
         # NEW: Per-sample initialization logic
         if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
@@ -748,6 +750,9 @@ class MeasurementRunner:
             'test_acc': np.nan,  # NEW
             'train_test_gap': np.nan, # NEW
         }
+
+        if self.log_every_step:
+            ctx.log_all_measurements = True
 
         epoch_loss_update = None
 
@@ -1267,6 +1272,7 @@ def train(
             knn_outlier_cfg=None,
             subset_tracking_cfgs=None,
             prototype_data=None,
+            log_every_step: bool = False,
     ):
     
     # -------------------------------------
@@ -1391,6 +1397,7 @@ def train(
         subset_tracking_cfgs=subset_tracking_cfgs,
         prototype_data=prototype_data,    
         full_inputs_test=None,
+        log_every_step=log_every_step,
     )
     # ----- Run Identification -----
     run_id = wandb_run_id or generate_run_id()
@@ -1440,6 +1447,7 @@ def train(
                 lr=optimizer.param_groups[0]['lr'],
                 precise_plots=precise_plots,
                 rare_measure=rare_measure,
+                log_all_measurements=log_every_step,
             )
 
             X_batch = X_shuffled[i*batch_size : (i+1)*batch_size]
@@ -1949,6 +1957,7 @@ if __name__ == '__main__':
     parser.add_argument('--fisher', action='store_true', help='If set, compute Fisher information matrix eigenvalue. Currently only works with one-dim output')
     parser.add_argument('--param-distance', '--param_distance', action='store_true', help='If set, compute the distance from the reference weights')
     parser.add_argument('--param-file', '--param_file', type=str, default=None, help='Path to reference parameters for computing parameter distance')
+    parser.add_argument('--log-every-step', action='store_true', help='Force all configured measurements to log every training step, bypassing frequency rules.')
 
     # --- Measurement Configuration ---
     parser.add_argument('--disable-cache-eigenvectors', '--disable_cache_eigenvectors', action='store_true', help='If set, disable eigenvector caching for warm starts to improve eigenvalue computation performance')
@@ -2346,6 +2355,7 @@ if __name__ == '__main__':
         knn_outlier_cfg=knn_outlier_cfg,
         subset_tracking_cfgs=subset_tracking_cfgs,
         prototype_data=prototype_data,
+        log_every_step=args.log_every_step,
     )
 
     if args.feature_prototypes:

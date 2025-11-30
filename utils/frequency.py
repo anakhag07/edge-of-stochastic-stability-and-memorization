@@ -22,6 +22,8 @@ class MeasurementContext:
     precise_plots: bool = False
     # Rare-measure regime: sparsify expensive measurements
     rare_measure: bool = False
+    # Override all frequency rules and measure every step
+    log_all_measurements: bool = False
     # Add other variables as needed
 
 
@@ -58,7 +60,7 @@ class FrequencyCalculator:
             if ctx.batch_size <= 33:
                 base_freq = 256
             else:
-                base_freq = 64
+                base_freq = 32
 
             if ctx.precise_plots:
                 base_freq = min(base_freq, 32)
@@ -424,7 +426,8 @@ class FrequencyCalculator:
         """
         if measurement_type not in self.rules:
             raise ValueError(f"Unknown measurement type: {measurement_type}")
-        
+        if getattr(ctx, "log_all_measurements", False):
+            return True
         return self.rules[measurement_type](ctx)
     
     def set_rule(self, measurement_type: str, rule_func: Callable[[MeasurementContext], bool]):
