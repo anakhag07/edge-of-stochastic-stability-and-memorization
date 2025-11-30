@@ -2061,6 +2061,8 @@ if __name__ == '__main__':
                         help='Extrapolation factor used when building feature-space x-outliers')
     parser.add_argument('--track-feature-prototypes-from', type=str, default=None,
                         help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
+    parser.add_argument('--track-input-prototypes', action='store_true',
+                        help='Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
 
     # ----- Argument Parsing -----
     args = parser.parse_args()
@@ -2296,7 +2298,8 @@ if __name__ == '__main__':
 
     subset_tracking_cfgs = prepare_knn_subset_tracking_configs(args, dataset, args.model, data) if args.track_knn_outliers_from else []
     subset_tracking_cfgs.extend(prepare_feature_prototype_subset_configs(prototype_data))
-    subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prototype_data, base_batch_size=batch_size))
+    if args.track_input_prototypes:
+        subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prototype_data, base_batch_size=batch_size))
     
     per_sample_cfg = None
     if args.per_sample:
