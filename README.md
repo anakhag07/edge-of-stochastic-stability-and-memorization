@@ -5,7 +5,7 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
 
 1. **Run once with `--knn-outliers` to mine ambiguous samples.**
    ```bash
-   python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 \
+   python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 -- loss ce\
      --steps 150000 --num-data 8192 \
      --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
      --lambdamax --batch-sharpness \
@@ -16,7 +16,7 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
 
 2. **Track those stored samples (plus an equally sized inlier set) during a fresh run.**
    ```bash
-   python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 \
+   python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 -- loss ce\
      --steps 150000 --num-data 8192 \
      --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
      --lambdamax --batch-sharpness \
