@@ -1,28 +1,12 @@
 # edge-of-stochastic-stability-and-memorization
 This repository builds on edge-of-stochastic-stability repo to quantify memorization during training and relationship to edge of stochastic stability and progressive sharpening. The information on the original repository follows here. 
 
+## Tracking Outlier Metrics in W & B (only input_space_prototypes)
 
-## Tracking Outlier Metrics in Weights & Biases
-
-To populate the `feature_space_prototypes/*` and `input_space_prototypes/*` panels in W&B, follow this two-stage process:
-
-1. **Export feature-space prototypes (one-time per dataset/model).** Run any training job with `--feature-prototypes` so the plaintext run folder gets a `feature_prototypes/` package. For example:
+**Launch the tracking run that logs both feature and input prototypes.** Use the stored feature prototypes via `--track-feature-prototypes-from "$RUN_DIR"` and enable input-space logging with `--track-input-prototypes` (no extra setup needed for inputs):
    ```bash
-    python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --feature-prototypes
+    python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --track-input-prototypes
    ```
-
-   When it finishes, note the latest run directory:
-   ```bash
-    RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
-    echo "$RUN_DIR"
-   ```
-
-2. **Launch the tracking run that logs both feature and input prototypes.** Use the stored feature prototypes via `--track-feature-prototypes-from "$RUN_DIR"` and enable input-space logging with `--track-input-prototypes` (no extra setup needed for inputs):
-   ```bash
-    python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --per-sample --track-feature-prototypes-from "$RUN_DIR" --track-input-prototypes
-   ```
-
-   W&B will now log `feature_space_prototypes/...` series sourced from the reference run and `input_space_prototypes/...` series computed on-the-fly.
 
 ## Generating Per-Sample Loss GIFs
 
@@ -63,6 +47,29 @@ python tools/make_joint_proto.py \
   --out "$RUN_DIR/prototypes_loss.gif" \
   --fps 4
   ```
+
+## Tracking Outlier Metrics in Weights & Biases (not being used for all experiments anymore)
+
+To populate the `feature_space_prototypes/*` and `input_space_prototypes/*` panels in W&B, follow this two-stage process:
+
+1. **Export feature-space prototypes (one-time per dataset/model).** Run any training job with `--feature-prototypes` so the plaintext run folder gets a `feature_prototypes/` package. For example:
+   ```bash
+    python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --feature-prototypes
+   ```
+
+   When it finishes, note the latest run directory:
+   ```bash
+    RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
+    echo "$RUN_DIR"
+   ```
+
+2. **Launch the tracking run that logs both feature and input prototypes.** Use the stored feature prototypes via `--track-feature-prototypes-from "$RUN_DIR"` and enable input-space logging with `--track-input-prototypes` (no extra setup needed for inputs):
+   ```bash
+    python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --per-sample --track-feature-prototypes-from "$RUN_DIR" --track-input-prototypes
+   ```
+
+   W&B will now log `feature_space_prototypes/...` series sourced from the reference run and `input_space_prototypes/...` series computed on-the-fly.
+
 
 ## k-NN Outlier Mining & Tracking
 # This is a legacy command - use the earlier --track-feature-prototypes-from instructions for the same functionality with more data prototypes. 
