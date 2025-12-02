@@ -5,7 +5,10 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
 
 **Launch the tracking run that logs both feature and input prototypes.** Use the stored feature prototypes via `--track-feature-prototypes-from "$RUN_DIR"` and enable input-space logging with `--track-input-prototypes` (no extra setup needed for inputs):
    ```bash
-    python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --track-input-prototypes
+    python training.py --dataset cifar10 --model mlp --loss ce \
+    --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 \
+    --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
+    --batch-sharpness --classes 1 9 --track-input-prototypes
    ```
 
 ## Generating Per-Sample Loss GIFs
