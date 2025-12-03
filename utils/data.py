@@ -642,7 +642,7 @@ def generate_prototype_sets(X_train: T.Tensor, Y_train: T.Tensor, classes: tuple
     _, idx_0_near = T.topk(dist_0_to_0, k=k0, largest=False)
 
     X_seed = X0_flat[idx_0_near]                             # [k0, D]
-    X_x_outlier_flat = X_seed + EXTRAPOLATION_FACTOR * v_diff_flat  # [k0, D]
+    X_x_outlier_flat = X_seed - EXTRAPOLATION_FACTOR * v_diff_flat  # [k0, D]
     X_x_outlier = X_x_outlier_flat.view(k0, *X_0.shape[1:])  # back to [k0, C, H, W]
 
     Y_x_outlier = T.full((k0,), class_0, dtype=class_labels.dtype)
@@ -805,7 +805,7 @@ def generate_feature_space_prototype_sets(
     ])
 
     X_seed = X0_flat[idx_0_near]
-    X_x_outlier_flat = X_seed + extrapolation_factor * v_diff_flat
+    X_x_outlier_flat = X_seed - extrapolation_factor * v_diff_flat
     X_x_outlier = X_x_outlier_flat.view(k0, -1)
 
     assigned_local = _assign_synthetic_to_real(X_x_outlier_flat, X0_flat, idx_0)
