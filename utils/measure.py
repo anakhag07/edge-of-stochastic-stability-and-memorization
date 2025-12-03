@@ -27,7 +27,7 @@ __all__ = ['compute_train_test_gap_from_tensors','param_vector', 'param_length',
            'estimate_hessian_trace', 'gimme_new_rng', 'gimme_random_subset_idx',
            'compute_per_example_losses', 'compute_outlier_vs_bulk_stats_hessian',
            'extract_feature_matrix', 'identify_knn_outliers_by_neighbor_mix',
-           'select_dataset_subset', 'compute_subset_metrics']
+           'select_dataset_subset', 'compute_subset_metrics', 'compute_subset_metrics_from_tensors']
 
 
 class EigenvectorCache:
@@ -1944,42 +1944,18 @@ def select_dataset_subset(
     return X.index_select(0, indices), Y.index_select(0, indices)
 
 
-def compute_subset_metrics(
+def _compute_metrics_on_subset_data(
     net: nn.Module,
     loss_fn,
-    X: torch.Tensor,
-    Y: torch.Tensor,
-    indices,
-    metrics: Optional[List[str]] = None,
+    X_subset: torch.Tensor,
+    Y_subset: torch.Tensor,
+    metrics: List[str],
     *,
-    eigenvector_cache: Optional[EigenvectorCache] = None,
-    num_eigenvalues: int = 1,
-    use_power_iteration: bool = False,
-    metric_kwargs: Optional[dict] = None,
+    eigenvector_cache: Optional[EigenvectorCache],
+    num_eigenvalues: int,
+    use_power_iteration: bool,
+    metric_kwargs: dict,
 ) -> dict:
-    """
-    Compute measurement-runner style metrics restricted to a subset of examples.
-
-    Args:
-        net: Model under evaluation.
-        loss_fn: Loss function used during training.
-        X, Y: Full dataset tensors.
-        indices: Indices identifying the subset of interest.
-        metrics: List of metric names to compute. Defaults to
-                 ['full_loss','accuracy','lambda_max'].
-        eigenvector_cache, num_eigenvalues, use_power_iteration:
-                 Controls for Hessian eigen computations.
-        metric_kwargs: Optional mapping metric_name -> kwargs for fine control.
-
-    Returns:
-        Dictionary of computed metrics.
-    """
-    if metrics is None:
-        metrics = ["full_loss", "accuracy", "lambda_max"]
-    if metric_kwargs is None:
-        metric_kwargs = {}
-
-    X_subset, Y_subset = select_dataset_subset(X, Y, indices)
     if X_subset.numel() == 0:
         raise ValueError("Subset is empty; cannot compute metrics.")
 
@@ -1994,6 +1970,51 @@ def compute_subset_metrics(
 
     preds = net(X_subset).squeeze(dim=-1)
     loss_value = loss_fn(preds, Y_subset)
+    subset_size = X_subset.shape[0]
+
+    def _maybe_add_batch_sharpness(metric_name: str, *, expectation_inside_default: bool):
+        if metric_name not in metrics:
+            return
+
+        cfg = metric_kwargs.get(metric_name)
+        if cfg is None and metric_name != "batch_sharpness":
+            cfg = metric_kwargs.get("batch_sharpness", {})
+        if cfg is None:
+            cfg = {}
+
+        bs_value = calculate_averaged_grad_H_grad(
+            net=net,
+            X=X_subset,
+            Y=Y_subset,
+            loss_fn=loss_fn,
+            batch_size=cfg.get("batch_size", subset_size),
+            n_estimates=cfg.get("n_estimates", 1000),
+            min_estimates=cfg.get("min_estimates", 20),
+            eps=cfg.get("eps", 0.005),
+            expectation_inside=cfg.get("expectation_inside", expectation_inside_default),
+            with_replacement=cfg.get("with_replacement", False),
+            return_confidence_interval=cfg.get("return_confidence_interval", False),
+            confidence_level=cfg.get("confidence_level", 0.95),
+        )
+
+        if isinstance(bs_value, dict):
+            mean_val = bs_value.get("mean")
+            results[metric_name] = float(mean_val) if mean_val is not None else float("nan")
+            ci = bs_value.get("ci")
+            if ci is not None and len(ci) == 2:
+                results[f"{metric_name}_ci_low"] = float(ci[0])
+                results[f"{metric_name}_ci_high"] = float(ci[1])
+            stderr = bs_value.get("stderr")
+            if stderr is not None:
+                results[f"{metric_name}_stderr"] = float(stderr)
+            conf = bs_value.get("confidence_level")
+            if conf is not None:
+                results[f"{metric_name}_confidence_level"] = float(conf)
+            num_samples = bs_value.get("num_samples")
+            if num_samples is not None:
+                results[f"{metric_name}_num_samples"] = int(num_samples)
+        else:
+            results[metric_name] = float(bs_value)
 
     if "full_loss" in metrics:
         results["full_loss"] = float(loss_value.item())
@@ -2033,6 +2054,9 @@ def compute_subset_metrics(
 
     if "grad_hessian_grad" in metrics:
         results["grad_hessian_grad"] = float(compute_grad_H_grad(loss_value, net).item())
+
+    _maybe_add_batch_sharpness("batch_sharpness", expectation_inside_default=False)
+    _maybe_add_batch_sharpness("batch_sharpness_exp_inside", expectation_inside_default=True)
 
     if "gradient_norm_squared" in metrics:
         gn_kwargs = metric_kwargs.get("gradient_norm_squared", {})
@@ -2084,3 +2108,71 @@ def compute_subset_metrics(
         net.train()
 
     return results
+
+
+def compute_subset_metrics(
+    net: nn.Module,
+    loss_fn,
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    indices,
+    metrics: Optional[List[str]] = None,
+    *,
+    eigenvector_cache: Optional[EigenvectorCache] = None,
+    num_eigenvalues: int = 1,
+    use_power_iteration: bool = False,
+    metric_kwargs: Optional[dict] = None,
+) -> dict:
+    """
+    Compute measurement-runner style metrics restricted to a subset of examples.
+    """
+    if metrics is None:
+        metrics = ["full_loss", "accuracy", "lambda_max"]
+    if metric_kwargs is None:
+        metric_kwargs = {}
+
+    X_subset, Y_subset = select_dataset_subset(X, Y, indices)
+    return _compute_metrics_on_subset_data(
+        net=net,
+        loss_fn=loss_fn,
+        X_subset=X_subset,
+        Y_subset=Y_subset,
+        metrics=metrics,
+        eigenvector_cache=eigenvector_cache,
+        num_eigenvalues=num_eigenvalues,
+        use_power_iteration=use_power_iteration,
+        metric_kwargs=metric_kwargs,
+    )
+
+
+def compute_subset_metrics_from_tensors(
+    net: nn.Module,
+    loss_fn,
+    X_subset: torch.Tensor,
+    Y_subset: torch.Tensor,
+    metrics: Optional[List[str]] = None,
+    *,
+    eigenvector_cache: Optional[EigenvectorCache] = None,
+    num_eigenvalues: int = 1,
+    use_power_iteration: bool = False,
+    metric_kwargs: Optional[dict] = None,
+) -> dict:
+    """
+    Compute subset metrics directly on provided tensors (no indexing into a parent dataset).
+    """
+    if metrics is None:
+        metrics = ["full_loss", "accuracy", "lambda_max"]
+    if metric_kwargs is None:
+        metric_kwargs = {}
+
+    return _compute_metrics_on_subset_data(
+        net=net,
+        loss_fn=loss_fn,
+        X_subset=X_subset,
+        Y_subset=Y_subset,
+        metrics=metrics,
+        eigenvector_cache=eigenvector_cache,
+        num_eigenvalues=num_eigenvalues,
+        use_power_iteration=use_power_iteration,
+        metric_kwargs=metric_kwargs,
+    )

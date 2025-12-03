@@ -1,11 +1,85 @@
 # edge-of-stochastic-stability-and-memorization
 This repository builds on edge-of-stochastic-stability repo to quantify memorization during training and relationship to edge of stochastic stability and progressive sharpening. The information on the original repository follows here. 
 
+## Tracking Outlier Metrics in W & B (only input_space_prototypes)
+
+**Launch the tracking run that logs both feature and input prototypes.** Use the stored feature prototypes via `--track-feature-prototypes-from "$RUN_DIR"` and enable input-space logging with `--track-input-prototypes` (no extra setup needed for inputs):
+   ```bash
+    python training.py --dataset cifar10 --model mlp --loss ce \
+    --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 \
+    --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
+    --batch-sharpness --classes 1 9 --track-input-prototypes
+   ```
+
+## Generating Per-Sample Loss GIFs
+
+Create an animated GIF showing how the per-sample loss distribution evolves over training by following the steps below:
+0. Launch a training run with per-sample histogram logging enabled (`--per-sample`):
+  ```bash
+  python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --per-sample
+  ```
+  This command logs the per-sample histograms under each run directory.
+  
+1. Identify the most recent run directory:
+  ```bash
+  RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
+  echo "$RUN_DIR"
+  ```
+
+2. Locate the latest per-sample histogram folder:
+  ```bash
+  LATEST_PS=$(find "$RESULTS"/plaintext/cifar10_mlp -maxdepth 5 -type d -name per_sample_histograms | sort | tail -1)
+  echo "$LATEST_PS"
+  ```
+This finds the newest per_sample_histograms directory, which contains the saved PNG frames.
+
+3. Generate the GIF
+Run:
+  ```bash
+python tools/make_gif.py \
+  --frames-dir "$LATEST_PS/frames" \
+  --metric loss \
+  --out "$RUN_DIR/loss_hist_evolution.gif" \
+  --fps 6
+  ```
+4. (Optional) Create prototype GIFs
+  ```bash
+python tools/make_joint_proto.py \
+  --proto-dir "$LATEST_PS/prototypes" \
+  --metric loss \
+  --out "$RUN_DIR/prototypes_loss.gif" \
+  --fps 4
+  ```
+
+## Tracking Outlier Metrics in Weights & Biases (not being used for all experiments anymore)
+
+To populate the `feature_space_prototypes/*` and `input_space_prototypes/*` panels in W&B, follow this two-stage process:
+
+1. **Export feature-space prototypes (one-time per dataset/model).** Run any training job with `--feature-prototypes` so the plaintext run folder gets a `feature_prototypes/` package. For example:
+   ```bash
+    python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --feature-prototypes
+   ```
+
+   When it finishes, note the latest run directory:
+   ```bash
+    RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
+    echo "$RUN_DIR"
+   ```
+
+2. **Launch the tracking run that logs both feature and input prototypes.** Use the stored feature prototypes via `--track-feature-prototypes-from "$RUN_DIR"` and enable input-space logging with `--track-input-prototypes` (no extra setup needed for inputs):
+   ```bash
+    python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --per-sample --track-feature-prototypes-from "$RUN_DIR" --track-input-prototypes
+   ```
+
+   W&B will now log `feature_space_prototypes/...` series sourced from the reference run and `input_space_prototypes/...` series computed on-the-fly.
+
+
 ## k-NN Outlier Mining & Tracking
+# This is a legacy command - use the earlier --track-feature-prototypes-from instructions for the same functionality with more data prototypes. 
 
 1. **Run once with `--knn-outliers` to mine ambiguous samples.**
    ```bash
-   python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 \
+   python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 -- loss ce\
      --steps 150000 --num-data 8192 \
      --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
      --lambdamax --batch-sharpness \
@@ -13,44 +87,22 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
    ```
    After the run finishes you will find `knn_outlier_indices.json` and `knn_outliers.json` in the plaintext run directory. For example, my last run lived in  
    `/home/anakhag/projects/eos_results/plaintext/cifar10_mlp/20251124_0820_35_lr0.01000_b8/`.
+2. **Identify the most recent run directory:**
+  ```bash
+  RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
+  echo "$RUN_DIR"
+  ```
 
-2. **Track those stored samples (plus an equally sized inlier set) during a fresh run.**
+3. **Track those stored samples (plus an equally sized inlier set) during a fresh run.**
    ```bash
-   python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 \
-     --steps 150000 --num-data 8192 \
-     --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
-     --lambdamax --batch-sharpness \
-     --track-knn-outliers-from 20251124_0820_35_lr0.01000_b8 \
-     --track-knn-topk 5
+    python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 -- loss ce\
+      --steps 150000 --num-data 8192 \
+      --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
+      --lambdamax --batch-sharpness \
+      --track-knn-outliers-from $RUN_DIR \
+      --track-knn-topk 5
    ```
    When `--track-knn-outliers-from` is set, the training loop automatically loads the stored indices, logs per-class metrics for those outliers under the `knn_outlier/<run>/class_*/*` series in Weights & Biases, and also samples the same number of inliers per class that get logged under `knn_inlier/<run>/class_*/*`. This allows you to compare loss/accuracy/λ_max/grad H grad for memorized versus typical points as training progresses.
-
-## Generating Per-Sample Loss GIFs
-
-Create an animated GIF showing how the per-sample loss distribution evolves over training by following the steps below:
-1. Identify the most recent run directory:
-  ```bash
-RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
-echo "$RUN_DIR"
-  ```
-
-2. Locate the latest per-sample histogram folder:
-  ```bash
-LATEST_PS=$(find "$RESULTS"/plaintext/cifar10_mlp -maxdepth 5 -type d -name per_sample_histograms | sort | tail -1)
-echo "$LATEST_PS"
-  ```
-This finds the newest per_sample_histograms directory, which contains the saved PNG frames.
-
-3. Generate the GIF
-Run:
-  ```bash
-python eoss_shared/tools/make_gif.py \
-  --frames-dir "$LATEST_PS/frames" \
-  --metric loss \
-  --out "$RUN_DIR/loss_hist_evolution.gif" \
-  --fps 6
-  ```
-
 
 ___
 

@@ -10,8 +10,9 @@ from pathlib import Path
 import math
 import random
 import argparse
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
+import torch.nn.functional as F
 import time
 
 import imageio.v2 as imageio
@@ -19,7 +20,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from utils.data import prepare_dataset, get_dataset_presets
+from utils.data import (
+    prepare_dataset,
+    get_dataset_presets,
+    generate_prototype_sets,
+    generate_feature_space_prototype_sets,
+    EXTRAPOLATION_FACTOR,
+)
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
 from utils.nets import ResNet
 from utils.storage import initialize_folders
@@ -33,6 +40,7 @@ from utils.wandb_utils import (
     get_checkpoint_dir_for_run,
     is_wandb_available,
     generate_run_id,
+
 )
 
 from utils.noise import gd_with_noise, GradStorage, sde_integration
@@ -53,7 +61,7 @@ DATASET_FOLDER = Path(os.environ.get('DATASETS'))
 # export RESULTS=/scratch/gpfs/andreyev/eoss/results
 RES_FOLDER = Path(os.environ.get('RESULTS'))
 
-KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad"]
+KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad", "batch_sharpness"]
 
 
 def _load_reference_knn_indices(dataset_name: str, model_name: str, run_name: str) -> Dict[int, List[int]]:
@@ -135,11 +143,186 @@ def _sample_inlier_subsets(
     return subsets
 
 
+FEATURE_PROTOTYPE_TRACKING_MAP = {
+    'feature_boundary': 'feature_space_prototypes/knn_outlier',
+    'feature_inliers': 'feature_space_prototypes/knn_inlier',
+    'feature_x_outlier': 'feature_space_prototypes/synthetic_x_outlier',
+    'feature_y_outlier': 'feature_space_prototypes/synthetic_y_outlier',
+}
+
+INPUT_PROTOTYPE_TRACKING_MAP = {
+    'boundary': 'input_space_prototypes/boundary_points',
+    'inliers': 'input_space_prototypes/inlier_points',
+    'x_outlier': 'input_space_prototypes/synthetic_x_outlier',
+    'y_outlier': 'input_space_prototypes/synthetic_y_outlier',
+}
+
+
+def prepare_feature_prototype_subset_configs(prototype_data: dict) -> List[dict]:
+    if not prototype_data:
+        return []
+
+    configs = []
+    for proto_key, log_prefix in FEATURE_PROTOTYPE_TRACKING_MAP.items():
+        if proto_key not in prototype_data:
+            continue
+        X_p, Y_p = prototype_data[proto_key]
+        configs.append({
+            "enabled": True,
+            "subsets": [{
+                "name": None,
+                "class_id": None,
+                "X_tensor": X_p.detach().cpu(),
+                "Y_tensor": Y_p.detach().cpu(),
+            }],
+            "metrics": KNN_TRACKING_METRICS,
+            "log_prefix": log_prefix,
+        })
+    return configs
+
+
+def prepare_prototype_subset_configs(prototype_data: dict, base_batch_size: int) -> List[dict]:
+    """
+    Reuse the subset-tracking machinery to log prototype metrics instead of relying on
+    the legacy compute_prototype_metrics helper.
+    """
+    if not prototype_data:
+        return []
+
+    configs = []
+    for name, tensors in prototype_data.items():
+        if name is None or tensors is None:
+            continue
+        if name.startswith("feature_"):
+            # Feature-space prototypes are tracked separately with their own prefixes.
+            continue
+        log_prefix = INPUT_PROTOTYPE_TRACKING_MAP.get(name)
+        if log_prefix is None:
+            log_prefix = f"prototype/{name}"
+        X_p, Y_p = tensors
+        if X_p is None or Y_p is None:
+            continue
+        X_cpu = X_p.detach().cpu()
+        Y_cpu = Y_p.detach().cpu()
+        if X_cpu.numel() == 0:
+            continue
+        batch_size = min(base_batch_size, X_cpu.shape[0]) if base_batch_size else X_cpu.shape[0]
+        metrics = list(KNN_TRACKING_METRICS)
+        if "batch_sharpness" not in metrics:
+            metrics.append("batch_sharpness")
+        configs.append({
+            "enabled": True,
+            "subsets": [{
+                "name": name,
+                "class_id": None,
+                "X_tensor": X_cpu,
+                "Y_tensor": Y_cpu,
+            }],
+            "metrics": metrics,
+            "metric_kwargs": {
+                "batch_sharpness": {
+                    "batch_size": batch_size,
+                    "n_estimates": 1,
+                    "min_estimates": 1,
+                    "eps": 1.0,
+                }
+            },
+            "log_prefix": log_prefix,
+        })
+    return configs
+
+
+def _feature_prototype_dir(dataset_name: str, model_name: str, run_name: str) -> Path:
+    plaintext_root = RES_FOLDER / 'plaintext' / f"{dataset_name}_{model_name}"
+    return plaintext_root / run_name / 'feature_prototypes'
+
+
+def _metadata_to_cpu(payload):
+    if torch.is_tensor(payload):
+        return payload.detach().cpu()
+    if isinstance(payload, dict):
+        return {k: _metadata_to_cpu(v) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [_metadata_to_cpu(v) for v in payload]
+    return payload
+
+
+def _save_feature_prototype_package(
+    save_dir: Path,
+    prototypes: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    metadata: Dict[str, dict],
+):
+    target_dir = save_dir / 'feature_prototypes'
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    package = {
+        "prototypes": {
+            name: {
+                "inputs": X.detach().cpu(),
+                "labels": Y.detach().cpu(),
+            }
+            for name, (X, Y) in prototypes.items()
+        },
+        "metadata": _metadata_to_cpu(metadata),
+    }
+
+    torch.save(package, target_dir / 'prototypes.pt')
+
+    summary = {
+        "classes": metadata.get("classes"),
+        "counts": {name: int(payload["inputs"].shape[0]) for name, payload in package["prototypes"].items()},
+    }
+    indices = metadata.get("indices")
+    if indices:
+        summary["indices"] = {name: [int(idx) for idx in tensor.tolist()] for name, tensor in indices.items()}
+
+    with open(target_dir / 'summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+
+
+def _load_reference_feature_prototypes(dataset_name: str, model_name: str, run_name: str):
+    proto_dir = _feature_prototype_dir(dataset_name, model_name, run_name)
+    proto_path = proto_dir / 'prototypes.pt'
+    if not proto_path.exists():
+        raise FileNotFoundError(
+            f"Cannot find feature prototype package at {proto_path}. "
+            "Ensure the reference run computed feature-space prototypes."
+        )
+
+    package = torch.load(proto_path, map_location='cpu')
+    proto_payload = package.get("prototypes", {})
+    if not proto_payload:
+        raise ValueError(f"No prototype tensors stored in {proto_path}")
+
+    prototypes = {}
+    for name, payload in proto_payload.items():
+        inputs = payload.get("inputs")
+        labels = payload.get("labels")
+        if inputs is None or labels is None:
+            continue
+        prototypes[name] = (inputs, labels)
+
+    if not prototypes:
+        raise ValueError(f"Feature prototype file {proto_path} did not contain usable tensors.")
+
+    metadata = package.get("metadata", {})
+    return prototypes, metadata
+
+
 def prepare_knn_subset_tracking_configs(args, dataset_name: str, model_name: str, data) -> List[dict]:
     if not args.track_knn_outliers_from:
         return []
 
     per_class_indices = _load_reference_knn_indices(dataset_name, model_name, args.track_knn_outliers_from)
+    allowed_classes = set(args.classes or [])
+    if allowed_classes:
+        per_class_indices = {cid: idxs for cid, idxs in per_class_indices.items() if cid in allowed_classes}
+        if not per_class_indices:
+            raise ValueError(
+                f"No reference KNN indices for requested classes {sorted(allowed_classes)} "
+                f"in run {args.track_knn_outliers_from}"
+            )
+
     track_top = max(1, args.track_knn_topk)
 
     tracked_subsets, trimmed_by_class = _build_tracked_subsets(per_class_indices, track_top)
@@ -173,19 +356,16 @@ def prepare_knn_subset_tracking_configs(args, dataset_name: str, model_name: str
 
 
 
+"""
 # -------------------------------------
-# NEW: Sharpness for Prototypes
+# NEW: Sharpness for Prototypes (legacy helper, superseded by subset tracking)
 # ------------------------------------
 
 def compute_prototype_metrics(net, loss_fn, prototype_data, device, base_batch_size=32):
-    """
-    prototype_data: dict like {
-        'boundary': (X_boundary, Y_boundary),
-        'x_outlier': (X_x, Y_x),
-        'y_outlier': (X_y, Y_y),
-        'inliers': (X_in, Y_in),
-    }
-    """
+    \"\"\"
+    Legacy helper for logging prototype metrics directly. Subset tracking now
+    handles prototype logging to keep behavior consistent across tracked sets.
+    \"\"\"
     metrics = {}
 
     for name, (X_p, Y_p) in prototype_data.items():
@@ -194,31 +374,28 @@ def compute_prototype_metrics(net, loss_fn, prototype_data, device, base_batch_s
         n = X_p.shape[0]
         batch_size = min(base_batch_size, n)
 
-
-        # ---- Prototype Loss ----
         with torch.no_grad():
             logits = net(X_p)
             loss_val = loss_fn(logits, Y_p).item()
-        metrics[f"prototype/{name}/loss"] = loss_val
+        metrics[f\"prototype/{name}/loss\"] = loss_val
 
-
-        # ---- Batch sharpness: E[gᵀHg / ||g||²] on the prototype set ----
         proto_batch_sharp = calculate_averaged_grad_H_grad(
             net=net,
             X=X_p,
             Y=Y_p,
             loss_fn=loss_fn,
             batch_size=batch_size,
-            n_estimates=1,       # small set, 1–3 estimates is usually enough
+            n_estimates=1,
             min_estimates=1,
-            eps=1.0,             # don't bother with tight MC convergence
+            eps=1.0,
             expectation_inside=False,
             with_replacement=False,
             return_confidence_interval=False,
         )
-        metrics[f"prototype/{name}/batch_sharpness"] = float(proto_batch_sharp)
+        metrics[f\"prototype/{name}/batch_sharpness\"] = float(proto_batch_sharp)
 
     return metrics
+"""
 
 
 
@@ -235,11 +412,18 @@ class PerSampleHistograms:
         self.counts = {metric: 0 for metric in metrics}
         self.quantiles = {metric: np.zeros((bins,)) for metric in metrics}
 
-@torch.no_grad()
+# @torch.no_grad()
+
 def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, device='cuda'):
-    """Return dict of numpy arrays: loss, resid_norm, kappa for dataset (X,Y)."""
+    """
+    Return dict of numpy arrays: loss, resid_norm, kappa, grad_norm for dataset (X, Y).
+    loss_type: 'ce' (cross-entropy) or 'mse' (SquaredLoss: 0.5 * ||y - yhat||^2).
+    """
+    was_training = net.training
     net.eval()
-    out_loss, out_resid, out_kappa = [], [], []
+
+    out_loss, out_resid, out_kappa, out_grad_norm = [], [], [], []
+
     for i in range(0, len(X), batch_size):
         xb = X[i:i + batch_size].to(device)
         yb = Y[i:i + batch_size].to(device)
@@ -340,7 +524,7 @@ def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, devic
         'loss': torch.cat(out_loss).numpy(),
         'resid': torch.cat(out_resid).numpy(),
         'kappa': torch.cat(out_kappa).numpy(),
-        'grad_norm': torch.cat(out_grad_norm).numpy()
+        'grad_norm': np.asarray(out_grad_norm),
     }
 
 def _hist_log10(values, bin_edges):
@@ -356,6 +540,16 @@ def _quantiles(values, qs=(0.1,0.5,0.9,0.99)):
 
 def _ensure_dir(p):
     Path(p).mkdir(parents=True, exist_ok=True)
+
+def _format_duration(seconds):
+    seconds = max(int(seconds), 0)
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 def _render_frame(bin_edges, counts_train, counts_test, title, out_png_path):
     plt.figure(figsize=(6,4))
@@ -403,9 +597,11 @@ class MeasurementRunner:
         quad_approx,
         memorization_outlier_frac: float,
         # NEW:
+        prototype_data,
         full_inputs_test=None,
         per_sample_cfg=None,
         subset_tracking_cfgs=None,
+        log_every_step: bool = False,
     ):
         self.net = net
         self.loss_fn = loss_fn
@@ -431,38 +627,12 @@ class MeasurementRunner:
         self.gd_noise = gd_noise
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
-        self.memorization_outlier_frac = memorization_outlier_frac
-        
+        self.memorization_outlier_frac = memorization_outlier_frac 
+
         # NEW: Per-sample config
         self.full_inputs_test = full_inputs_test
         self.per_sample_cfg = per_sample_cfg
-        
-        # NEW: Per-sample initialization logic
-        if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
-            self.per_sample_histograms = PerSampleHistograms(
-                min_log10=per_sample_cfg['hist_min_log10'],
-                max_log10=per_sample_cfg['hist_max_log10'],
-                bins=per_sample_cfg['hist_bins'],
-                metrics=per_sample_cfg.get('metrics', per_sample_cfg.get('hist_metrics', ['loss'])))
-            # Initialize bin edges for log10 histogram
-            self.bin_edges = np.linspace(
-                per_sample_cfg['hist_min_log10'],
-                per_sample_cfg['hist_max_log10'],
-                per_sample_cfg['hist_bins'] + 1
-            )
-            # Initialize directories for saving
-            self.ps_dir = save_dir / 'per_sample_histograms'
-            self.frames_dir = self.ps_dir / 'frames'
-            _ensure_dir(self.ps_dir)
-            if not per_sample_cfg.get('no_frames', False):
-                _ensure_dir(self.frames_dir)
-        else:
-            self.per_sample_histograms = None
-            self.bin_edges = None
-            self.ps_dir = None       
-        # NEW: Per-sample config
-        self.full_inputs_test = full_inputs_test
-        self.per_sample_cfg = per_sample_cfg
+        self.log_every_step = log_every_step
         
         # NEW: Per-sample initialization logic
         if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
@@ -497,17 +667,30 @@ class MeasurementRunner:
                 tracked_subsets = []
                 for subset in cfg.get('subsets', []):
                     indices = subset.get('indices')
-                    if not torch.is_tensor(indices):
-                        indices = torch.tensor(indices, dtype=torch.long, device=self.X.device)
-                    else:
-                        indices = indices.to(device=self.X.device, dtype=torch.long)
-                    if indices.numel() == 0:
+                    X_tensor = subset.get('X_tensor')
+                    Y_tensor = subset.get('Y_tensor')
+
+                    if indices is None and (X_tensor is None or Y_tensor is None):
                         continue
-                    tracked_subsets.append({
+
+                    entry = {
                         "name": subset.get('name', f"class_{subset.get('class_id', 'unknown')}"),
                         "class_id": subset.get('class_id'),
-                        "indices": indices,
-                    })
+                    }
+
+                    if indices is not None:
+                        if not torch.is_tensor(indices):
+                            indices = torch.tensor(indices, dtype=torch.long, device=self.X.device)
+                        else:
+                            indices = indices.to(device=self.X.device, dtype=torch.long)
+                        if indices.numel() == 0:
+                            continue
+                        entry["indices"] = indices
+                    else:
+                        entry["X_tensor"] = X_tensor.detach().clone()
+                        entry["Y_tensor"] = Y_tensor.detach().clone()
+
+                    tracked_subsets.append(entry)
 
                 if tracked_subsets:
                     self.subset_trackers.append({
@@ -524,7 +707,7 @@ class MeasurementRunner:
             self.eigenvalues_file.write('[\n')
         else:
             self.eigenvalues_file = None
-
+        self.prototype_data = prototype_data #NEW
     def close(self):
         if self.eigenvalues_file is not None:
             self.eigenvalues_file.write('\n]')
@@ -567,6 +750,9 @@ class MeasurementRunner:
             'test_acc': np.nan,  # NEW
             'train_test_gap': np.nan, # NEW
         }
+
+        if self.log_every_step:
+            ctx.log_all_measurements = True
 
         epoch_loss_update = None
 
@@ -735,19 +921,37 @@ class MeasurementRunner:
             for tracker in self.subset_trackers:
                 metric_kwargs = tracker.get('metric_kwargs', {})
                 for subset in tracker['subsets']:
-                    subset_results = compute_subset_metrics(
-                        net=self.net,
-                        loss_fn=self.loss_fn,
-                        X=self.X,
-                        Y=self.Y,
-                        indices=subset['indices'],
-                        metrics=tracker['metrics'],
-                        eigenvector_cache=self.eigenvector_cache,
-                        num_eigenvalues=self.num_eigenvalues,
-                        use_power_iteration=self.use_power_iteration,
-                        metric_kwargs=metric_kwargs,
-                    )
-                    prefix = f"{tracker['log_prefix']}/{subset['name']}"
+                    if 'indices' in subset:
+                        subset_results = compute_subset_metrics(
+                            net=self.net,
+                            loss_fn=self.loss_fn,
+                            X=self.X,
+                            Y=self.Y,
+                            indices=subset['indices'],
+                            metrics=tracker['metrics'],
+                            eigenvector_cache=self.eigenvector_cache,
+                            num_eigenvalues=self.num_eigenvalues,
+                            use_power_iteration=self.use_power_iteration,
+                            metric_kwargs=metric_kwargs,
+                        )
+                    else:
+                        subset_results = compute_subset_metrics_from_tensors(
+                            net=self.net,
+                            loss_fn=self.loss_fn,
+                            X_subset=subset['X_tensor'],
+                            Y_subset=subset['Y_tensor'],
+                            metrics=tracker['metrics'],
+                            eigenvector_cache=self.eigenvector_cache,
+                            num_eigenvalues=self.num_eigenvalues,
+                            use_power_iteration=self.use_power_iteration,
+                            metric_kwargs=metric_kwargs,
+                        )
+
+                    subset_name = subset.get('name')
+                    if subset_name:
+                        prefix = f"{tracker['log_prefix']}/{subset_name}"
+                    else:
+                        prefix = tracker['log_prefix']
                     for key, value in subset_results.items():
                         metrics[f"{prefix}/{key}"] = value
 
@@ -971,21 +1175,52 @@ class MeasurementRunner:
                     np.savez(out_path, **stats)
 
 
-        if self.prototype_data is not None:
-            proto_metrics = compute_prototype_metrics(
-                net=self.net,
-                loss_fn=self.loss_fn,
-                prototype_data=self.prototype_data,
-                device=self.device,
-                base_batch_size=self.batch_size,
-            )
-            metrics.update(proto_metrics)
+
+        # ----- NEW: Prototype per-sample stats over time -----
+        if self.prototype_data is not None and self.per_sample_cfg and self.per_sample_cfg['enabled']:
+            proto_every = self.per_sample_cfg["every"]
+            if step_number % proto_every == 0:
+                loss_type = 'ce' if isinstance(self.loss_fn, nn.CrossEntropyLoss) else 'mse'
+
+                proto_dir = self.ps_dir / "prototypes"
+                _ensure_dir(proto_dir)
+
+                for name, (X_p, Y_p) in self.prototype_data.items():
+                    X_p = X_p.to(self.device)
+                    Y_p = Y_p.to(self.device)
+
+                    # Per-sample stats
+                    stats = _per_sample_stats(
+                        self.net,
+                        self.loss_fn,
+                        X_p,
+                        Y_p,
+                        loss_type=loss_type,
+                        batch_size=len(X_p),
+                        device=self.device,
+                    )
+                    
+                    # NEW: Add batch sharpness for this prototype set
+                    # Compute full loss on this prototype set
+                    self.net.zero_grad()
+                    preds = self.net(X_p).squeeze(dim=-1)
+                    proto_loss = self.loss_fn(preds, Y_p)
+                    
+                    # Compute batch sharpness (gHg/g²)
+                    batch_sharpness = compute_grad_H_grad(proto_loss, self.net).item()
+                    
+                    # Add to stats
+                    stats['batch_sharpness'] = batch_sharpness
+                    stats['mean_loss'] = np.mean(stats['loss'])
+                    
+                    out_path = proto_dir / f"step_{step_number:05d}_{name}.npz"
+                    np.savez(out_path, **stats)
+
+
 
         metrics['epoch_loss_update'] = epoch_loss_update
         return metrics
-    
-        
-
+ 
 
 # -------------------------------------
 # Section: Training Function
@@ -1002,7 +1237,7 @@ def train(
             save_to, #folder
             device,
             verbose=True,
-            loss_fn=nn.MSELoss(),
+            loss_fn=nn.CrossEntropyLoss(),
             permute=True,
             stop_loss=None,
             epoch_to_start=0,
@@ -1036,6 +1271,8 @@ def train(
             per_sample_cfg=None, #NEW 
             knn_outlier_cfg=None,
             subset_tracking_cfgs=None,
+            prototype_data=None,
+            log_every_step: bool = False,
     ):
     
     # -------------------------------------
@@ -1057,7 +1294,6 @@ def train(
 
     X, Y = X_train, Y_train
 
-
     # ----- Device Alignment -----
     net = net.to(device)
     net.train()
@@ -1073,7 +1309,6 @@ def train(
     save_to.mkdir(parents=True, exist_ok=True)
 
     model_save_path = save_to / 'checkpoints'
-
     results_file = save_to / 'results.txt'
     if device == 'cpu':
         # No buffering on CPU to ensure writes happen immediately
@@ -1160,6 +1395,9 @@ def train(
         memorization_outlier_frac=memorization_outlier_frac,
         per_sample_cfg=per_sample_cfg,
         subset_tracking_cfgs=subset_tracking_cfgs,
+        prototype_data=prototype_data,    
+        full_inputs_test=None,
+        log_every_step=log_every_step,
     )
     # ----- Run Identification -----
     run_id = wandb_run_id or generate_run_id()
@@ -1209,6 +1447,7 @@ def train(
                 lr=optimizer.param_groups[0]['lr'],
                 precise_plots=precise_plots,
                 rare_measure=rare_measure,
+                log_all_measurements=log_every_step,
             )
 
             X_batch = X_shuffled[i*batch_size : (i+1)*batch_size]
@@ -1429,6 +1668,16 @@ def train(
             )
             if checkpoint_path:
                 print(f"Checkpoint saved at step {step_number}: {checkpoint_path}")
+                if max_steps is not None and step_number > step_to_start:
+                    elapsed = time.time() - start_time
+                    steps_done = step_number - step_to_start
+                    avg_step_time = elapsed / steps_done
+                    remaining_steps = max(max_steps - step_number, 0)
+                    eta_seconds = remaining_steps * avg_step_time
+                    eta_str = _format_duration(eta_seconds)
+                    finish_ts = time.time() + eta_seconds
+                    finish_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(finish_ts))
+                    print(f"  Estimated time remaining: {eta_str} (finish ~ {finish_str})")
 
             # -------------------------------------
             # Section: Logging (Step)
@@ -1489,6 +1738,31 @@ def train(
         save_every_n_steps=1  # Always save final checkpoint
     )
     print(f"Final checkpoint saved: {final_checkpoint_path}")
+
+    # ----- NEW: per-sample stats on prototype sets -----
+    if prototype_data is not None:
+        print("Computing per-sample metrics for prototype sets...")
+        loss_type = 'ce' if isinstance(loss_fn, nn.CrossEntropyLoss) else 'mse'
+
+        proto_dir = save_to / "prototype_final"
+        _ensure_dir(proto_dir)
+
+        for name, (X_p, Y_p) in prototype_data.items():
+            X_p = X_p.to(device)
+            Y_p = Y_p.to(device)
+
+            stats = _per_sample_stats(
+                net,
+                loss_fn,
+                X_p,
+                Y_p,
+                loss_type='ce',
+                batch_size=batch_size,
+                device=device,
+            )
+            out_path = proto_dir / f"final_{name}.npz"
+            np.savez(out_path, **stats)
+            print(f"  saved {name} -> {out_path}")
 
     results_file.close()
 
@@ -1683,6 +1957,7 @@ if __name__ == '__main__':
     parser.add_argument('--fisher', action='store_true', help='If set, compute Fisher information matrix eigenvalue. Currently only works with one-dim output')
     parser.add_argument('--param-distance', '--param_distance', action='store_true', help='If set, compute the distance from the reference weights')
     parser.add_argument('--param-file', '--param_file', type=str, default=None, help='Path to reference parameters for computing parameter distance')
+    parser.add_argument('--log-every-step', action='store_true', help='Force all configured measurements to log every training step, bypassing frequency rules.')
 
     # --- Measurement Configuration ---
     parser.add_argument('--disable-cache-eigenvectors', '--disable_cache_eigenvectors', action='store_true', help='If set, disable eigenvector caching for warm starts to improve eigenvalue computation performance')
@@ -1730,13 +2005,24 @@ if __name__ == '__main__':
     parser.add_argument('--train-test-gap', action='store_true', help='If set, compute the training and testing accuracy and gap (heavy, runs rarely)')
 
     # --- NEW: Per-Sample Histogram Configuration ---
-    parser.add_argument('--per-sample', action='store_true', help='If set, compute per-sample histograms (heavy; runs rarely)')
-    parser.add_argument('--per-sample-freq', type=float, default=None, help='Frequency of per-sample histograms, as fraction of max_steps (default: 0.01 = every 100 steps for 10k max_steps)')
-    parser.add_argument('--per-sample-min-log10', type=float, default=-8, help='Min log10 value for log10 histograms (default: -8)')
-    parser.add_argument('--per-sample-max-log10', type=float, default=0, help='Max log10 value for log10 histograms (default: 0)')
-    parser.add_argument('--per-sample-bins', type=int, default=80, help='Number of bins for log10 histograms (default: 80)')
-    parser.add_argument('--per-sample-metrics', type=str, nargs='+', default=['loss','resid','kappa'], choices=['loss','resid','kappa'], help='Which metrics to histogram (default: loss resid kappa)')
-    parser.add_argument('--no-frames', action='store_true', help='Only save counts/quantiles as .npz; do not render PNG frames')
+
+    parser.add_argument('--per-sample', action='store_true',
+                        help='Track per-sample loss/residual/curvature histograms over time and save frames')
+    parser.add_argument('--per-sample-every', type=int, default=100,
+                        help='Snapshot cadence in steps for per-sample histograms (default: 100)')
+    parser.add_argument('--hist-min-log10', type=float, default=-6.0,
+                        help='Left edge for log10 binning (default: -6)')
+    parser.add_argument('--hist-max-log10', type=float, default=2.0,
+                        help='Right edge for log10 binning (default: 2)')
+    parser.add_argument('--hist-bins', type=int, default=80,
+                        help='Number of bins for log10 histograms (default: 80)')
+    parser.add_argument('--per-sample-metrics', type=str, nargs='+',
+                        default=['loss','resid','kappa'],
+                        choices=['loss','resid','kappa'],
+                        help='Which metrics to histogram (default: loss resid kappa)')
+    parser.add_argument('--no-frames', action='store_true',
+                        help='Only save counts/quantiles as .npz; do not render PNG frames')
+
 
     # --- NEW: Memorization via Outliers identified by Alignment with Top Hessian Eigenvector ---
     parser.add_argument('--memorization-hessian-outliers', action='store_true', help='Compute memorization stats based on alignment with top Hessian eigenvector (heavy; runs rarely)')
@@ -1759,6 +2045,24 @@ if __name__ == '__main__':
                         help='Existing plaintext run folder name (e.g., 20251124_0820_35_lr0.01000_b8) whose knn_outlier_indices.json should be tracked during training')
     parser.add_argument('--track-knn-topk', type=int, default=5,
                         help='Number of stored outliers per class to track from the reference run')
+
+    # --- NEW: Feature-space Prototype Tracking ---
+    parser.add_argument('--feature-prototypes', action='store_true',
+                        help='After training, export feature-space prototype sets for reuse')
+    parser.add_argument('--feature-prototype-batch', type=int, default=512,
+                        help='Batch size for feature extraction when exporting feature prototypes')
+    parser.add_argument('--feature-prototype-topk', type=int, default=50,
+                        help='Maximum prototypes per class to store from feature space')
+    parser.add_argument('--feature-prototype-kneighbors', type=int, default=32,
+                        help='k-NN neighborhood size when identifying boundary points in feature space')
+    parser.add_argument('--feature-prototype-no-normalize', action='store_true',
+                        help='Disable L2 normalization before computing feature-space prototypes')
+    parser.add_argument('--feature-prototype-extrapolation', type=float, default=EXTRAPOLATION_FACTOR,
+                        help='Extrapolation factor used when building feature-space x-outliers')
+    parser.add_argument('--track-feature-prototypes-from', type=str, default=None,
+                        help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
+    parser.add_argument('--track-input-prototypes', action='store_true',
+                        help='Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
 
     # ----- Argument Parsing -----
     args = parser.parse_args()
@@ -1833,6 +2137,9 @@ if __name__ == '__main__':
     
     if len(exclusive_modes) > 1:
         raise ValueError(f"Cannot use multiple training modes simultaneously: {', '.join(exclusive_modes)}. Please choose only one.")
+
+    if args.feature_prototypes and (args.classes is None or len(args.classes) != 2):
+        raise ValueError("--feature-prototypes requires specifying exactly two classes via --classes")
     
     # ----- Measurement Selection -----
     measurements = {name for name, enabled in [
@@ -1870,6 +2177,28 @@ if __name__ == '__main__':
 
     # --- Dataset Preparation ---
     data = prepare_dataset(dataset, DATASET_FOLDER, args.num_data, args.classes, args.dataset_seed, loss_type=args.loss)
+
+    # --- Unpack dataset and build tuple_data ---
+    train_x, train_y, test_x, test_y = data  
+    tuple_data = (train_x, train_y, test_x, test_y)
+
+    prototype_data = generate_prototype_sets(train_x, train_y, args.classes)
+
+    combined_prototype_data = dict(prototype_data)
+    if args.track_feature_prototypes_from:
+        tracked_feature_prototypes, _ = _load_reference_feature_prototypes(
+            dataset,
+            args.model,
+            args.track_feature_prototypes_from,
+        )
+        for name, tensors in tracked_feature_prototypes.items():
+            combined_prototype_data[name] = tensors
+        print(
+            f"Loaded feature-space prototypes from run {args.track_feature_prototypes_from} "
+            f"({len(tracked_feature_prototypes)} subsets)"
+        )
+
+    prototype_data = combined_prototype_data
 
     # --- Model Construction ---
     name = args.model
@@ -1939,7 +2268,7 @@ if __name__ == '__main__':
     if args.param_file is not None:
         param_reference = T.load(args.param_file, map_location=device)
         # param_reference = param_reference['model_state_dict']
-        # param_reference = {k: v.to(device) for k, v in param_reference.items()}
+        # param_reference = {k: v.to(device) for k, v in param_reference.items()} 
 
     # ----- Optimizer Preparation -----
     optimizer = prepare_optimizer(net, args.lr, args.momentum, args.adam)
@@ -1950,22 +2279,6 @@ if __name__ == '__main__':
     else:
         checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
     
-    per_sample_cfg = None
-    if args.per_sample:
-        freq = args.per_sample_freq if args.per_sample_freq is not None else 0.01
-        if args.steps is None:
-            raise ValueError("--per-sample requires --steps when using --epochs-only mode")
-        every = max(1, int(args.steps * freq))
-        per_sample_cfg = {
-            'enabled': True,
-            'every': every,
-            'hist_min_log10': args.per_sample_min_log10,
-            'hist_max_log10': args.per_sample_max_log10,
-            'hist_bins': args.per_sample_bins,
-            'metrics': args.per_sample_metrics,
-            'no_frames': args.no_frames,
-        }
-
     knn_outlier_cfg = None
     if args.knn_outliers:
         if args.knn_neighbors < 2:
@@ -1984,12 +2297,27 @@ if __name__ == '__main__':
         }
 
     subset_tracking_cfgs = prepare_knn_subset_tracking_configs(args, dataset, args.model, data) if args.track_knn_outliers_from else []
+    subset_tracking_cfgs.extend(prepare_feature_prototype_subset_configs(prototype_data))
+    if args.track_input_prototypes:
+        subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prototype_data, base_batch_size=batch_size))
+    
+    per_sample_cfg = None
+    if args.per_sample:
+        per_sample_cfg = {
+            'enabled': True,
+            'every': max(1, int(args.per_sample_every)),
+            'hist_min_log10': args.hist_min_log10,
+            'hist_max_log10': args.hist_max_log10,
+            'hist_bins': args.hist_bins,
+            'metrics': args.per_sample_metrics,   # ['loss','resid','kappa']
+            'no_frames': args.no_frames,
+        }
 
     # ----- Training Invocation -----
     train(
         net=net,
         optimizer=optimizer,
-        data=data,
+        data=tuple_data,
         max_epochs=args.epochs,
         max_steps=args.steps,
         batch_size=args.batch,
@@ -2029,5 +2357,29 @@ if __name__ == '__main__':
         per_sample_cfg=per_sample_cfg,
         knn_outlier_cfg=knn_outlier_cfg,
         subset_tracking_cfgs=subset_tracking_cfgs,
-
+        prototype_data=prototype_data,
+        log_every_step=args.log_every_step,
     )
+
+    if args.feature_prototypes:
+        print("Computing feature-space prototypes for export...")
+        feature_batch = args.feature_prototype_batch
+        features = extract_feature_matrix(
+            net=net,
+            inputs=train_x,
+            batch_size=feature_batch,
+            flatten_outputs=True,
+        )
+        proto_sets, proto_meta = generate_feature_space_prototype_sets(
+            net=None,
+            Y_train=train_y,
+            classes=tuple(args.classes),
+            precomputed_features=features,
+            original_inputs=train_x,
+            normalize_features=not args.feature_prototype_no_normalize,
+            k_neighbors=args.feature_prototype_kneighbors,
+            prototypes_per_class=args.feature_prototype_topk,
+            extrapolation_factor=args.feature_prototype_extrapolation,
+        )
+        _save_feature_prototype_package(run_folder, proto_sets, proto_meta)
+        print(f"Feature-space prototypes saved to {run_folder / 'feature_prototypes'}")
