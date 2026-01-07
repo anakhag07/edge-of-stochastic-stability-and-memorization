@@ -4,6 +4,7 @@ import urllib.request
 import scipy.io as sio
 from torchvision import datasets
 import torch
+import json
 
 if 'DATASETS' not in os.environ:
     raise ValueError("Please set the environment variable 'DATASETS'. Use 'export DATASETS=/path/to/datasets'")
@@ -76,6 +77,49 @@ def download_svhn():
         print(f"Error verifying SVHN data: {e}")
 
 
+def download_imagenet32():
+    """Download ImageNet-32 (Chrabaszcz et al. downsampled ImageNet 32x32) CIFAR-style batches."""
+    print("Downloading ImageNet-32...")
+    imagenet_folder = DATASET_FOLDER / "imagenet32"
+    imagenet_folder.mkdir(parents=True, exist_ok=True)
+
+    # Figshare article "Imagenet_32" (contains train_data_batch_1..10 and val_data)
+    api_url = "https://api.figshare.com/v2/articles/4960082"
+
+    # Fetch metadata (list of files + per-file download_url)
+    print(f"Fetching file list from {api_url} ...")
+    with urllib.request.urlopen(api_url) as r:
+        meta = json.loads(r.read().decode("utf-8"))
+
+    files = meta.get("files", [])
+    if not files:
+        raise RuntimeError(f"No files found at {api_url}. (API response missing 'files')")
+
+    # Download each batch file by its direct download_url
+    for f in files:
+        name = f["name"]                      # e.g., "train_data_batch_1"
+        url = f["download_url"]               # e.g., https://ndownloader.figshare.com/files/...
+        expected_size = f.get("size", None)   # bytes (optional)
+        dest = imagenet_folder / name
+
+        if dest.exists():
+            print(f"{name} already exists.")
+            continue
+
+        print(f"Downloading {name} ({expected_size} bytes) from {url} ...")
+        urllib.request.urlretrieve(url, dest)
+
+        # Basic verification: size check when available
+        if expected_size is not None:
+            got = dest.stat().st_size
+            if got != expected_size:
+                raise RuntimeError(
+                    f"Size mismatch for {name}: expected {expected_size} bytes, got {got} bytes. "
+                    f"Delete {dest} and retry."
+                )
+
+    print("ImageNet-32 download completed!")
+
 def main():
     """Download all datasets"""
     print(f"Dataset folder: {DATASET_FOLDER}")
@@ -85,6 +129,7 @@ def main():
         download_cifar10()
         download_fashion_mnist()
         download_svhn()
+        download_imagenet32()
         print("\nAll datasets downloaded successfully!")
         
     except Exception as e:
@@ -94,4 +139,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
