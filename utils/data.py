@@ -538,12 +538,14 @@ def _assign_synthetic_to_real(
 
     return torch.tensor(assigned, dtype=torch.long)
 
+def generate_prototype_sets(X_train, Y_train, classes, n_prototype=None, prototype_frac=0.05):
 
-def generate_prototype_sets(X_train: T.Tensor, Y_train: T.Tensor, classes: tuple):
     """
     Generates prototype sets: boundary, x_outlier, y_outlier.
     Works with image tensors [N, C, H, W] and one-hot labels.
     """
+    if n_prototype is None:
+        n_prototype = max(1, int(round(X_train.shape[0] * prototype_frac)))
 
     class_0, class_1 = classes
     X_0, X_1, _, _, class_labels = _split_by_classes(X_train, Y_train, classes)
@@ -551,8 +553,8 @@ def generate_prototype_sets(X_train: T.Tensor, Y_train: T.Tensor, classes: tuple
     n0, n1 = X_0.size(0), X_1.size(0)
 
     # How many prototypes per class we can actually take
-    k0 = min(N_PROTOTYPE, n0)
-    k1 = min(N_PROTOTYPE, n1)
+    k0 = min(n_prototype, n0)
+    k1 = min(n_prototype, n1)
 
     # Centroids in image space
     centroid_0 = X_0.mean(dim=0, keepdim=True)  # [1, C, H, W]

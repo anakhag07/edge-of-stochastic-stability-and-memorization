@@ -1934,7 +1934,8 @@ if __name__ == '__main__':
     # --- Optimizer Variants ---
     parser.add_argument('--momentum', type=float, default=None, help='Momentum for SGD optimizer')
     parser.add_argument('--adam', action='store_true', help='If set, use Adam optimizer instead of SGD')
-    
+    parser.add_argument('--weight-decay', type=float, default=0.0)
+
     # --- Measurement Flags (Primary) ---
     # parser.add_argument('--fullbs', action='store_true', help='If set, compute the lambda_max, aka FullBS')
     parser.add_argument('--lambdamax', '--lmax', action='store_true', help='If set, compute the lambda_max, aka FullBS')
@@ -2182,7 +2183,10 @@ if __name__ == '__main__':
     train_x, train_y, test_x, test_y = data  
     tuple_data = (train_x, train_y, test_x, test_y)
 
-    prototype_data = generate_prototype_sets(train_x, train_y, args.classes)
+    n_proto = max(1, int(round(args.num_data * 0.05)))
+    print(f"[sanity] args.num_data={args.num_data} -> n_proto={n_proto}")
+
+    prototype_data = generate_prototype_sets(train_x, train_y, tuple(args.classes), n_prototype=n_proto)
 
     combined_prototype_data = dict(prototype_data)
     if args.track_feature_prototypes_from:
@@ -2271,7 +2275,7 @@ if __name__ == '__main__':
         # param_reference = {k: v.to(device) for k, v in param_reference.items()} 
 
     # ----- Optimizer Preparation -----
-    optimizer = prepare_optimizer(net, args.lr, args.momentum, args.adam)
+    optimizer = prepare_optimizer(net, args.lr, args.momentum, args.adam, args.weight_decay)
 
     # ----- Checkpoint Cadence Determination -----
     if args.checkpoint_every is not None:

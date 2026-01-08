@@ -430,16 +430,36 @@ def initialize_net(net, scale=None, seed=None):
         else:
             raise ValueError("Unknown net type")
 
-
-def prepare_optimizer(net, lr, momentum, adam):
+def prepare_optimizer(net, lr, momentum, adam, weight_decay: float = 0.0):
     if adam:
         if momentum is not None:
-            raise ValueError("Momentum is not supported for Adam, just because. Change the code if you need to change the params in Adam")
-        return T.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999))
+            raise ValueError(
+                "Momentum is not supported for Adam. "
+                "Change the code if you need to change the params in Adam"
+            )
+
+        if weight_decay and weight_decay > 0:
+            # Only use AdamW when weight decay is requested
+            return T.optim.AdamW(
+                net.parameters(),
+                lr=lr,
+                betas=(0.9, 0.999),
+                weight_decay=weight_decay,
+            )
+
+        # Default:
+        return T.optim.Adam(
+            net.parameters(),
+            lr=lr,
+            betas=(0.9, 0.999),
+        )
+
+    # SGD branch (weight_decay here is classic L2)
     if momentum is not None:
-        return T.optim.SGD(net.parameters(), lr=lr, momentum=momentum)
-    
-    return T.optim.SGD(net.parameters(), lr=lr, momentum=0)
+        return T.optim.SGD(net.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+
+    return T.optim.SGD(net.parameters(), lr=lr, momentum=0, weight_decay=weight_decay)
+
 
 
 def get_path_of_last_net(path: Union[str, Path], not_final=False):
