@@ -1298,6 +1298,7 @@ def train(
 
     X, Y = X_train, Y_train
 
+    # ----- Lmax Decay Setup -----
     decay_active = False
     decay_start_step = None
     decay_start_lr = None
@@ -1482,6 +1483,7 @@ def train(
                 step_number=step_number,
             )
 
+            # --- Lmax-based Learning Rate Decay Logic ---
             if lmax_decay:
                 lmax_value = metrics.get('lmax', float('nan'))
                 if not decay_active and math.isfinite(lmax_value):
@@ -1729,6 +1731,7 @@ def train(
                         "epoch": epoch,
                         "step": step_number,
                         "batch_loss": batch_loss,
+                        "lr": optimizer.param_groups[0]["lr"],
                     })
                     rename_map = {
                         "batch_lmax": "batch_lambda_max",
@@ -1942,14 +1945,17 @@ if __name__ == '__main__':
     parser.add_argument('--steps', type=int, default=10000, help='Number of steps to train. Either epochs or steps should be provided')
     parser.add_argument('--cpu', action='store_true', help='Force training to run on CPU even if CUDA is available')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for training')
+
+    # --- Lmax LR Decay Configuration ---
     parser.add_argument('--lmax-decay', action='store_true',
                         help='Enable linear lr decay once lambda_max >= 2/initial_lr')
     parser.add_argument('--lmax-decay-target-lr', type=float, default=0.001,
                         help='Target lr for linear decay after lmax trigger')
     parser.add_argument('--lmax-decay-steps', type=int, default=10000,
                         help='Number of steps to linearly decay to target lr')
-    parser.add_argument('--stop-loss', '--stop_loss', type=float, default=None, help='Stop training if loss goes below this value')
+
     # --- Loss Configuration ---
+    parser.add_argument('--stop-loss', '--stop_loss', type=float, default=None, help='Stop training if loss goes below this value')
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'ce'], help='Loss function to use (mse or ce)')
 
     # --- Dataset Configuration ---
