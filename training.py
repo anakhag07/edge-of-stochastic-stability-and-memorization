@@ -1273,6 +1273,10 @@ def train(
             subset_tracking_cfgs=None,
             prototype_data=None,
             log_every_step: bool = False,
+            lmax_decay: bool = False,
+            lmax_decay_target_lr: float = 0.001,
+            lmax_decay_steps: int = 10000,
+            lmax_decay_initial_lr: float = None,
     ):
     
     # -------------------------------------
@@ -1293,6 +1297,13 @@ def train(
     X_train, Y_train, X_test, Y_test = data
 
     X, Y = X_train, Y_train
+
+    decay_active = False
+    decay_start_step = None
+    decay_start_lr = None
+    if lmax_decay_initial_lr is None:
+        lmax_decay_initial_lr = optimizer.param_groups[0]['lr']
+    lmax_decay_threshold = 2.0 / lmax_decay_initial_lr
 
     # ----- Device Alignment -----
     net = net.to(device)
@@ -1470,6 +1481,25 @@ def train(
                 step_in_epoch=i,
                 step_number=step_number,
             )
+
+            if lmax_decay:
+                lmax_value = metrics.get('lmax', float('nan'))
+                if not decay_active and math.isfinite(lmax_value):
+                    if lmax_value >= lmax_decay_threshold:
+                        decay_active = True
+                        decay_start_step = step_number
+                        decay_start_lr = optimizer.param_groups[0]['lr']
+                        print(
+                            f"Lmax decay triggered at step {step_number}: "
+                            f"lmax={lmax_value:.4f} >= {lmax_decay_threshold:.4f}"
+                        )
+
+                if decay_active:
+                    steps_elapsed = step_number - decay_start_step
+                    t = min(steps_elapsed / max(lmax_decay_steps, 1), 1.0)
+                    new_lr = decay_start_lr + t * (lmax_decay_target_lr - decay_start_lr)
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = new_lr
 
             # --- Epoch-Level Loss Tracking ---
             if metrics['epoch_loss_update'] is not None:
@@ -1912,6 +1942,12 @@ if __name__ == '__main__':
     parser.add_argument('--steps', type=int, default=10000, help='Number of steps to train. Either epochs or steps should be provided')
     parser.add_argument('--cpu', action='store_true', help='Force training to run on CPU even if CUDA is available')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for training')
+    parser.add_argument('--lmax-decay', action='store_true',
+                        help='Enable linear lr decay once lambda_max >= 2/initial_lr')
+    parser.add_argument('--lmax-decay-target-lr', type=float, default=0.001,
+                        help='Target lr for linear decay after lmax trigger')
+    parser.add_argument('--lmax-decay-steps', type=int, default=10000,
+                        help='Number of steps to linearly decay to target lr')
     parser.add_argument('--stop-loss', '--stop_loss', type=float, default=None, help='Stop training if loss goes below this value')
     # --- Loss Configuration ---
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'ce'], help='Loss function to use (mse or ce)')
@@ -2141,6 +2177,14 @@ if __name__ == '__main__':
 
     if args.feature_prototypes and (args.classes is None or len(args.classes) != 2):
         raise ValueError("--feature-prototypes requires specifying exactly two classes via --classes")
+
+    if args.lmax_decay_steps < 1:
+        raise ValueError("--lmax-decay-steps must be >= 1")
+    if args.lmax_decay_target_lr < 0:
+        raise ValueError("--lmax-decay-target-lr must be >= 0")
+    if args.lmax_decay and not args.lambdamax:
+        print("--lmax-decay requires --lambdamax; enabling lambda_max measurement.")
+        args.lambdamax = True
     
     # ----- Measurement Selection -----
     measurements = {name for name, enabled in [
@@ -2363,6 +2407,10 @@ if __name__ == '__main__':
         subset_tracking_cfgs=subset_tracking_cfgs,
         prototype_data=prototype_data,
         log_every_step=args.log_every_step,
+        lmax_decay=args.lmax_decay,
+        lmax_decay_target_lr=args.lmax_decay_target_lr,
+        lmax_decay_steps=args.lmax_decay_steps,
+        lmax_decay_initial_lr=args.lr,
     )
 
     if args.feature_prototypes:
