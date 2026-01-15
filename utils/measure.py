@@ -1,6 +1,7 @@
 import torch as T
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import linalg as LA
 import numpy as np
@@ -1969,6 +1970,14 @@ def _compute_metrics_on_subset_data(
     results = {}
 
     preds = net(X_subset).squeeze(dim=-1)
+    if (
+        isinstance(loss_fn, nn.modules.loss._Loss)
+        and loss_fn.__class__.__name__ == "SquaredLoss"
+        and Y_subset.ndim == 1
+        and preds.ndim == 2
+    ):
+        # Convert class-index labels to one-hot targets for MSE-style losses.
+        Y_subset = F.one_hot(Y_subset.long(), num_classes=preds.shape[1]).float()
     loss_value = loss_fn(preds, Y_subset)
     subset_size = X_subset.shape[0]
 
