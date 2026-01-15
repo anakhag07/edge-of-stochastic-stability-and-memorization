@@ -1949,7 +1949,7 @@ if __name__ == '__main__':
     # --- Lmax LR Decay Configuration ---
     parser.add_argument('--lmax-decay', action='store_true',
                         help='Enable linear lr decay once lambda_max >= 2/initial_lr')
-    parser.add_argument('--lmax-decay-target-lr', type=float, default=0.001,
+    parser.add_argument('--lmax-decay-target-lr', type=float, default=0.0001,
                         help='Target lr for linear decay after lmax trigger')
     parser.add_argument('--lmax-decay-steps', type=int, default=10000,
                         help='Number of steps to linearly decay to target lr')
