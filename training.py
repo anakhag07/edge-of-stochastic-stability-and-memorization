@@ -1285,6 +1285,18 @@ def train(
     start_time = time.time()
     print(f"Training started at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
 
+    wandb_finished = False
+
+    def _log_train_time():
+        nonlocal wandb_finished, wandb_run
+        if wandb_run is None or wandb_finished:
+            return
+        end_time = time.time()
+        train_time_s = end_time - start_time
+        print(f"Training finished at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
+        print(f"Total training time: {train_time_s:.2f} seconds")
+        wandb_run.summary["train_time_s"] = float(train_time_s)
+
     # ----- Checkpoint Frequency Defaults -----
     NET_SAVES_PER_TRAINING = 200
 
@@ -1426,8 +1438,10 @@ def train(
             print(f"Reached max steps {max_steps}, stopping the training")
             results_file.flush()
             results_file.close()
-            if wandb_run is not None:
+            if wandb_run is not None and not wandb_finished:
+                _log_train_time()
                 wandb_run.finish()
+                wandb_finished = True
             break
 
         # --- Epoch Data Preparation ---
@@ -1509,8 +1523,10 @@ def train(
                     print('Full loss is NaN, the network prolly diverged, stopping the training')
                     results_file.flush()
                     results_file.close()
-                    if wandb_run is not None:
+                    if wandb_run is not None and not wandb_finished:
+                        _log_train_time()
                         wandb_run.finish()
+                        wandb_finished = True
                     measurement_runner.close()
                     return
                 epoch_loss = metrics['epoch_loss_update']
@@ -1535,8 +1551,10 @@ def train(
                 if math.isinf(loss) or math.isnan(loss):
                     results_file.flush()
                     results_file.close()
-                    if wandb_run is not None:
+                    if wandb_run is not None and not wandb_finished:
+                        _log_train_time()
                         wandb_run.finish()
+                        wandb_finished = True
                     raise ValueError("Loss is inf or NaN, stopping the training")
                     
                     
@@ -1612,8 +1630,10 @@ def train(
                 if math.isinf(loss.item()) or math.isnan(loss.item()):
                     results_file.flush()
                     results_file.close()
-                    if wandb_run is not None:
+                    if wandb_run is not None and not wandb_finished:
+                        _log_train_time()
                         wandb_run.finish()
+                        wandb_finished = True
                     raise ValueError("Loss is inf or NaN, stopping the training")
 
                 # Backward pass for minibatch gradient
@@ -1668,8 +1688,10 @@ def train(
                 if math.isinf(loss.item()) or math.isnan(loss.item()):
                     results_file.flush()
                     results_file.close()
-                    if wandb_run is not None:
+                    if wandb_run is not None and not wandb_finished:
+                        _log_train_time()
                         wandb_run.finish()
+                        wandb_finished = True
                     raise ValueError("Loss is inf or NaN, stopping the training")
 
                 # Check if we should initialize quadratic approximation
@@ -1689,6 +1711,8 @@ def train(
 
             # --- Checkpoint Handling ---
             # Save checkpoint using wandb system
+            ckpt_start_ts = time.time()
+            ckpt_start_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ckpt_start_ts))
             checkpoint_path = save_checkpoint_wandb(
                 model=net,
                 optimizer=optimizer,
@@ -1698,7 +1722,11 @@ def train(
                 run_id=run_id,
                 save_every_n_steps=checkpoint_every_n_steps
             )
+            ckpt_end_ts = time.time()
+            ckpt_end_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ckpt_end_ts))
             if checkpoint_path:
+                print(f"Checkpoint start at step {step_number}: {ckpt_start_str}")
+                print(f"Checkpoint end at step {step_number}: {ckpt_end_str} (elapsed {ckpt_end_ts - ckpt_start_ts:.2f}s)")
                 print(f"Checkpoint saved at step {step_number}: {checkpoint_path}")
                 if max_steps is not None and step_number > step_to_start:
                     elapsed = time.time() - start_time
@@ -1801,14 +1829,11 @@ def train(
 
     measurement_runner.close()
 
-    # ----- WandB Teardown -----
-    if wandb_run is not None:
-        wandb_run.finish()
-
     # ----- Final Reporting -----
-    end_time = time.time()
-    print(f"Training finished at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
-    print(f"Total training time: {end_time - start_time:.2f} seconds")
+    if wandb_run is not None and not wandb_finished:
+        _log_train_time()
+        wandb_run.finish()
+        wandb_finished = True
 
     if knn_outlier_cfg and knn_outlier_cfg.get('enabled', False):
         print("Computing k-NN neighbor-mix outliers...")
