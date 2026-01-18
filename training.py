@@ -565,6 +565,116 @@ def _render_frame(bin_edges, counts_train, counts_test, title, out_png_path):
     plt.savefig(out_png_path, dpi=140)
     plt.close()
 
+
+
+def _trainable_params(net):
+    return [p for p in net.parameters() if p.requires_grad]
+
+def _flatten_grads_like_params(grads, params):
+    flats = []
+    for g, p in zip(grads, params):
+        if g is None:
+            flats.append(torch.zeros_like(p).reshape(-1))
+        else:
+            flats.append(g.reshape(-1))
+    return torch.cat(flats) if flats else torch.tensor([])
+
+@torch.no_grad()
+def _adam_pinv_sqrt_flat(optimizer, params, bias_correction=True):
+    """
+    Build diagonal P^{-1/2} for Adam/AdamW, matching denom = sqrt(v_hat) + eps.
+      P = sqrt(v_hat) + eps
+      P^{-1/2} = 1 / sqrt(P)
+    """
+    p2group = {}
+    for pg in optimizer.param_groups:
+        beta2 = pg.get("betas", (0.9, 0.999))[1]
+        eps = pg.get("eps", 1e-8)
+        for p in pg["params"]:
+            p2group[p] = (beta2, eps)
+
+    chunks = []
+    for p in params:
+        beta2, eps = p2group.get(p, (0.999, 1e-8))
+        st = optimizer.state.get(p, {})
+        v = st.get("exp_avg_sq", None)
+        if v is None:
+            chunks.append(torch.ones(p.numel(), device=p.device, dtype=p.dtype))
+            continue
+
+        v_hat = v
+        if bias_correction:
+            step = st.get("step", 0)
+            if isinstance(step, torch.Tensor):
+                step = int(step.item())
+            step = max(int(step), 1)
+            v_hat = v / (1.0 - (beta2 ** step))
+
+        P_diag = v_hat.sqrt().add(eps)
+        chunks.append(P_diag.rsqrt().reshape(-1))
+
+    return torch.cat(chunks)
+
+
+def _make_hvp(loss, params):
+    """
+    Hessian-vector product H @ v (flattened), using autograd.
+    """
+    grads = torch.autograd.grad(
+        loss, params, create_graph=True, retain_graph=True, allow_unused=True
+    )
+    g_flat = _flatten_grads_like_params(grads, params)
+
+    def hvp(v_flat):
+        dot = (g_flat * v_flat).sum()
+        hv = torch.autograd.grad(
+            dot, params, retain_graph=True, allow_unused=True
+        )
+        return _flatten_grads_like_params(hv, params).detach()
+
+    return hvp
+
+def _power_iter_top_eig(operator, dim, iters=20, tol=1e-4, device=None, dtype=None):
+    device = device or "cpu"
+    dtype = dtype or torch.float32
+    v = torch.randn(dim, device=device, dtype=dtype)
+    v = v / (v.norm() + 1e-12)
+
+    last = None
+    for _ in range(iters):
+        w = operator(v)
+        v = w / (w.norm() + 1e-12)
+
+        Av = operator(v)
+        lam = (v * Av).sum().item()
+
+        if last is not None and abs(lam - last) / (abs(last) + 1e-12) < tol:
+            last = lam
+            break
+        last = lam
+
+    return last
+
+def compute_adam_precond_lmax(net, optimizer, loss, *, bias_correction=True, power_iters=20):
+    """
+    Returns lambda_max(P^{-1/2} H P^{-1/2}) via power iteration,
+    where P = sqrt(v_hat) + eps from Adam/AdamW state.
+    """
+    params = _trainable_params(net)
+    hvp = _make_hvp(loss, params)
+    pinv_sqrt = _adam_pinv_sqrt_flat(optimizer, params, bias_correction=bias_correction)
+
+    def A(u):
+        u2 = pinv_sqrt * u
+        Hu2 = hvp(u2)
+        return pinv_sqrt * Hu2
+
+    lam = _power_iter_top_eig(A, dim=pinv_sqrt.numel(), iters=power_iters,
+                             device=pinv_sqrt.device, dtype=pinv_sqrt.dtype)
+
+    # Usually positive; keep raw in case you want debugging
+    return lam
+    
 # -------------------------------------
 # Section: Measurement Runner
 # -------------------------------------
@@ -749,6 +859,7 @@ class MeasurementRunner:
             'train_acc': np.nan, # NEW
             'test_acc': np.nan,  # NEW
             'train_test_gap': np.nan, # NEW
+            'lmax_precond_adam': np.nan, #NEW
         }
 
         if self.log_every_step:
@@ -809,6 +920,18 @@ class MeasurementRunner:
 
             preds = self.net(X_subset).squeeze(dim=-1)
             loss = self.loss_fn(preds, Y_subset)
+            if 'lmax_precond_adam' in self.measurements:
+                import torch.optim as optim
+                if isinstance(optimizer, (optim.Adam, optim.AdamW)):
+                    metrics['lmax_precond_adam'] = float(
+                        compute_adam_precond_lmax(
+                            net=self.net,
+                            optimizer=optimizer,
+                            loss=loss,
+                            bias_correction=True,
+                            power_iters=20,
+                        )
+                    )
 
             if self.eigenvector_cache is not None:
                 max_iterations = 100 if not self.use_power_iteration else 1000
@@ -877,8 +1000,6 @@ class MeasurementRunner:
                 f"Epoch {epoch + 1}, Step {step_in_epoch}: Total lambda max = {metrics['lmax']}, "
                 f"Loss = {metrics['full_loss']} !!!"
             )
-
-        
 
         if 'hessian_trace' in self.measurements:
             if frequency_calculator.should_measure('hessian_trace', ctx):
@@ -1133,47 +1254,6 @@ class MeasurementRunner:
                 f"Epoch {epoch + 1}, Step {step_in_epoch}: Batch Lambda Max = {metrics['batch_lmax']}, "
                 f"Loss = {loss.item()}"
             )
-    
-        # ----- NEW: Prototype per-sample stats over time -----
-        if self.prototype_data is not None and self.per_sample_cfg and self.per_sample_cfg['enabled']:
-            proto_every = self.per_sample_cfg["every"]
-            if step_number % proto_every == 0:
-                loss_type = 'ce' if isinstance(self.loss_fn, nn.CrossEntropyLoss) else 'mse'
-
-                proto_dir = self.ps_dir / "prototypes"
-                _ensure_dir(proto_dir)
-
-                for name, (X_p, Y_p) in self.prototype_data.items():
-                    X_p = X_p.to(self.device)
-                    Y_p = Y_p.to(self.device)
-
-                    # Per-sample stats
-                    stats = _per_sample_stats(
-                        self.net,
-                        self.loss_fn,
-                        X_p,
-                        Y_p,
-                        loss_type=loss_type,
-                        batch_size=len(X_p),
-                        device=self.device,
-                    )
-                    
-                    # NEW: Add batch sharpness for this prototype set
-                    # Compute full loss on this prototype set
-                    self.net.zero_grad()
-                    preds = self.net(X_p).squeeze(dim=-1)
-                    proto_loss = self.loss_fn(preds, Y_p)
-                    
-                    # Compute batch sharpness (gHg/g²)
-                    batch_sharpness = compute_grad_H_grad(proto_loss, self.net).item()
-                    
-                    # Add to stats
-                    stats['batch_sharpness'] = batch_sharpness
-                    stats['mean_loss'] = np.mean(stats['loss'])
-                    
-                    out_path = proto_dir / f"step_{step_number:05d}_{name}.npz"
-                    np.savez(out_path, **stats)
-
 
 
         # ----- NEW: Prototype per-sample stats over time -----
@@ -1277,6 +1357,9 @@ def train(
             lmax_decay_target_lr: float = 0.001,
             lmax_decay_steps: int = 10000,
             lmax_decay_initial_lr: float = None,
+            lmax_drop: bool = False,
+            lmax_drop_mult: float = 0.5,
+            lmax_drop_target_lr: float = None,
     ):
     
     # -------------------------------------
@@ -1482,7 +1565,19 @@ def train(
                 step_in_epoch=i,
                 step_number=step_number,
             )
+            if lmax_drop:
+                lmax_value = metrics.get('lmax', float('nan'))
+                if (not decay_active) and math.isfinite(lmax_value) and (lmax_value >= lmax_decay_threshold):
+                    decay_active = True  # reuse as "already dropped"
+                    old_lr = optimizer.param_groups[0]['lr']
+                    new_lr = old_lr * float(lmax_drop_mult)
+                    if lmax_drop_target_lr is not None:
+                        new_lr = max(new_lr, float(lmax_drop_target_lr))
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = new_lr
+                    print(f"[LR DROP] step={step_number} lmax={lmax_value:.4f} thresh={lmax_decay_threshold:.4f} lr: {old_lr:g} -> {new_lr:g}")
 
+                
             # --- Lmax-based Learning Rate Decay Logic ---
             if lmax_decay:
                 lmax_value = metrics.get('lmax', float('nan'))
@@ -1502,7 +1597,10 @@ def train(
                     new_lr = decay_start_lr + t * (lmax_decay_target_lr - decay_start_lr)
                     for pg in optimizer.param_groups:
                         pg['lr'] = new_lr
-
+    
+            if lmax_drop and lmax_decay:
+                raise ValueError("Use either --lmax-drop or --lmax-decay, not both.")
+            
             # --- Epoch-Level Loss Tracking ---
             if metrics['epoch_loss_update'] is not None:
                 if math.isnan(metrics['epoch_loss_update']):
@@ -1742,6 +1840,7 @@ def train(
                         "fisher_total_eigenval": "total_fisher_eigenval",
                         "gni": "GNI",
                         "full_accuracy": "accuracy",
+                        "lmax_precond_adam": "lambda_max_precond_adam",
                     }
                     for old_key, new_key in rename_map.items():
                         if old_key in wandb_metrics:
@@ -1977,6 +2076,8 @@ if __name__ == '__main__':
     parser.add_argument('--momentum', type=float, default=None, help='Momentum for SGD optimizer')
     parser.add_argument('--adam', action='store_true', help='If set, use Adam optimizer instead of SGD')
     parser.add_argument('--weight-decay', type=float, default=0.0)
+    parser.add_argument('--precond-lmax', action='store_true',
+        help='Log Adam-preconditioned top Hessian eigenvalue (AEoS sharpness).')
 
     # --- Measurement Flags (Primary) ---
     # parser.add_argument('--fullbs', action='store_true', help='If set, compute the lambda_max, aka FullBS')
@@ -2106,6 +2207,14 @@ if __name__ == '__main__':
                         help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
     parser.add_argument('--track-input-prototypes', action='store_true',
                         help='Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
+                        
+    # --- NEW: LR Decay/Drop ---
+    parser.add_argument('--lmax-drop', action='store_true',
+                        help='One-time LR drop once lambda_max exceeds threshold (2/initial_lr).')
+    parser.add_argument('--lmax-drop-mult', type=float, default=0.5,
+                        help='Multiply LR by this factor on trigger. (0.5 = 50%% drop, 0.8 = 20%% drop)')
+    parser.add_argument('--lmax-drop-target-lr', type=float, default=None,
+                        help='Optional floor: LR after drop is max(LR*mult, target).')
 
     # ----- Argument Parsing -----
     args = parser.parse_args()
@@ -2209,6 +2318,7 @@ if __name__ == '__main__':
     ('hessian_trace', args.hessian_trace),
     ('memorization_hessian_outliers', args.memorization_hessian_outliers),
     ('train_test_gap', args.train_test_gap),
+    ('lmax_precond_adam', args.precond_lmax),
     ] if enabled}
 
     # ----- Result Storage Setup -----
@@ -2417,6 +2527,9 @@ if __name__ == '__main__':
         lmax_decay_target_lr=args.lmax_decay_target_lr,
         lmax_decay_steps=args.lmax_decay_steps,
         lmax_decay_initial_lr=args.lr,
+        lmax_drop=args.lmax_drop,
+        lmax_drop_mult=args.lmax_drop_mult,
+        lmax_drop_target_lr=args.lmax_drop_target_lr,
     )
 
     if args.feature_prototypes:
