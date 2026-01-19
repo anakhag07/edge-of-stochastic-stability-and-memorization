@@ -2078,6 +2078,14 @@ if __name__ == '__main__':
     parser.add_argument('--lmax-decay-steps', type=int, default=10000,
                         help='Number of steps to linearly decay to target lr')
 
+    # --- LR Drop Configuration ---
+    parser.add_argument('--lmax-drop', action='store_true',
+                        help='One-time LR drop once lambda_max exceeds threshold (2/initial_lr).')
+    parser.add_argument('--lmax-drop-mult', type=float, default=0.5,
+                        help='Multiply LR by this factor on trigger. (0.5 = 50%% drop, 0.8 = 20%% drop)')
+    parser.add_argument('--lmax-drop-target-lr', type=float, default=None,
+                        help='Optional floor: LR after drop is max(LR*mult, target).')
+
     # --- Loss Configuration ---
     parser.add_argument('--stop-loss', '--stop_loss', type=float, default=None, help='Stop training if loss goes below this value')
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'ce'], help='Loss function to use (mse or ce)')
@@ -2232,14 +2240,6 @@ if __name__ == '__main__':
                         help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
     parser.add_argument('--track-input-prototypes', action='store_true',
                         help='Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
-                        
-    # --- NEW: LR Decay/Drop ---
-    parser.add_argument('--lmax-drop', action='store_true',
-                        help='One-time LR drop once lambda_max exceeds threshold (2/initial_lr).')
-    parser.add_argument('--lmax-drop-mult', type=float, default=0.5,
-                        help='Multiply LR by this factor on trigger. (0.5 = 50%% drop, 0.8 = 20%% drop)')
-    parser.add_argument('--lmax-drop-target-lr', type=float, default=None,
-                        help='Optional floor: LR after drop is max(LR*mult, target).')
 
     # ----- Argument Parsing -----
     args = parser.parse_args()
