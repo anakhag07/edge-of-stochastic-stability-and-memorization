@@ -2064,6 +2064,14 @@ def _compute_metrics_on_subset_data(
     if "grad_hessian_grad" in metrics:
         results["grad_hessian_grad"] = float(compute_grad_H_grad(loss_value, net).item())
 
+    if "per_example_loss_mean" in metrics or "per_example_loss_std" in metrics:
+        with torch.no_grad():
+            per_example_losses = compute_per_example_losses(net, X_subset, Y_subset, loss_fn)
+        if "per_example_loss_mean" in metrics:
+            results["per_example_loss_mean"] = float(per_example_losses.mean().item())
+        if "per_example_loss_std" in metrics:
+            results["per_example_loss_std"] = float(per_example_losses.std(unbiased=False).item())
+
     _maybe_add_batch_sharpness("batch_sharpness", expectation_inside_default=False)
     _maybe_add_batch_sharpness("batch_sharpness_exp_inside", expectation_inside_default=True)
 
