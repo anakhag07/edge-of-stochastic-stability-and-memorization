@@ -722,10 +722,19 @@ def _make_hvp(loss, params):
 
     return hvp
 
-def _power_iter_top_eig(operator, dim, iters=20, tol=1e-4, device=None, dtype=None):
+def _power_iter_top_eig(operator, dim, iters=20, tol=1e-4, device=None, dtype=None, init_v=None):
     device = device or "cpu"
     dtype = dtype or torch.float32
-    v = torch.randn(dim, device=device, dtype=dtype)
+
+    if init_v is None:
+        v = torch.randn(dim, device=device, dtype=dtype)
+    else:
+        v = init_v.detach()
+        if v.numel() != dim:
+            v = torch.randn(dim, device=device, dtype=dtype)
+        else:
+            v = v.to(device=device, dtype=dtype)
+
     v = v / (v.norm() + 1e-12)
 
     last = None
@@ -741,28 +750,43 @@ def _power_iter_top_eig(operator, dim, iters=20, tol=1e-4, device=None, dtype=No
             break
         last = lam
 
-    return last
+    return last, v.detach()
 
-def compute_adam_precond_lmax(net, optimizer, loss, *, bias_correction=True, power_iters=20):
-    """
-    Returns lambda_max(P^{-1/2} H P^{-1/2}) via power iteration,
-    where P = sqrt(v_hat) + eps from Adam/AdamW state.
-    """
+def compute_adam_precond_lmax(
+    net, optimizer, loss_fn, X_probe, Y_probe, *,
+    power_iters=50, prev_vec=None, bias_correction=True, clamp_pinv_sqrt_max=1e3,
+):
     params = _trainable_params(net)
-    hvp = _make_hvp(loss, params)
     pinv_sqrt = _adam_pinv_sqrt_flat(optimizer, params, bias_correction=bias_correction)
+    if clamp_pinv_sqrt_max is not None:
+        pinv_sqrt = torch.clamp(pinv_sqrt, max=float(clamp_pinv_sqrt_max))
+
+    was_training = net.training
+    net.eval()
+
+    out = net(X_probe)
+    loss_probe = loss_fn(out, Y_probe)
+
+    hvp = _make_hvp(loss_probe, params)
 
     def A(u):
         u2 = pinv_sqrt * u
-        Hu2 = hvp(u2)
-        return pinv_sqrt * Hu2
+        return pinv_sqrt * hvp(u2)
 
-    lam = _power_iter_top_eig(A, dim=pinv_sqrt.numel(), iters=power_iters,
-                             device=pinv_sqrt.device, dtype=pinv_sqrt.dtype)
+    lam, vec = _power_iter_top_eig(
+        A, dim=pinv_sqrt.numel(),
+        iters=power_iters,
+        device=pinv_sqrt.device,
+        dtype=pinv_sqrt.dtype,
+        init_v=prev_vec,
+    )
 
-    # Usually positive; keep raw in case you want debugging
-    return lam
-    
+    if was_training: net.train()
+    return float(lam), vec
+
+
+
+
 # -------------------------------------
 # Section: Measurement Runner
 # -------------------------------------
@@ -800,10 +824,19 @@ class MeasurementRunner:
         per_sample_cfg=None,
         subset_tracking_cfgs=None,
         log_every_step: bool = False,
+        precond_pi_vec = None,
     ):
         self.net = net
         self.loss_fn = loss_fn
         self.X, self.Y = full_inputs
+        
+        # NEW: fixed probe batch for preconditioned Adam sharpness 
+        self._precond_probe_size = 4096
+        n = len(self.X)
+        g = torch.Generator(device="cpu")
+        g.manual_seed(12345)
+        m = min(self._precond_probe_size, n)
+        self._precond_probe_idx = torch.randperm(n, generator=g)[:m]
 
         # New: Test inputs handling
         if test_inputs is not None:
@@ -826,6 +859,7 @@ class MeasurementRunner:
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
         self.memorization_outlier_frac = memorization_outlier_frac 
+        self._precond_pi_vec = precond_pi_vec
 
         # NEW: Per-sample config
         self.full_inputs_test = full_inputs_test
@@ -947,7 +981,10 @@ class MeasurementRunner:
             'train_acc': np.nan, # NEW
             'test_acc': np.nan,  # NEW
             'train_test_gap': np.nan, # NEW
-            'lmax_precond_adam': np.nan, #NEW
+            'lmax_precond_adam': np.nan,
+            'adam_edge_threshold': np.nan,
+            'adam_edge_ratio': np.nan,
+
         }
 
         if self.log_every_step:
@@ -1011,15 +1048,41 @@ class MeasurementRunner:
             if 'lmax_precond_adam' in self.measurements:
                 import torch.optim as optim
                 if isinstance(optimizer, (optim.Adam, optim.AdamW)):
-                    metrics['lmax_precond_adam'] = float(
-                        compute_adam_precond_lmax(
-                            net=self.net,
-                            optimizer=optimizer,
-                            loss=loss,
-                            bias_correction=True,
-                            power_iters=20,
-                        )
+
+                    # NEW: measure on fixed probe batch (not X_subset / random)
+                    was_training = self.net.training
+                    self.net.eval()
+
+                    idxp = self._precond_probe_idx.to(self.X.device)
+                    Xp = self.X[idxp]
+                    Yp = self.Y[idxp]
+
+                    preds_p = self.net(Xp).squeeze(dim=-1)
+                    loss_p = self.loss_fn(preds_p, Yp)
+
+                    lam, v = compute_adam_precond_lmax(
+                        net=self.net,
+                        optimizer=optimizer,
+                        loss_fn=self.loss_fn,
+                        X_probe=Xp,
+                        Y_probe=Yp,
+                        power_iters=50,
+                        prev_vec=self._precond_pi_vec,
                     )
+
+                    metrics["lmax_precond_adam"] = float(lam)
+                    self._precond_pi_vec = v
+
+                    beta1 = float(optimizer.param_groups[0].get("betas", (0.9, 0.999))[0])
+                    c = 2.0 * (1.0 + beta1) / (1.0 - beta1)  
+                    lr = float(optimizer.param_groups[0]["lr"])
+                    metrics["adam_edge_threshold"] = c / max(lr, 1e-30)
+                    metrics["adam_edge_ratio"] = (lr * float(lam)) / c
+
+                    if was_training:
+                        self.net.train()
+
+
 
             if self.eigenvector_cache is not None:
                 max_iterations = 100 if not self.use_power_iteration else 1000
@@ -1649,7 +1712,7 @@ def train(
 
             X_batch = X_shuffled[i*batch_size : (i+1)*batch_size]
             Y_batch = Y_shuffled[i*batch_size : (i+1)*batch_size]
-            # Track batch indices for Gauss-Newton quadratic approximation
+
             if permute:
                 batch_indices = shuffle[i*batch_size : (i+1)*batch_size]
             else:
@@ -1668,16 +1731,29 @@ def train(
                 step_number=step_number,
             )
             if lmax_drop:
-                lmax_value = metrics.get('lmax', float('nan'))
-                if (not decay_active) and math.isfinite(lmax_value) and (lmax_value >= lmax_decay_threshold):
-                    decay_active = True  # reuse as "already dropped"
-                    old_lr = optimizer.param_groups[0]['lr']
-                    new_lr = old_lr * float(lmax_drop_mult)
-                    if lmax_drop_target_lr is not None:
-                        new_lr = max(new_lr, float(lmax_drop_target_lr))
-                    for pg in optimizer.param_groups:
-                        pg['lr'] = new_lr
-                    print(f"[LR DROP] step={step_number} lmax={lmax_value:.4f} thresh={lmax_decay_threshold:.4f} lr: {old_lr:g} -> {new_lr:g}")
+                # Adam: trigger off AEoS ratio ~ 1
+                if args.adam and ('adam_edge_ratio' in metrics):
+                    r = metrics.get('adam_edge_ratio', float('nan'))
+                    if (not decay_active) and math.isfinite(r) and (r >= 1.0):
+                        decay_active = True
+                        old_lr = optimizer.param_groups[0]['lr']
+                        new_lr = old_lr * float(lmax_drop_mult)
+                        if lmax_drop_target_lr is not None:
+                            new_lr = max(new_lr, float(lmax_drop_target_lr))
+                        for pg in optimizer.param_groups:
+                            pg['lr'] = new_lr
+                        print(f"[ADAM LR DROP] step={step_number} edge_ratio={r:.3f} lr: {old_lr:g} -> {new_lr:g}")
+                else:
+                    lmax_value = metrics.get('lmax', float('nan'))
+                    if (not decay_active) and math.isfinite(lmax_value) and (lmax_value >= lmax_decay_threshold):
+                        decay_active = True  # reuse as "already dropped"
+                        old_lr = optimizer.param_groups[0]['lr']
+                        new_lr = old_lr * float(lmax_drop_mult)
+                        if lmax_drop_target_lr is not None:
+                            new_lr = max(new_lr, float(lmax_drop_target_lr))
+                        for pg in optimizer.param_groups:
+                            pg['lr'] = new_lr
+                        print(f"[LR DROP] step={step_number} lmax={lmax_value:.4f} thresh={lmax_decay_threshold:.4f} lr: {old_lr:g} -> {new_lr:g}")
 
                 
             # --- Lmax-based Learning Rate Decay Logic ---
@@ -1957,6 +2033,9 @@ def train(
                         "gni": "GNI",
                         "full_accuracy": "accuracy",
                         "lmax_precond_adam": "lambda_max_precond_adam",
+                        "adam_edge_threshold": "adam_edge_threshold",
+                        "adam_edge_ratio": "adam_edge_ratio",
+
                     }
                     for old_key, new_key in rename_map.items():
                         if old_key in wandb_metrics:
@@ -2467,6 +2546,7 @@ if __name__ == '__main__':
     # --- Unpack dataset and build tuple_data ---
     train_x, train_y, test_x, test_y = data  
     tuple_data = (train_x, train_y, test_x, test_y)
+
 
     n_proto = max(1, int(round(args.num_data * 0.05)))
     if args.train_input_x_outliers is not None:
