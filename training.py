@@ -62,6 +62,13 @@ DATASET_FOLDER = Path(os.environ.get('DATASETS'))
 RES_FOLDER = Path(os.environ.get('RESULTS'))
 
 KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad", "batch_sharpness"]
+TRAIN_OUTLIER_TRACKING_METRICS = [
+    "per_example_loss_mean",
+    "per_example_loss_std",
+    "lambda_max",
+    "grad_hessian_grad",
+    "batch_sharpness",
+]
 
 
 def _load_reference_knn_indices(dataset_name: str, model_name: str, run_name: str) -> Dict[int, List[int]]:
@@ -156,6 +163,87 @@ INPUT_PROTOTYPE_TRACKING_MAP = {
     'x_outlier': 'input_space_prototypes/synthetic_x_outlier',
     'y_outlier': 'input_space_prototypes/synthetic_y_outlier',
 }
+
+
+def _coerce_labels_like(ref_labels: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    if ref_labels.ndim > 1:
+        num_classes = ref_labels.shape[1]
+        return F.one_hot(labels.long(), num_classes=num_classes).to(dtype=ref_labels.dtype)
+    return labels.to(dtype=ref_labels.dtype)
+
+
+def _select_outlier_subset_by_class(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    classes: Tuple[int, int],
+    count_per_class: int,
+    seed: int,
+    subset_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if count_per_class < 1:
+        raise ValueError(f"{subset_name} count per class must be >= 1")
+
+    labels = Y
+    if labels.ndim > 1:
+        labels = labels.argmax(dim=1)
+    labels = labels.to(dtype=torch.long)
+
+    rng = np.random.default_rng(seed)
+    chosen_indices = []
+    for class_id in classes:
+        class_indices = (labels == class_id).nonzero(as_tuple=False).view(-1).cpu().numpy()
+        if len(class_indices) < count_per_class:
+            raise ValueError(
+                f"{subset_name} only has {len(class_indices)} samples for class {class_id}; "
+                f"cannot select {count_per_class}."
+            )
+        picked = rng.choice(class_indices, count_per_class, replace=False)
+        chosen_indices.append(torch.tensor(picked, dtype=torch.long, device=X.device))
+
+    indices = torch.cat(chosen_indices, dim=0)
+    return X.index_select(0, indices), Y.index_select(0, indices)
+
+
+def prepare_train_outlier_subset_configs(
+    outlier_data: dict,
+    base_batch_size: int,
+) -> List[dict]:
+    if not outlier_data:
+        return []
+
+    configs = []
+    for name, tensors in outlier_data.items():
+        if name not in ("x_outlier", "y_outlier"):
+            continue
+        X_p, Y_p = tensors
+        if X_p is None or Y_p is None:
+            continue
+        log_prefix = INPUT_PROTOTYPE_TRACKING_MAP.get(name, f"train_outlier/{name}")
+        X_cpu = X_p.detach().cpu()
+        Y_cpu = Y_p.detach().cpu()
+        if X_cpu.numel() == 0:
+            continue
+        batch_size = min(base_batch_size, X_cpu.shape[0]) if base_batch_size else X_cpu.shape[0]
+        configs.append({
+            "enabled": True,
+            "subsets": [{
+                "name": name,
+                "class_id": None,
+                "X_tensor": X_cpu,
+                "Y_tensor": Y_cpu,
+            }],
+            "metrics": list(TRAIN_OUTLIER_TRACKING_METRICS),
+            "metric_kwargs": {
+                "batch_sharpness": {
+                    "batch_size": batch_size,
+                    "n_estimates": 1,
+                    "min_estimates": 1,
+                    "eps": 1.0,
+                }
+            },
+            "log_prefix": log_prefix,
+        })
+    return configs
 
 
 def prepare_feature_prototype_subset_configs(prototype_data: dict) -> List[dict]:
@@ -2240,6 +2328,10 @@ if __name__ == '__main__':
                         help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
     parser.add_argument('--track-input-prototypes', action='store_true',
                         help='Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
+    parser.add_argument('--train-input-x-outliers', type=int, default=None,
+                        help='Augment the training set with this many input-space x-outliers per class')
+    parser.add_argument('--train-input-y-outliers', type=int, default=None,
+                        help='Augment the training set with this many input-space y-outliers per class')
 
     # ----- Argument Parsing -----
     args = parser.parse_args()
@@ -2285,6 +2377,14 @@ if __name__ == '__main__':
 
     if args.steps is not None and args.epochs is not None:
         raise ValueError("You should provide either epochs or steps, not both")
+    if args.track_input_prototypes and (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None):
+        raise ValueError("Use either --track-input-prototypes or --train-input-*-outliers, not both.")
+
+    for flag_name in ("train_input_x_outliers", "train_input_y_outliers"):
+        flag_value = getattr(args, flag_name)
+        if flag_value is not None and flag_value < 1:
+            raise ValueError(f"--{flag_name.replace('_', '-')} must be >= 1 when provided")
+
     if args.memorization_outlier_frac <= 0 or args.memorization_outlier_frac >= 1:
         raise ValueError("--memorization-outlier-frac must be in (0, 1)")
 
@@ -2369,6 +2469,10 @@ if __name__ == '__main__':
     tuple_data = (train_x, train_y, test_x, test_y)
 
     n_proto = max(1, int(round(args.num_data * 0.05)))
+    if args.train_input_x_outliers is not None:
+        n_proto = max(n_proto, args.train_input_x_outliers)
+    if args.train_input_y_outliers is not None:
+        n_proto = max(n_proto, args.train_input_y_outliers)
     print(f"[sanity] args.num_data={args.num_data} -> n_proto={n_proto}")
 
     prototype_data = generate_prototype_sets(train_x, train_y, tuple(args.classes), n_prototype=n_proto)
@@ -2388,6 +2492,54 @@ if __name__ == '__main__':
         )
 
     prototype_data = combined_prototype_data
+
+    train_outlier_tracking = {}
+    if args.train_input_x_outliers is not None or args.train_input_y_outliers is not None:
+        classes = tuple(args.classes)
+        if len(classes) != 2:
+            raise ValueError("Training input outliers requires exactly two classes.")
+
+        outlier_augments = []
+        seed_base = (args.dataset_seed or 0) + 100
+
+        if args.train_input_x_outliers is not None:
+            X_x, Y_x = prototype_data["x_outlier"]
+            swapped_classes = (classes[1], classes[0])
+            swapped_proto = generate_prototype_sets(train_x, train_y, swapped_classes, n_prototype=n_proto)
+            X_x_swapped, Y_x_swapped = swapped_proto["x_outlier"]
+            X_x_all = torch.cat([X_x, X_x_swapped], dim=0)
+            Y_x_all = torch.cat([Y_x, Y_x_swapped], dim=0)
+            X_x_sel, Y_x_sel = _select_outlier_subset_by_class(
+                X_x_all,
+                Y_x_all,
+                classes,
+                args.train_input_x_outliers,
+                seed_base,
+                "x_outlier",
+            )
+            train_outlier_tracking["x_outlier"] = (X_x_sel, Y_x_sel)
+            outlier_augments.append((X_x_sel, _coerce_labels_like(train_y, Y_x_sel)))
+
+        if args.train_input_y_outliers is not None:
+            X_y, Y_y = prototype_data["y_outlier"]
+            X_y_sel, Y_y_sel = _select_outlier_subset_by_class(
+                X_y,
+                Y_y,
+                classes,
+                args.train_input_y_outliers,
+                seed_base + 1,
+                "y_outlier",
+            )
+            train_outlier_tracking["y_outlier"] = (X_y_sel, Y_y_sel)
+            outlier_augments.append((X_y_sel, _coerce_labels_like(train_y, Y_y_sel)))
+
+        if outlier_augments:
+            aug_X = [train_x] + [payload[0] for payload in outlier_augments]
+            aug_Y = [train_y] + [payload[1] for payload in outlier_augments]
+            train_x = torch.cat(aug_X, dim=0)
+            train_y = torch.cat(aug_Y, dim=0)
+            data = (train_x, train_y, test_x, test_y)
+            tuple_data = data
 
     # --- Model Construction ---
     name = args.model
@@ -2489,6 +2641,8 @@ if __name__ == '__main__':
     subset_tracking_cfgs.extend(prepare_feature_prototype_subset_configs(prototype_data))
     if args.track_input_prototypes:
         subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prototype_data, base_batch_size=batch_size))
+    elif train_outlier_tracking:
+        subset_tracking_cfgs.extend(prepare_train_outlier_subset_configs(train_outlier_tracking, base_batch_size=batch_size))
     
     per_sample_cfg = None
     if args.per_sample:
