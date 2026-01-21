@@ -2408,9 +2408,11 @@ if __name__ == '__main__':
     parser.add_argument('--track-input-prototypes', action='store_true',
                         help='Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
     parser.add_argument('--train-input-x-outliers', type=int, default=None,
-                        help='Augment the training set with this many input-space x-outliers per class')
+                        help='Augment the training set with this many input-space x-outliers per class; '
+                             'also logs input-space prototype subsets')
     parser.add_argument('--train-input-y-outliers', type=int, default=None,
-                        help='Augment the training set with this many input-space y-outliers per class')
+                        help='Augment the training set with this many input-space y-outliers per class; '
+                             'also logs input-space prototype subsets')
 
     # ----- Argument Parsing -----
     args = parser.parse_args()
@@ -2456,8 +2458,7 @@ if __name__ == '__main__':
 
     if args.steps is not None and args.epochs is not None:
         raise ValueError("You should provide either epochs or steps, not both")
-    if args.track_input_prototypes and (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None):
-        raise ValueError("Use either --track-input-prototypes or --train-input-*-outliers, not both.")
+    # Allow tracking input prototypes even when training with input outliers.
 
     for flag_name in ("train_input_x_outliers", "train_input_y_outliers"):
         flag_value = getattr(args, flag_name)
@@ -2598,6 +2599,7 @@ if __name__ == '__main__':
                 "x_outlier",
             )
             train_outlier_tracking["x_outlier"] = (X_x_sel, Y_x_sel)
+            prototype_data["x_outlier"] = (X_x_sel, Y_x_sel)
             outlier_augments.append((X_x_sel, _coerce_labels_like(train_y, Y_x_sel)))
 
         if args.train_input_y_outliers is not None:
@@ -2611,6 +2613,7 @@ if __name__ == '__main__':
                 "y_outlier",
             )
             train_outlier_tracking["y_outlier"] = (X_y_sel, Y_y_sel)
+            prototype_data["y_outlier"] = (X_y_sel, Y_y_sel)
             outlier_augments.append((X_y_sel, _coerce_labels_like(train_y, Y_y_sel)))
 
         if outlier_augments:
@@ -2719,10 +2722,8 @@ if __name__ == '__main__':
 
     subset_tracking_cfgs = prepare_knn_subset_tracking_configs(args, dataset, args.model, data) if args.track_knn_outliers_from else []
     subset_tracking_cfgs.extend(prepare_feature_prototype_subset_configs(prototype_data))
-    if args.track_input_prototypes:
+    if args.track_input_prototypes or train_outlier_tracking:
         subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prototype_data, base_batch_size=batch_size))
-    elif train_outlier_tracking:
-        subset_tracking_cfgs.extend(prepare_train_outlier_subset_configs(train_outlier_tracking, base_batch_size=batch_size))
     
     per_sample_cfg = None
     if args.per_sample:
