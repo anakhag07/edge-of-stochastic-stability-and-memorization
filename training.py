@@ -666,28 +666,24 @@ def _power_iter_top_eig(operator, dim, iters=20, tol=1e-4, device=None, dtype=No
 
 def compute_adam_precond_lmax(
     net, optimizer, loss_fn, X_probe, Y_probe, *,
-    bias_correction=True,
-    power_iters=50,
-    prev_vec=None,
-    clamp_pinv_sqrt_max=1e3,
+    power_iters=50, prev_vec=None, bias_correction=True, clamp_pinv_sqrt_max=1e3,
 ):
     params = _trainable_params(net)
     pinv_sqrt = _adam_pinv_sqrt_flat(optimizer, params, bias_correction=bias_correction)
     if clamp_pinv_sqrt_max is not None:
         pinv_sqrt = torch.clamp(pinv_sqrt, max=float(clamp_pinv_sqrt_max))
 
-    # --- CE probe loss (NO squeeze) ---
     was_training = net.training
     net.eval()
-    logits = net(X_probe)  # [B, C]
-    loss_probe = F.cross_entropy(logits, Y_probe.long(), reduction="mean")
 
-    hvp = _make_hvp(loss_probe, params)  # v -> H v (flat)
+    out = net(X_probe)
+    loss_probe = loss_fn(out, Y_probe)
+
+    hvp = _make_hvp(loss_probe, params)
 
     def A(u):
         u2 = pinv_sqrt * u
-        Hu2 = hvp(u2)
-        return pinv_sqrt * Hu2
+        return pinv_sqrt * hvp(u2)
 
     lam, vec = _power_iter_top_eig(
         A, dim=pinv_sqrt.numel(),
@@ -697,9 +693,9 @@ def compute_adam_precond_lmax(
         init_v=prev_vec,
     )
 
-    if was_training:
-        net.train()
+    if was_training: net.train()
     return float(lam), vec
+
 
 
 
@@ -989,7 +985,6 @@ class MeasurementRunner:
                     metrics["lmax_precond_adam"] = float(lam)
                     self._precond_pi_vec = v
 
-                    # NEW: threshold (beta1=0.9 => 38/lr)
                     beta1 = float(optimizer.param_groups[0].get("betas", (0.9, 0.999))[0])
                     c = 2.0 * (1.0 + beta1) / (1.0 - beta1)  
                     lr = float(optimizer.param_groups[0]["lr"])
@@ -1629,7 +1624,7 @@ def train(
 
             X_batch = X_shuffled[i*batch_size : (i+1)*batch_size]
             Y_batch = Y_shuffled[i*batch_size : (i+1)*batch_size]
-            # Track batch indices for Gauss-Newton quadratic approximation
+
             if permute:
                 batch_indices = shuffle[i*batch_size : (i+1)*batch_size]
             else:
@@ -2452,8 +2447,9 @@ if __name__ == '__main__':
     train_x, train_y, test_x, test_y = data  
     tuple_data = (train_x, train_y, test_x, test_y)
 
+
     n_proto = max(1, int(round(args.num_data * 0.05)))
-    print(f"[sanity] args.num_data={args.num_data} -> n_proto={n_proto}")
+
 
     prototype_data = generate_prototype_sets(train_x, train_y, tuple(args.classes), n_prototype=n_proto)
 
