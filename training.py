@@ -2585,9 +2585,10 @@ if __name__ == '__main__':
     proto_frac = 0.05
     if args.track_input_prototypes and args.input_prototype_holdout_frac is not None:
         proto_frac = args.input_prototype_holdout_frac
-    n_proto = max(1, int(round(args.num_data * proto_frac)))
     if args.track_input_prototypes and args.input_prototype_holdout_per_class is not None:
-        n_proto = max(n_proto, args.input_prototype_holdout_per_class)
+        n_proto = args.input_prototype_holdout_per_class
+    else:
+        n_proto = max(1, int(round(args.num_data * proto_frac)))
     if args.train_input_x_outliers is not None:
         n_proto = max(n_proto, args.train_input_x_outliers)
     if args.train_input_y_outliers is not None:
@@ -2693,6 +2694,13 @@ if __name__ == '__main__':
             train_y = torch.cat(aug_Y, dim=0)
             data = (train_x, train_y, test_x, test_y)
             tuple_data = data
+
+    effective_train_len = int(train_x.shape[0])
+    if effective_train_len == 0:
+        raise ValueError("Training set is empty after holdout/augmentation.")
+    if batch_size > effective_train_len:
+        print(f"[batch] reducing batch size from {batch_size} to {effective_train_len} to match training set size")
+        batch_size = effective_train_len
 
     # --- Model Construction ---
     name = args.model
@@ -2814,7 +2822,7 @@ if __name__ == '__main__':
         data=tuple_data,
         max_epochs=args.epochs,
         max_steps=args.steps,
-        batch_size=args.batch,
+        batch_size=batch_size,
         save_to=run_folder,
         device=device,
         loss_fn=loss_fn,

@@ -556,7 +556,7 @@ def generate_prototype_sets(
         n_prototype = max(1, int(round(X_train.shape[0] * prototype_frac)))
 
     class_0, class_1 = classes
-    X_0, X_1, _, _, class_labels = _split_by_classes(X_train, Y_train, classes)
+    X_0, X_1, idx_0, idx_1, class_labels = _split_by_classes(X_train, Y_train, classes)
 
     n0, n1 = X_0.size(0), X_1.size(0)
 
