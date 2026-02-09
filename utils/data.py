@@ -538,7 +538,15 @@ def _assign_synthetic_to_real(
 
     return torch.tensor(assigned, dtype=torch.long)
 
-def generate_prototype_sets(X_train, Y_train, classes, n_prototype=None, prototype_frac=0.05):
+def generate_prototype_sets(
+    X_train,
+    Y_train,
+    classes,
+    n_prototype=None,
+    prototype_frac=0.05,
+    *,
+    return_indices: bool = False,
+):
 
     """
     Generates prototype sets: boundary, x_outlier, y_outlier.
@@ -548,7 +556,7 @@ def generate_prototype_sets(X_train, Y_train, classes, n_prototype=None, prototy
         n_prototype = max(1, int(round(X_train.shape[0] * prototype_frac)))
 
     class_0, class_1 = classes
-    X_0, X_1, _, _, class_labels = _split_by_classes(X_train, Y_train, classes)
+    X_0, X_1, idx_0, idx_1, class_labels = _split_by_classes(X_train, Y_train, classes)
 
     n0, n1 = X_0.size(0), X_1.size(0)
 
@@ -632,6 +640,9 @@ def generate_prototype_sets(X_train, Y_train, classes, n_prototype=None, prototy
 
     idx_0_boundary = torch.tensor(boundary_local_indices[class_0], dtype=torch.long)
     idx_1_boundary = torch.tensor(boundary_local_indices[class_1], dtype=torch.long)
+    boundary_idx_0_global = idx_0.index_select(0, idx_0_boundary)
+    boundary_idx_1_global = idx_1.index_select(0, idx_1_boundary)
+    boundary_global_idx = torch.cat([boundary_idx_0_global, boundary_idx_1_global], dim=0)
 
     X_boundary = T.cat([X_0[idx_0_boundary], X_1[idx_1_boundary]], dim=0)
     Y_boundary = T.cat([
@@ -677,13 +688,22 @@ def generate_prototype_sets(X_train, Y_train, classes, n_prototype=None, prototy
     # Concatenate to form the final Inlier set
     X_inlier = T.cat([X_inlier_0, X_inlier_1], dim=0)
     Y_inlier = T.cat([Y_inlier_0, Y_inlier_1], dim=0)
+    inlier_idx_0_global = idx_0.index_select(0, idx_0_near)
+    inlier_idx_1_global = idx_1.index_select(0, idx_1_near)
+    inlier_global_idx = torch.cat([inlier_idx_0_global, inlier_idx_1_global], dim=0)
 
-    return {
+    prototypes = {
         'boundary': (X_boundary, Y_boundary),
         'x_outlier': (X_x_outlier, Y_x_outlier),
         'y_outlier': (X_y_outlier, Y_y_outlier),
         'inliers': (X_inlier, Y_inlier),
     }
+    if return_indices:
+        return prototypes, {
+            'boundary': boundary_global_idx,
+            'inliers': inlier_global_idx,
+        }
+    return prototypes
 
 
 def generate_feature_space_prototype_sets(
