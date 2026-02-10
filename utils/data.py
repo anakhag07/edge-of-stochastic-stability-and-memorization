@@ -706,6 +706,65 @@ def generate_prototype_sets(
     return prototypes
 
 
+def _select_indices_by_class(
+    labels: T.Tensor,
+    classes: tuple,
+    count_per_class: int,
+) -> T.Tensor:
+    if count_per_class < 1:
+        raise ValueError("count_per_class must be >= 1")
+
+    if labels.ndim > 1:
+        labels = labels.argmax(dim=1)
+    labels = labels.to(dtype=torch.long)
+
+    selected = []
+    for class_id in classes:
+        class_idx = (labels == class_id).nonzero(as_tuple=False).view(-1)
+        if class_idx.numel() == 0:
+            continue
+        take = min(count_per_class, class_idx.numel())
+        selected.append(class_idx[:take])
+
+    if not selected:
+        return torch.empty((0,), dtype=torch.long)
+
+    return torch.cat(selected, dim=0)
+
+
+def trim_prototype_sets(
+    prototypes: Dict[str, Tuple[T.Tensor, T.Tensor]],
+    classes: tuple,
+    counts_by_subset: Optional[Dict[str, int]] = None,
+    indices: Optional[Dict[str, T.Tensor]] = None,
+) -> Tuple[Dict[str, Tuple[T.Tensor, T.Tensor]], Optional[Dict[str, T.Tensor]]]:
+    if not counts_by_subset:
+        return prototypes, indices
+
+    trimmed = {}
+    trimmed_indices = {} if indices is not None else None
+
+    for name, (X, Y) in prototypes.items():
+        count = counts_by_subset.get(name)
+        if count is None:
+            trimmed[name] = (X, Y)
+            if trimmed_indices is not None and indices and name in indices:
+                trimmed_indices[name] = indices[name]
+            continue
+
+        selected = _select_indices_by_class(Y, classes, count)
+        selected = selected.to(device=X.device)
+        trimmed[name] = (X.index_select(0, selected), Y.index_select(0, selected))
+
+        if trimmed_indices is not None and indices and name in indices:
+            idx_tensor = indices[name]
+            if not torch.is_tensor(idx_tensor):
+                idx_tensor = torch.tensor(idx_tensor, dtype=torch.long)
+            trimmed_indices[name] = idx_tensor.index_select(0, selected.to(idx_tensor.device))
+
+    return trimmed, trimmed_indices
+
+
 def generate_feature_space_prototype_sets(
     net: Optional[nn.Module],
     Y_train: T.Tensor,
