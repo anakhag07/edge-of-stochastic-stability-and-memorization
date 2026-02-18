@@ -10,7 +10,7 @@ from pathlib import Path
 import math
 import random
 import argparse
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch.nn.functional as F
 import time
@@ -183,6 +183,158 @@ def _build_input_prototype_counts(args) -> Dict[str, int]:
     if args.input_prototypes_y_outlier_count is not None:
         counts["y_outlier"] = args.input_prototypes_y_outlier_count
     return counts
+
+
+_INPUT_PROTOTYPE_SUBSETS = {
+    "boundary",
+    "inliers",
+    "x_outlier",
+    "y_outlier",
+}
+
+
+def _parse_input_prototype_holdout_counts(raw: str) -> Dict[str, int]:
+    if raw is None:
+        return {}
+    value = raw.strip()
+    if not value:
+        return {}
+
+    counts = {}
+    for part in value.split(","):
+        if not part.strip():
+            continue
+        if "=" not in part:
+            raise ValueError(
+                "--input-prototypes-holdout-count expects comma-separated key=value pairs "
+                "like boundary=10,inliers=10,x_outlier=5,y_outlier=5"
+            )
+        key, raw_count = part.split("=", 1)
+        key = key.strip().lower().replace("-", "_")
+        if key not in _INPUT_PROTOTYPE_SUBSETS:
+            raise ValueError(
+                f"Unknown input prototype subset '{key}' in --input-prototypes-holdout-count. "
+                f"Expected one of {sorted(_INPUT_PROTOTYPE_SUBSETS)}."
+            )
+        try:
+            count = int(raw_count)
+        except ValueError as exc:
+            raise ValueError(
+                f"Holdout count for '{key}' must be an integer (got '{raw_count}')."
+            ) from exc
+        if count < 1:
+            raise ValueError(f"Holdout count for '{key}' must be >= 1.")
+        counts[key] = count
+    return counts
+
+
+def _split_prototype_subset_by_class(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    classes: Tuple[int, int],
+    holdout_count: int,
+    seed: int,
+    subset_name: str,
+):
+    if holdout_count <= 0:
+        empty = (X[:0], Y[:0])
+        full_idx = torch.arange(X.shape[0], dtype=torch.long, device=X.device)
+        empty_idx = torch.empty((0,), dtype=torch.long, device=X.device)
+        return (X, Y), empty, full_idx, empty_idx
+
+    labels = Y
+    if labels.ndim > 1:
+        labels = labels.argmax(dim=1)
+    labels = labels.to(dtype=torch.long).cpu()
+
+    rng = np.random.default_rng(seed)
+    selected = []
+    for class_id in classes:
+        class_idx = (labels == class_id).nonzero(as_tuple=False).view(-1).cpu().numpy()
+        if len(class_idx) == 0:
+            print(
+                f"Warning: input prototype subset '{subset_name}' has no samples for class {class_id}; "
+                "skipping holdout for this class."
+            )
+            continue
+        if len(class_idx) < holdout_count:
+            raise ValueError(
+                f"Holdout count {holdout_count} for '{subset_name}' exceeds available "
+                f"samples ({len(class_idx)}) in class {class_id}."
+            )
+        chosen = rng.choice(class_idx, holdout_count, replace=False)
+        selected.append(torch.tensor(chosen, dtype=torch.long))
+
+    if not selected:
+        empty = (X[:0], Y[:0])
+        full_idx = torch.arange(X.shape[0], dtype=torch.long, device=X.device)
+        empty_idx = torch.empty((0,), dtype=torch.long, device=X.device)
+        return (X, Y), empty, full_idx, empty_idx
+
+    holdout_idx = torch.cat(selected, dim=0)
+    holdout_idx = torch.unique(holdout_idx, sorted=False).to(device=X.device)
+
+    mask = torch.ones(X.shape[0], dtype=torch.bool, device=X.device)
+    mask[holdout_idx] = False
+    train_idx = mask.nonzero(as_tuple=False).view(-1)
+
+    train_subset = (X.index_select(0, train_idx), Y.index_select(0, train_idx))
+    holdout_subset = (X.index_select(0, holdout_idx), Y.index_select(0, holdout_idx))
+    return train_subset, holdout_subset, train_idx, holdout_idx
+
+
+def _split_input_prototype_sets(
+    prototypes: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    indices: Optional[Dict[str, torch.Tensor]],
+    *,
+    classes: Tuple[int, int],
+    holdout_counts: Dict[str, int],
+    seed: int,
+):
+    if not prototypes:
+        return {}, {}, indices, None
+
+    missing = [name for name in holdout_counts.keys() if name not in prototypes]
+    if missing:
+        print(
+            "Warning: holdout counts specified for subsets missing from prototypes: "
+            f"{', '.join(sorted(missing))}."
+        )
+
+    train_sets = {}
+    holdout_sets = {}
+    train_indices = {} if indices is not None else None
+    holdout_indices = {} if indices is not None else None
+
+    for idx, (name, (X, Y)) in enumerate(prototypes.items()):
+        if X is None or Y is None:
+            continue
+        holdout_count = holdout_counts.get(name, 0)
+        train_subset, holdout_subset, train_idx, holdout_idx = _split_prototype_subset_by_class(
+            X,
+            Y,
+            classes,
+            holdout_count,
+            seed + idx * 17,
+            name,
+        )
+        train_sets[name] = train_subset
+        holdout_sets[name] = holdout_subset
+
+        if indices is not None and name in indices:
+            idx_tensor = indices[name]
+            if not torch.is_tensor(idx_tensor):
+                idx_tensor = torch.tensor(idx_tensor, dtype=torch.long)
+            idx_tensor = idx_tensor.to(dtype=torch.long)
+
+            if holdout_idx.numel() == 0:
+                train_indices[name] = idx_tensor
+                holdout_indices[name] = idx_tensor[:0]
+            else:
+                holdout_indices[name] = idx_tensor.index_select(0, holdout_idx.to(device=idx_tensor.device))
+                train_indices[name] = idx_tensor.index_select(0, train_idx.to(device=idx_tensor.device))
+
+    return train_sets, holdout_sets, train_indices, holdout_indices
 
 
 def _validate_input_prototype_metadata(metadata: dict, *, dataset: str, classes: List[int], dataset_seed: int, num_data: int):
@@ -2485,6 +2637,13 @@ if __name__ == '__main__':
                         help='Extrapolation factor used when building feature-space x-outliers')
     parser.add_argument('--track-feature-prototypes-from', type=str, default=None,
                         help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
+    
+    
+    # new input prototypes train vs val mode
+    parser.add_argument('--input-prototypes-mode', type=str, default=None,
+                        choices=['train', 'val'],
+                        help='Unified input-prototype mode: train (include all prototypes in training) or val '
+                             '(hold out subsets and log metrics on held-out sets). When unset, legacy behavior applies.')
     parser.add_argument('--train-input-prototypes', type=str, default=None,
                         help='Input prototype source for training run: generate | from:<path or run> | none')
     parser.add_argument('--test-input-prototypes', type=str, default=None,
@@ -2501,15 +2660,19 @@ if __name__ == '__main__':
                         help='Override count per class for x-outlier prototypes')
     parser.add_argument('--input-prototypes-y-outlier-count', type=int, default=None,
                         help='Override count per class for y-outlier prototypes')
+    parser.add_argument('--input-prototypes-holdout-count', type=str, default=None,
+                        help='Per-subset holdout count (per class) for validation mode, e.g. '
+                             '"boundary=10,inliers=10,x_outlier=5,y_outlier=5"')
     parser.add_argument('--input-prototypes-holdout', type=str, default='auto',
                         choices=['auto', 'boundary_inliers', 'none'],
-                        help='Hold out boundary/inlier indices from training when using train-input-prototypes (auto => boundary_inliers for new flags)')
+                        help='[DEPRECATED] Hold out boundary/inlier indices from training when using train-input-prototypes '
+                             '(auto => boundary_inliers for legacy flags)')
     parser.add_argument('--track-input-prototypes', action='store_true',
-                        help='DEPRECATED: Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
+                        help='[DEPRECATED] Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
     parser.add_argument('--input-prototype-holdout-per-class', type=int, default=None,
-                        help='DEPRECATED: hold out this many boundary/inlier points per class from training')
+                        help='[DEPRECATED] Hold out this many boundary/inlier points per class from training')
     parser.add_argument('--input-prototype-holdout-frac', type=float, default=None,
-                        help='DEPRECATED: hold out this fraction of the training set per class (used to size boundary/inlier prototypes)')
+                        help='[DEPRECATED] Hold out this fraction of the training set per class (used to size boundary/inlier prototypes)')
     parser.add_argument('--train-input-x-outliers', type=int, default=None,
                         help='Augment the training set with this many input-space x-outliers per class; '
                              'also logs input-space prototype subsets')
@@ -2681,7 +2844,12 @@ if __name__ == '__main__':
     tuple_data = (train_x, train_y, test_x, test_y)
 
 
-    use_new_proto_flags = args.train_input_prototypes is not None or args.test_input_prototypes is not None
+    use_new_proto_flags = (
+        args.train_input_prototypes is not None
+        or args.test_input_prototypes is not None
+        or args.input_prototypes_mode is not None
+        or args.input_prototypes_holdout_count is not None
+    )
     train_proto_source = _parse_input_prototype_source(args.train_input_prototypes)
     test_proto_source = _parse_input_prototype_source(args.test_input_prototypes)
 
@@ -2780,6 +2948,123 @@ if __name__ == '__main__':
             None,
         )
 
+    explicit_proto_mode = args.input_prototypes_mode is not None
+    input_proto_mode = args.input_prototypes_mode or "train"
+    holdout_counts = _parse_input_prototype_holdout_counts(args.input_prototypes_holdout_count)
+
+    heldout_prototype_data = None
+    heldout_prototype_indices = None
+    prototype_data_for_aug = train_prototype_data
+
+    if explicit_proto_mode and input_proto_mode == "train" and args.input_prototypes_holdout_count:
+        print("Warning: --input-prototypes-holdout-count is ignored in train mode.")
+
+    if explicit_proto_mode and input_proto_mode == "val":
+        if test_proto_source["mode"] not in (None, "none"):
+            print("Warning: --test-input-prototypes ignored in validation mode; using held-out subsets from training prototypes.")
+
+        if not holdout_counts:
+            legacy_holdout = None
+            if args.input_prototype_holdout_per_class is not None:
+                legacy_holdout = args.input_prototype_holdout_per_class
+                print("Warning: using deprecated --input-prototype-holdout-per-class for validation holdout sizing.")
+            elif args.input_prototype_holdout_frac is not None:
+                legacy_holdout = max(1, int(round(train_x.shape[0] * args.input_prototype_holdout_frac)))
+                print("Warning: using deprecated --input-prototype-holdout-frac for validation holdout sizing.")
+            if legacy_holdout is not None:
+                holdout_counts = {"boundary": legacy_holdout, "inliers": legacy_holdout}
+
+        if holdout_counts and train_prototype_data is None:
+            print("Warning: validation mode requested holdout counts but no training prototypes were available.")
+        if holdout_counts and train_prototype_data is not None:
+            holdout_seed = (args.dataset_seed or 0) + 4242
+            train_prototype_data, heldout_prototype_data, train_prototype_indices, heldout_prototype_indices = _split_input_prototype_sets(
+                train_prototype_data,
+                train_prototype_indices,
+                classes=tuple(args.classes),
+                holdout_counts=holdout_counts,
+                seed=holdout_seed,
+            )
+            prototype_data_for_aug = train_prototype_data
+        elif not holdout_counts:
+            print("Warning: validation mode enabled but no holdout counts provided; input prototype holdout disabled.")
+
+        if heldout_prototype_indices:
+            holdout_tensors = []
+            boundary_idx = heldout_prototype_indices.get("boundary") if heldout_prototype_indices else None
+            inlier_idx = heldout_prototype_indices.get("inliers") if heldout_prototype_indices else None
+            if boundary_idx is not None:
+                holdout_tensors.append(boundary_idx)
+            if inlier_idx is not None:
+                holdout_tensors.append(inlier_idx)
+            if holdout_tensors:
+                holdout_indices = torch.unique(torch.cat(holdout_tensors, dim=0))
+                if holdout_indices.numel() > 0:
+                    orig_n = train_x.shape[0]
+                    train_x, train_y = _drop_indices_from_dataset(train_x, train_y, holdout_indices)
+                    removed = orig_n - train_x.shape[0]
+                    print(
+                        f"[holdout] removed {removed} samples from training set for input prototypes "
+                        f"(boundary+inliers, {holdout_indices.numel()} unique indices)"
+                    )
+                    data = (train_x, train_y, test_x, test_y)
+                    tuple_data = data
+                    if args.train_input_x_outliers is not None or args.train_input_y_outliers is not None:
+                        prototype_data_for_aug, _ = generate_prototype_sets(
+                            train_x, train_y, tuple(args.classes), n_prototype=n_proto, return_indices=True
+                        )
+                        prototype_data_for_aug, _ = trim_prototype_sets(
+                            prototype_data_for_aug,
+                            tuple(args.classes),
+                            input_proto_counts,
+                            None,
+                        )
+        log_prototype_data = heldout_prototype_data or train_prototype_data
+    else:
+        holdout_mode = args.input_prototypes_holdout
+        if holdout_mode == "auto":
+            if use_new_proto_flags and train_proto_source["mode"] not in (None, "none"):
+                holdout_mode = "boundary_inliers"
+            elif args.track_input_prototypes and (
+                args.input_prototype_holdout_per_class is not None or args.input_prototype_holdout_frac is not None
+            ):
+                holdout_mode = "boundary_inliers"
+            else:
+                holdout_mode = "none"
+
+        if holdout_mode == "boundary_inliers" and train_prototype_indices:
+            holdout_tensors = []
+            boundary_idx = train_prototype_indices.get("boundary") if train_prototype_indices else None
+            inlier_idx = train_prototype_indices.get("inliers") if train_prototype_indices else None
+            if boundary_idx is not None:
+                holdout_tensors.append(boundary_idx)
+            if inlier_idx is not None:
+                holdout_tensors.append(inlier_idx)
+            if holdout_tensors:
+                holdout_indices = torch.unique(torch.cat(holdout_tensors, dim=0))
+                if holdout_indices.numel() > 0:
+                    orig_n = train_x.shape[0]
+                    train_x, train_y = _drop_indices_from_dataset(train_x, train_y, holdout_indices)
+                    removed = orig_n - train_x.shape[0]
+                    print(
+                        f"[holdout] removed {removed} samples from training set for input prototypes "
+                        f"(boundary+inliers, {holdout_indices.numel()} unique indices)"
+                    )
+                    data = (train_x, train_y, test_x, test_y)
+                    tuple_data = data
+                    if args.train_input_x_outliers is not None or args.train_input_y_outliers is not None:
+                        prototype_data_for_aug, _ = generate_prototype_sets(
+                            train_x, train_y, tuple(args.classes), n_prototype=n_proto, return_indices=True
+                        )
+                        prototype_data_for_aug, _ = trim_prototype_sets(
+                            prototype_data_for_aug,
+                            tuple(args.classes),
+                            input_proto_counts,
+                            None,
+                        )
+        elif holdout_mode == "boundary_inliers" and train_proto_source["mode"] not in (None, "none"):
+            print("Warning: input prototype holdout requested but no indices were available; skipping holdout.")
+
     prototype_data = log_prototype_data or train_prototype_data or {}
     combined_prototype_data = dict(prototype_data)
     if args.track_feature_prototypes_from:
@@ -2796,51 +3081,6 @@ if __name__ == '__main__':
         )
 
     prototype_data = combined_prototype_data
-    prototype_data_for_aug = train_prototype_data
-
-    holdout_mode = args.input_prototypes_holdout
-    if holdout_mode == "auto":
-        if use_new_proto_flags and train_proto_source["mode"] not in (None, "none"):
-            holdout_mode = "boundary_inliers"
-        elif args.track_input_prototypes and (
-            args.input_prototype_holdout_per_class is not None or args.input_prototype_holdout_frac is not None
-        ):
-            holdout_mode = "boundary_inliers"
-        else:
-            holdout_mode = "none"
-
-    if holdout_mode == "boundary_inliers" and train_prototype_indices:
-        holdout_tensors = []
-        boundary_idx = train_prototype_indices.get("boundary") if train_prototype_indices else None
-        inlier_idx = train_prototype_indices.get("inliers") if train_prototype_indices else None
-        if boundary_idx is not None:
-            holdout_tensors.append(boundary_idx)
-        if inlier_idx is not None:
-            holdout_tensors.append(inlier_idx)
-        if holdout_tensors:
-            holdout_indices = torch.unique(torch.cat(holdout_tensors, dim=0))
-            if holdout_indices.numel() > 0:
-                orig_n = train_x.shape[0]
-                train_x, train_y = _drop_indices_from_dataset(train_x, train_y, holdout_indices)
-                removed = orig_n - train_x.shape[0]
-                print(
-                    f"[holdout] removed {removed} samples from training set for input prototypes "
-                    f"(boundary+inliers, {holdout_indices.numel()} unique indices)"
-                )
-                data = (train_x, train_y, test_x, test_y)
-                tuple_data = data
-                if args.train_input_x_outliers is not None or args.train_input_y_outliers is not None:
-                    prototype_data_for_aug, _ = generate_prototype_sets(
-                        train_x, train_y, tuple(args.classes), n_prototype=n_proto, return_indices=True
-                    )
-                    prototype_data_for_aug, _ = trim_prototype_sets(
-                        prototype_data_for_aug,
-                        tuple(args.classes),
-                        input_proto_counts,
-                        None,
-                    )
-    elif holdout_mode == "boundary_inliers" and train_proto_source["mode"] not in (None, "none"):
-        print("Warning: input prototype holdout requested but no indices were available; skipping holdout.")
 
     if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None) and train_prototype_data is None:
         raise ValueError("Training input outliers requires train-input-prototypes.")
@@ -2870,7 +3110,8 @@ if __name__ == '__main__':
                 "x_outlier",
             )
             train_outlier_tracking["x_outlier"] = (X_x_sel, Y_x_sel)
-            prototype_data["x_outlier"] = (X_x_sel, Y_x_sel)
+            if input_proto_mode != "val":
+                prototype_data["x_outlier"] = (X_x_sel, Y_x_sel)
             outlier_augments.append((X_x_sel, _coerce_labels_like(train_y, Y_x_sel)))
 
         if args.train_input_y_outliers is not None:
@@ -2884,7 +3125,8 @@ if __name__ == '__main__':
                 "y_outlier",
             )
             train_outlier_tracking["y_outlier"] = (X_y_sel, Y_y_sel)
-            prototype_data["y_outlier"] = (X_y_sel, Y_y_sel)
+            if input_proto_mode != "val":
+                prototype_data["y_outlier"] = (X_y_sel, Y_y_sel)
             outlier_augments.append((X_y_sel, _coerce_labels_like(train_y, Y_y_sel)))
 
         if outlier_augments:

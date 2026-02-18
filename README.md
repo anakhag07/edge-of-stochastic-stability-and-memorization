@@ -3,6 +3,30 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
 
 ## Tracking Outlier Metrics in W & B (only input_space_prototypes)
 
+**Unified input-prototype train/val mode (recommended).**
+Use `--input-prototypes-mode` with `--input-prototypes-holdout-count` to control held-out subsets. In `train` mode all prototypes can be used for training/augmentation; in `val` mode the held-out subsets are excluded from training and metrics are logged on the held-out sets.
+
+Example (train mode, no holdout):
+```bash
+python training.py --dataset cifar10 --model mlp --loss ce \
+  --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 \
+  --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
+  --batch-sharpness --classes 1 9 \
+  --train-input-prototypes generate --input-prototypes-mode train
+```
+
+Example (validation mode with held-out subsets):
+```bash
+python training.py --dataset cifar10 --model mlp --loss ce \
+  --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 \
+  --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
+  --batch-sharpness --classes 1 9 \
+  --train-input-prototypes generate --input-prototypes-mode val \
+  --input-prototypes-holdout-count "boundary=10,inliers=10,x_outlier=5,y_outlier=5"
+```
+
+Legacy flags like `--track-input-prototypes` and `--input-prototype-holdout-*` still work but are deprecated.
+
 **Launch the tracking run that logs both feature and input prototypes.** Use the stored feature prototypes via `--track-feature-prototypes-from "$RUN_DIR"` and enable input-space logging with `--track-input-prototypes` (no extra setup needed for inputs):
    ```bash
     python training.py --dataset cifar10 --model mlp --loss ce \
