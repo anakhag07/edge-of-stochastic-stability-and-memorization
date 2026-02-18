@@ -228,6 +228,42 @@ def _parse_input_prototype_holdout_counts(raw: str) -> Dict[str, int]:
     return counts
 
 
+def _validate_nonempty_prototype_subsets(
+    prototype_data: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    *,
+    context: str,
+    require_nonempty: bool = False,
+):
+    if not prototype_data:
+        if require_nonempty:
+            raise ValueError(f"{context}: no prototype subsets were provided")
+        return
+    for name, tensors in prototype_data.items():
+        if name is None:
+            raise ValueError(f"{context}: prototype subset name is None")
+        if tensors is None:
+            raise ValueError(f"{context}: prototype subset '{name}' is missing tensors")
+        if not isinstance(tensors, (tuple, list)) or len(tensors) != 2:
+            raise ValueError(
+                f"{context}: prototype subset '{name}' must be a (X, Y) tuple"
+            )
+        X_p, Y_p = tensors
+        if X_p is None or Y_p is None:
+            raise ValueError(f"{context}: prototype subset '{name}' has missing tensors")
+        if not torch.is_tensor(X_p) or not torch.is_tensor(Y_p):
+            raise ValueError(
+                f"{context}: prototype subset '{name}' must use torch tensors"
+            )
+        if X_p.shape[0] == 0 or Y_p.shape[0] == 0:
+            raise ValueError(
+                f"{context}: prototype subset '{name}' is empty; provide nonzero counts"
+            )
+        if X_p.shape[0] != Y_p.shape[0]:
+            raise ValueError(
+                f"{context}: prototype subset '{name}' has mismatched X/Y sizes"
+            )
+
+
 def _split_prototype_subset_by_class(
     X: torch.Tensor,
     Y: torch.Tensor,
@@ -2303,6 +2339,12 @@ def train(
         print("Computing per-sample metrics for prototype sets...")
         loss_type = 'ce' if isinstance(loss_fn, nn.CrossEntropyLoss) else 'mse'
 
+        _validate_nonempty_prototype_subsets(
+            prototype_data,
+            context="final per-sample prototype metrics",
+            require_nonempty=True,
+        )
+
         proto_dir = save_to / "prototype_final"
         _ensure_dir(proto_dir)
 
@@ -2974,20 +3016,26 @@ if __name__ == '__main__':
             if legacy_holdout is not None:
                 holdout_counts = {"boundary": legacy_holdout, "inliers": legacy_holdout}
 
-        if holdout_counts and train_prototype_data is None:
-            print("Warning: validation mode requested holdout counts but no training prototypes were available.")
-        if holdout_counts and train_prototype_data is not None:
-            holdout_seed = (args.dataset_seed or 0) + 4242
-            train_prototype_data, heldout_prototype_data, train_prototype_indices, heldout_prototype_indices = _split_input_prototype_sets(
-                train_prototype_data,
-                train_prototype_indices,
-                classes=tuple(args.classes),
-                holdout_counts=holdout_counts,
-                seed=holdout_seed,
+        if not holdout_counts:
+            raise ValueError(
+                "Validation mode requires --input-prototypes-holdout-count to define held-out subsets. "
+                "Provide counts for every subset you want tracked."
             )
-            prototype_data_for_aug = train_prototype_data
-        elif not holdout_counts:
-            print("Warning: validation mode enabled but no holdout counts provided; input prototype holdout disabled.")
+
+        if train_prototype_data is None:
+            raise ValueError(
+                "Validation mode requires training prototypes to hold out; set --train-input-prototypes."
+            )
+
+        holdout_seed = (args.dataset_seed or 0) + 4242
+        train_prototype_data, heldout_prototype_data, train_prototype_indices, heldout_prototype_indices = _split_input_prototype_sets(
+            train_prototype_data,
+            train_prototype_indices,
+            classes=tuple(args.classes),
+            holdout_counts=holdout_counts,
+            seed=holdout_seed,
+        )
+        prototype_data_for_aug = train_prototype_data
 
         if heldout_prototype_indices:
             holdout_tensors = []
@@ -3019,7 +3067,7 @@ if __name__ == '__main__':
                             input_proto_counts,
                             None,
                         )
-        log_prototype_data = heldout_prototype_data or train_prototype_data
+        log_prototype_data = heldout_prototype_data
     else:
         holdout_mode = args.input_prototypes_holdout
         if holdout_mode == "auto":
@@ -3065,7 +3113,10 @@ if __name__ == '__main__':
         elif holdout_mode == "boundary_inliers" and train_proto_source["mode"] not in (None, "none"):
             print("Warning: input prototype holdout requested but no indices were available; skipping holdout.")
 
-    prototype_data = log_prototype_data or train_prototype_data or {}
+    if explicit_proto_mode and input_proto_mode == "val":
+        prototype_data = log_prototype_data if log_prototype_data is not None else {}
+    else:
+        prototype_data = log_prototype_data or train_prototype_data or {}
     combined_prototype_data = dict(prototype_data)
     if args.track_feature_prototypes_from:
         tracked_feature_prototypes, _ = _load_reference_feature_prototypes(
@@ -3136,6 +3187,12 @@ if __name__ == '__main__':
             train_y = torch.cat(aug_Y, dim=0)
             data = (train_x, train_y, test_x, test_y)
             tuple_data = data
+
+    _validate_nonempty_prototype_subsets(
+        prototype_data,
+        context=f"prototype data ({input_proto_mode} mode)",
+        require_nonempty=(input_proto_mode == "val"),
+    )
 
     effective_train_len = int(train_x.shape[0])
     if effective_train_len == 0:
