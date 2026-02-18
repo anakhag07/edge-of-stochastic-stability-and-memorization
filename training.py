@@ -26,10 +26,15 @@ from utils.data import (
     generate_prototype_sets,
     generate_feature_space_prototype_sets,
     EXTRAPOLATION_FACTOR,
+    trim_prototype_sets,
 )
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
 from utils.nets import ResNet
 from utils.storage import initialize_folders
+from utils.input_prototypes import (
+    resolve_input_prototype_path,
+    load_input_prototype_package,
+)
 from utils.wandb_utils import (
     init_wandb,
     log_metrics,
@@ -148,6 +153,61 @@ def _sample_inlier_subsets(
             "indices": sampled,
         })
     return subsets
+
+
+def _parse_input_prototype_source(raw: str):
+    if raw is None:
+        return {"mode": None, "value": None}
+
+    value = raw.strip()
+    lowered = value.lower()
+    if lowered in ("none", "off", "false"):
+        return {"mode": "none", "value": None}
+    if lowered in ("generate", "gen"):
+        return {"mode": "generate", "value": None}
+    if value.startswith("from:"):
+        return {"mode": "from", "value": value[5:]}
+    if value.startswith("run:"):
+        return {"mode": "from", "value": value[4:]}
+    return {"mode": "from", "value": value}
+
+
+def _build_input_prototype_counts(args) -> Dict[str, int]:
+    counts = {}
+    if args.input_prototypes_boundary_count is not None:
+        counts["boundary"] = args.input_prototypes_boundary_count
+    if args.input_prototypes_inliers_count is not None:
+        counts["inliers"] = args.input_prototypes_inliers_count
+    if args.input_prototypes_x_outlier_count is not None:
+        counts["x_outlier"] = args.input_prototypes_x_outlier_count
+    if args.input_prototypes_y_outlier_count is not None:
+        counts["y_outlier"] = args.input_prototypes_y_outlier_count
+    return counts
+
+
+def _validate_input_prototype_metadata(metadata: dict, *, dataset: str, classes: List[int], dataset_seed: int, num_data: int):
+    if not metadata:
+        return
+    expected_classes = metadata.get("classes")
+    if expected_classes is not None and list(expected_classes) != list(classes):
+        raise ValueError(
+            f"Input prototype package classes {expected_classes} do not match requested classes {classes}."
+        )
+    expected_dataset = metadata.get("dataset")
+    if expected_dataset is not None and expected_dataset != dataset:
+        raise ValueError(
+            f"Input prototype package dataset {expected_dataset} does not match requested dataset {dataset}."
+        )
+    expected_seed = metadata.get("dataset_seed")
+    if expected_seed is not None and dataset_seed is not None and int(expected_seed) != int(dataset_seed):
+        raise ValueError(
+            f"Input prototype package dataset_seed {expected_seed} does not match requested seed {dataset_seed}."
+        )
+    expected_num_data = metadata.get("num_data")
+    if expected_num_data is not None and num_data is not None and int(expected_num_data) != int(num_data):
+        raise ValueError(
+            f"Input prototype package num_data {expected_num_data} does not match requested num_data {num_data}."
+        )
 
 
 FEATURE_PROTOTYPE_TRACKING_MAP = {
@@ -2425,13 +2485,31 @@ if __name__ == '__main__':
                         help='Extrapolation factor used when building feature-space x-outliers')
     parser.add_argument('--track-feature-prototypes-from', type=str, default=None,
                         help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
+    parser.add_argument('--train-input-prototypes', type=str, default=None,
+                        help='Input prototype source for training run: generate | from:<path or run> | none')
+    parser.add_argument('--test-input-prototypes', type=str, default=None,
+                        help='Input prototype source for logging/eval: from:<path or run> | none (defaults to train-input-prototypes when unset)')
+    parser.add_argument('--input-prototypes-frac', type=float, default=None,
+                        help='Fraction of training set (per class) to use for input prototypes when generating')
+    parser.add_argument('--input-prototypes-count', type=int, default=None,
+                        help='Count per class to use for all input prototype subsets when generating')
+    parser.add_argument('--input-prototypes-boundary-count', type=int, default=None,
+                        help='Override count per class for boundary prototypes')
+    parser.add_argument('--input-prototypes-inliers-count', type=int, default=None,
+                        help='Override count per class for inlier prototypes')
+    parser.add_argument('--input-prototypes-x-outlier-count', type=int, default=None,
+                        help='Override count per class for x-outlier prototypes')
+    parser.add_argument('--input-prototypes-y-outlier-count', type=int, default=None,
+                        help='Override count per class for y-outlier prototypes')
+    parser.add_argument('--input-prototypes-holdout', type=str, default='auto',
+                        choices=['auto', 'boundary_inliers', 'none'],
+                        help='Hold out boundary/inlier indices from training when using train-input-prototypes (auto => boundary_inliers for new flags)')
     parser.add_argument('--track-input-prototypes', action='store_true',
-                        help='Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
+                        help='DEPRECATED: Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
     parser.add_argument('--input-prototype-holdout-per-class', type=int, default=None,
-                        help='When tracking input prototypes, hold out this many boundary/inlier points per class from training')
+                        help='DEPRECATED: hold out this many boundary/inlier points per class from training')
     parser.add_argument('--input-prototype-holdout-frac', type=float, default=None,
-                        help='When tracking input prototypes, hold out this fraction of the training set per class '
-                             '(used to size boundary/inlier prototypes; e.g., 0.05)')
+                        help='DEPRECATED: hold out this fraction of the training set per class (used to size boundary/inlier prototypes)')
     parser.add_argument('--train-input-x-outliers', type=int, default=None,
                         help='Augment the training set with this many input-space x-outliers per class; '
                              'also logs input-space prototype subsets')
@@ -2490,13 +2568,34 @@ if __name__ == '__main__':
         if flag_value is not None and flag_value < 1:
             raise ValueError(f"--{flag_name.replace('_', '-')} must be >= 1 when provided")
 
+    if args.input_prototypes_count is not None and args.input_prototypes_count < 1:
+        raise ValueError("--input-prototypes-count must be >= 1 when provided")
+    if args.input_prototypes_frac is not None:
+        if args.input_prototypes_frac <= 0 or args.input_prototypes_frac >= 1:
+            raise ValueError("--input-prototypes-frac must be in (0, 1)")
+    if args.input_prototypes_count is not None and args.input_prototypes_frac is not None:
+        raise ValueError("Provide only one of --input-prototypes-count or --input-prototypes-frac")
+
+    for flag_name in (
+        "input_prototypes_boundary_count",
+        "input_prototypes_inliers_count",
+        "input_prototypes_x_outlier_count",
+        "input_prototypes_y_outlier_count",
+    ):
+        flag_value = getattr(args, flag_name)
+        if flag_value is not None and flag_value < 1:
+            raise ValueError(f"--{flag_name.replace('_', '-')} must be >= 1 when provided")
+
     if args.input_prototype_holdout_per_class is not None and args.input_prototype_holdout_per_class < 1:
         raise ValueError("--input-prototype-holdout-per-class must be >= 1 when provided")
     if args.input_prototype_holdout_frac is not None:
         if args.input_prototype_holdout_frac <= 0 or args.input_prototype_holdout_frac >= 1:
             raise ValueError("--input-prototype-holdout-frac must be in (0, 1)")
-    if (args.input_prototype_holdout_per_class is not None or args.input_prototype_holdout_frac is not None) and not args.track_input_prototypes:
-        print("Warning: input prototype holdout sizing was provided without --track-input-prototypes; ignoring holdout.")
+    if (
+        args.input_prototype_holdout_per_class is not None
+        or args.input_prototype_holdout_frac is not None
+    ) and not args.track_input_prototypes and args.train_input_prototypes is None:
+        print("Warning: input prototype holdout sizing was provided without input prototype tracking; ignoring holdout.")
 
     if args.memorization_outlier_frac <= 0 or args.memorization_outlier_frac >= 1:
         raise ValueError("--memorization-outlier-frac must be in (0, 1)")
@@ -2582,27 +2681,106 @@ if __name__ == '__main__':
     tuple_data = (train_x, train_y, test_x, test_y)
 
 
-    proto_frac = 0.05
-    if args.track_input_prototypes and args.input_prototype_holdout_frac is not None:
-        proto_frac = args.input_prototype_holdout_frac
-    if args.track_input_prototypes and args.input_prototype_holdout_per_class is not None:
-        n_proto = args.input_prototype_holdout_per_class
-    else:
-        n_proto = max(1, int(round(args.num_data * proto_frac)))
+    use_new_proto_flags = args.train_input_prototypes is not None or args.test_input_prototypes is not None
+    train_proto_source = _parse_input_prototype_source(args.train_input_prototypes)
+    test_proto_source = _parse_input_prototype_source(args.test_input_prototypes)
+
+    if train_proto_source["mode"] is None and args.track_input_prototypes:
+        train_proto_source = {"mode": "generate", "value": None}
+
+    if test_proto_source["mode"] is None and train_proto_source["mode"] not in (None, "none"):
+        test_proto_source = {"mode": train_proto_source["mode"], "value": train_proto_source["value"]}
+
+    input_proto_counts = _build_input_prototype_counts(args)
+
+    def _base_proto_count():
+        if args.input_prototypes_count is not None:
+            return args.input_prototypes_count
+        if args.input_prototypes_frac is not None:
+            return max(1, int(round(train_x.shape[0] * args.input_prototypes_frac)))
+        if not use_new_proto_flags:
+            if args.input_prototype_holdout_per_class is not None:
+                return args.input_prototype_holdout_per_class
+            if args.input_prototype_holdout_frac is not None:
+                return max(1, int(round(train_x.shape[0] * args.input_prototype_holdout_frac)))
+        return max(1, int(round(train_x.shape[0] * 0.05)))
+
+    n_proto = _base_proto_count()
     if args.train_input_x_outliers is not None:
         n_proto = max(n_proto, args.train_input_x_outliers)
     if args.train_input_y_outliers is not None:
         n_proto = max(n_proto, args.train_input_y_outliers)
-    print(f"[sanity] args.num_data={args.num_data} -> n_proto={n_proto}")
 
-    prototype_indices = None
-    if args.track_input_prototypes:
-        prototype_data, prototype_indices = generate_prototype_sets(
+    train_prototype_data = None
+    train_prototype_indices = None
+    if train_proto_source["mode"] == "from":
+        proto_path = resolve_input_prototype_path(
+            train_proto_source["value"],
+            results_root=RES_FOLDER,
+            dataset=dataset,
+            model=args.model,
+        )
+        train_prototype_data, train_prototype_indices, proto_meta = load_input_prototype_package(proto_path)
+        _validate_input_prototype_metadata(
+            proto_meta,
+            dataset=dataset,
+            classes=args.classes,
+            dataset_seed=args.dataset_seed,
+            num_data=args.num_data,
+        )
+        train_prototype_data, train_prototype_indices = trim_prototype_sets(
+            train_prototype_data,
+            tuple(args.classes),
+            input_proto_counts,
+            train_prototype_indices,
+        )
+        print(f"Loaded input prototypes from {proto_path}")
+    elif train_proto_source["mode"] == "generate":
+        train_prototype_data, train_prototype_indices = generate_prototype_sets(
             train_x, train_y, tuple(args.classes), n_prototype=n_proto, return_indices=True
         )
-    else:
-        prototype_data = generate_prototype_sets(train_x, train_y, tuple(args.classes), n_prototype=n_proto)
+        train_prototype_data, train_prototype_indices = trim_prototype_sets(
+            train_prototype_data,
+            tuple(args.classes),
+            input_proto_counts,
+            train_prototype_indices,
+        )
 
+    log_prototype_data = None
+    if test_proto_source["mode"] == "from":
+        proto_path = resolve_input_prototype_path(
+            test_proto_source["value"],
+            results_root=RES_FOLDER,
+            dataset=dataset,
+            model=args.model,
+        )
+        log_prototype_data, _, proto_meta = load_input_prototype_package(proto_path)
+        _validate_input_prototype_metadata(
+            proto_meta,
+            dataset=dataset,
+            classes=args.classes,
+            dataset_seed=args.dataset_seed,
+            num_data=args.num_data,
+        )
+        log_prototype_data, _ = trim_prototype_sets(
+            log_prototype_data,
+            tuple(args.classes),
+            input_proto_counts,
+            None,
+        )
+        print(f"Loaded test input prototypes from {proto_path}")
+    elif test_proto_source["mode"] == "generate":
+        log_prototype_data, _ = generate_prototype_sets(
+            train_x, train_y, tuple(args.classes), n_prototype=n_proto, return_indices=True
+        )
+        log_prototype_data, _ = trim_prototype_sets(
+            log_prototype_data,
+            tuple(args.classes),
+            input_proto_counts,
+            None,
+        )
+
+    prototype_data = log_prototype_data or train_prototype_data or {}
     combined_prototype_data = dict(prototype_data)
     if args.track_feature_prototypes_from:
         tracked_feature_prototypes, _ = _load_reference_feature_prototypes(
@@ -2618,12 +2796,23 @@ if __name__ == '__main__':
         )
 
     prototype_data = combined_prototype_data
-    prototype_data_for_aug = prototype_data
+    prototype_data_for_aug = train_prototype_data
 
-    if args.track_input_prototypes and prototype_indices:
+    holdout_mode = args.input_prototypes_holdout
+    if holdout_mode == "auto":
+        if use_new_proto_flags and train_proto_source["mode"] not in (None, "none"):
+            holdout_mode = "boundary_inliers"
+        elif args.track_input_prototypes and (
+            args.input_prototype_holdout_per_class is not None or args.input_prototype_holdout_frac is not None
+        ):
+            holdout_mode = "boundary_inliers"
+        else:
+            holdout_mode = "none"
+
+    if holdout_mode == "boundary_inliers" and train_prototype_indices:
         holdout_tensors = []
-        boundary_idx = prototype_indices.get("boundary")
-        inlier_idx = prototype_indices.get("inliers")
+        boundary_idx = train_prototype_indices.get("boundary") if train_prototype_indices else None
+        inlier_idx = train_prototype_indices.get("inliers") if train_prototype_indices else None
         if boundary_idx is not None:
             holdout_tensors.append(boundary_idx)
         if inlier_idx is not None:
@@ -2641,9 +2830,20 @@ if __name__ == '__main__':
                 data = (train_x, train_y, test_x, test_y)
                 tuple_data = data
                 if args.train_input_x_outliers is not None or args.train_input_y_outliers is not None:
-                    prototype_data_for_aug = generate_prototype_sets(
-                        train_x, train_y, tuple(args.classes), n_prototype=n_proto
+                    prototype_data_for_aug, _ = generate_prototype_sets(
+                        train_x, train_y, tuple(args.classes), n_prototype=n_proto, return_indices=True
                     )
+                    prototype_data_for_aug, _ = trim_prototype_sets(
+                        prototype_data_for_aug,
+                        tuple(args.classes),
+                        input_proto_counts,
+                        None,
+                    )
+    elif holdout_mode == "boundary_inliers" and train_proto_source["mode"] not in (None, "none"):
+        print("Warning: input prototype holdout requested but no indices were available; skipping holdout.")
+
+    if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None) and train_prototype_data is None:
+        raise ValueError("Training input outliers requires train-input-prototypes.")
 
     train_outlier_tracking = {}
     if args.train_input_x_outliers is not None or args.train_input_y_outliers is not None:
@@ -2800,7 +3000,8 @@ if __name__ == '__main__':
 
     subset_tracking_cfgs = prepare_knn_subset_tracking_configs(args, dataset, args.model, data) if args.track_knn_outliers_from else []
     subset_tracking_cfgs.extend(prepare_feature_prototype_subset_configs(prototype_data))
-    if args.track_input_prototypes or train_outlier_tracking:
+    track_input_metrics = bool(prototype_data) or bool(train_outlier_tracking)
+    if track_input_metrics:
         subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prototype_data, base_batch_size=batch_size))
     
     per_sample_cfg = None

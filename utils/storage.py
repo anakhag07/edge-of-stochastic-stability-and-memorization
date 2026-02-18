@@ -54,3 +54,33 @@ def initialize_folders(args, results_folder):
         f.write(welcome_string + "\n")
 
     return runs_folder
+
+
+def create_plaintext_run_dir(
+    results_folder,
+    dataset: str,
+    model: str,
+    *,
+    tag: str = "",
+):
+    folder_root = "plaintext"
+    run_folder_name = f"{dataset}_{model}"
+
+    def generate_folder_name():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M_%S")
+        suffix = f"_{tag}" if tag else ""
+        return f"{timestamp}{suffix}"
+
+    while True:
+        config_name = generate_folder_name()
+        runs_folder = results_folder / folder_root / run_folder_name / config_name
+        if not runs_folder.exists():
+            try:
+                runs_folder.mkdir(parents=True, exist_ok=False)
+            except Exception:
+                time.sleep(2)
+                continue
+            break
+        time.sleep(2)
+
+    return runs_folder
