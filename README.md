@@ -66,37 +66,6 @@ python tools/make_joint_proto.py \
   --fps 4
   ```
 
-## k-NN Outlier Mining & Tracking
-
-This is a legacy command; use input-prototype tracking for most outlier metrics.
-
-1. **Run once with `--knn-outliers` to mine ambiguous samples.**
-   ```bash
-   python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 -- loss ce\
-     --steps 150000 --num-data 8192 \
-     --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
-     --lambdamax --batch-sharpness \
-     --knn-outliers
-   ```
-   After the run finishes you will find `knn_outlier_indices.json` and `knn_outliers.json` in the plaintext run directory. For example, my last run lived in  
-   `/home/anakhag/projects/eos_results/plaintext/cifar10_mlp/20251124_0820_35_lr0.01000_b8/`.
-2. **Identify the most recent run directory:**
-  ```bash
-  RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
-  echo "$RUN_DIR"
-  ```
-
-3. **Track those stored samples (plus an equally sized inlier set) during a fresh run.**
-   ```bash
-    python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 -- loss ce\
-      --steps 150000 --num-data 8192 \
-      --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
-      --lambdamax --batch-sharpness \
-      --track-knn-outliers-from $RUN_DIR \
-      --track-knn-topk 5
-   ```
-   When `--track-knn-outliers-from` is set, the training loop automatically loads the stored indices, logs per-class metrics for those outliers under the `knn_outlier/<run>/class_*/*` series in Weights & Biases, and also samples the same number of inliers per class that get logged under `knn_inlier/<run>/class_*/*`. This allows you to compare loss/accuracy/λ_max/grad H grad for memorized versus typical points as training progresses.
-
 ___
 
 
