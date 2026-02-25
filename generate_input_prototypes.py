@@ -86,11 +86,12 @@ def main():
         n_proto = max(1, int(round(train_x.shape[0] * args.input_prototypes_frac)))
     else:
         n_proto = max(1, int(round(train_x.shape[0] * 0.05)))
-
+    
+    proto_classes = (0, 1) if args.dataset == 'cifar10_2cls' else tuple(args.classes)
     prototypes, indices = generate_prototype_sets(
         train_x,
         train_y,
-        tuple(args.classes),
+        proto_classes,
         n_prototype=n_proto,
         return_indices=True,
     )
@@ -98,7 +99,7 @@ def main():
     counts_by_subset = _build_counts(args)
     prototypes, indices = trim_prototype_sets(
         prototypes,
-        tuple(args.classes),
+        proto_classes,
         counts_by_subset,
         indices,
     )

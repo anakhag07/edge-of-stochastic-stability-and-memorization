@@ -14,6 +14,7 @@ from typing import Dict, List, Tuple
 
 import torch.nn.functional as F
 import time
+import torch.optim as optim
 
 import imageio.v2 as imageio
 import matplotlib
@@ -222,6 +223,8 @@ INPUT_PROTOTYPE_TRACKING_MAP = {
     'inliers': 'input_space_prototypes/inlier_points',
     'x_outlier': 'input_space_prototypes/synthetic_x_outlier',
     'y_outlier': 'input_space_prototypes/synthetic_y_outlier',
+    'injected_x_outlier': 'input_space_prototypes/injected_x_outlier',
+    'injected_y_outlier': 'input_space_prototypes/injected_y_outlier',
 }
 
 
@@ -667,6 +670,8 @@ def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, devic
                     zf = zf.squeeze(-1)
                 if yf.ndim > 1 and yf.size(-1) == 1:
                     yf = yf.squeeze(-1)
+                if yf.ndim == 1 and zf.ndim == 2:
+                    yf = F.one_hot(yf.long(), num_classes=zf.size(-1)).float()
 
                 diff = zf - yf                       # [B] or [B, D]
                 loss = 0.5 * (diff ** 2)
@@ -1126,7 +1131,6 @@ class MeasurementRunner:
             preds = self.net(X_subset).squeeze(dim=-1)
             loss = self.loss_fn(preds, Y_subset)
             if 'lmax_precond_adam' in self.measurements:
-                import torch.optim as optim
                 if isinstance(optimizer, (optim.Adam, optim.AdamW)):
 
                     # NEW: measure on fixed probe batch (not X_subset / random)
@@ -1222,6 +1226,23 @@ class MeasurementRunner:
                     self.eigenvalues_file.flush()
 
             metrics['lmax'] = lmax_value.item()
+            
+            if isinstance(optimizer, (optim.Adam, optim.AdamW)):
+                eos_threshold = 38.0 / optimizer.param_groups[0]['lr']
+            else:
+                eos_threshold = 2.0 / optimizer.param_groups[0]['lr']
+            
+            if not getattr(self, '_t_star_logged', False) and metrics['lmax'] >= eos_threshold:
+                self._t_star_logged = True
+                metrics['t_star'] = step_number
+                try:
+                    wandb.run.summary["t_star"] = step_number
+                    wandb.run.summary["lmax_at_t_star"] = metrics['lmax']
+                    wandb.run.summary["eos_threshold"] = eos_threshold
+                except:
+                    pass
+
+            
             metrics['full_loss'] = loss.item()
             metrics['full_accuracy'] = calculate_accuracy(preds, Y_subset)
 
@@ -2163,7 +2184,7 @@ def train(
                 loss_fn,
                 X_p,
                 Y_p,
-                loss_type='ce',
+                loss_type=loss_type,
                 batch_size=batch_size,
                 device=device,
             )
@@ -2298,18 +2319,21 @@ if __name__ == '__main__':
     # Section: Runtime Setup
     # -------------------------------------
     # ----- Reproducibility Seeds -----
-    seed = 88881
+    # seed = 88881
     # torch.backends.cudnn.deterministic = False
     # torch.backends.cudnn.benchmark = True
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+    # torch.manual_seed(seed)
+    # torch.cuda.manual_seed_all(seed)
+    # np.random.seed(seed)
+    # random.seed(seed)
     
     # -------------------------------------
     # Section: Argument Parser
     # -------------------------------------
     parser = argparse.ArgumentParser(description='Training script')
+    # --- Seed ---
+    parser.add_argument("--seed", type=int, default=88881)
+
     # --- Training Parameters ---
     parser.add_argument('--batch', type=int, default=64, help='Input batch size for training')
     parser.add_argument('--epochs', type=int, help='Number of epochs to train')
@@ -2520,6 +2544,17 @@ if __name__ == '__main__':
     # ----- Argument Parsing -----
     args = parser.parse_args()
 
+
+    # -------------------------------------
+    # Section: Runtime Setup
+    # -------------------------------------
+    seed = args.seed
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    
+    
     # ----- wandb Availability Check -----
     wandb_installed = is_wandb_available()
     if not wandb_installed and not args.disable_wandb:
@@ -2706,6 +2741,7 @@ if __name__ == '__main__':
         return max(1, int(round(train_x.shape[0] * 0.05)))
 
     n_proto = _base_proto_count()
+    proto_classes = (0, 1) if dataset == 'cifar10_2cls' else tuple(args.classes)
     if args.train_input_x_outliers is not None:
         n_proto = max(n_proto, args.train_input_x_outliers)
     if args.train_input_y_outliers is not None:
@@ -2737,11 +2773,11 @@ if __name__ == '__main__':
         print(f"Loaded input prototypes from {proto_path}")
     elif train_proto_source["mode"] == "generate":
         train_prototype_data, train_prototype_indices = generate_prototype_sets(
-            train_x, train_y, tuple(args.classes), n_prototype=n_proto, return_indices=True
+            train_x, train_y, proto_classes, n_prototype=n_proto, return_indices=True
         )
         train_prototype_data, train_prototype_indices = trim_prototype_sets(
             train_prototype_data,
-            tuple(args.classes),
+            proto_classes,
             input_proto_counts,
             train_prototype_indices,
         )
@@ -2771,11 +2807,11 @@ if __name__ == '__main__':
         print(f"Loaded test input prototypes from {proto_path}")
     elif test_proto_source["mode"] == "generate":
         log_prototype_data, _ = generate_prototype_sets(
-            train_x, train_y, tuple(args.classes), n_prototype=n_proto, return_indices=True
+            train_x, train_y, proto_classes, n_prototype=n_proto, return_indices=True
         )
         log_prototype_data, _ = trim_prototype_sets(
             log_prototype_data,
-            tuple(args.classes),
+            proto_classes,
             input_proto_counts,
             None,
         )
@@ -2831,11 +2867,11 @@ if __name__ == '__main__':
                 tuple_data = data
                 if args.train_input_x_outliers is not None or args.train_input_y_outliers is not None:
                     prototype_data_for_aug, _ = generate_prototype_sets(
-                        train_x, train_y, tuple(args.classes), n_prototype=n_proto, return_indices=True
+                        train_x, train_y, proto_classes, n_prototype=n_proto, return_indices=True
                     )
                     prototype_data_for_aug, _ = trim_prototype_sets(
                         prototype_data_for_aug,
-                        tuple(args.classes),
+                        proto_classes,
                         input_proto_counts,
                         None,
                     )
@@ -2847,7 +2883,7 @@ if __name__ == '__main__':
 
     train_outlier_tracking = {}
     if args.train_input_x_outliers is not None or args.train_input_y_outliers is not None:
-        classes = tuple(args.classes)
+        classes = proto_classes
         if len(classes) != 2:
             raise ValueError("Training input outliers requires exactly two classes.")
 
@@ -2870,7 +2906,7 @@ if __name__ == '__main__':
                 "x_outlier",
             )
             train_outlier_tracking["x_outlier"] = (X_x_sel, Y_x_sel)
-            prototype_data["x_outlier"] = (X_x_sel, Y_x_sel)
+         #   prototype_data["x_outlier"] = (X_x_sel, Y_x_sel)
             outlier_augments.append((X_x_sel, _coerce_labels_like(train_y, Y_x_sel)))
 
         if args.train_input_y_outliers is not None:
@@ -2884,7 +2920,7 @@ if __name__ == '__main__':
                 "y_outlier",
             )
             train_outlier_tracking["y_outlier"] = (X_y_sel, Y_y_sel)
-            prototype_data["y_outlier"] = (X_y_sel, Y_y_sel)
+      #      prototype_data["y_outlier"] = (X_y_sel, Y_y_sel)
             outlier_augments.append((X_y_sel, _coerce_labels_like(train_y, Y_y_sel)))
 
         if outlier_augments:
@@ -3004,6 +3040,15 @@ if __name__ == '__main__':
     if track_input_metrics:
         subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prototype_data, base_batch_size=batch_size))
     
+    
+    if train_outlier_tracking:
+        injected_tracking = {
+            f"injected_{name}": tensors
+            for name, tensors in train_outlier_tracking.items()
+        }
+        subset_tracking_cfgs.extend(prepare_prototype_subset_configs(injected_tracking, base_batch_size=batch_size))
+
+
     per_sample_cfg = None
     if args.per_sample:
         per_sample_cfg = {
