@@ -1,15 +1,30 @@
 # edge-of-stochastic-stability-and-memorization
 This repository builds on edge-of-stochastic-stability repo to quantify memorization during training and relationship to edge of stochastic stability and progressive sharpening. The information on the original repository follows here. 
 
-## Tracking Outlier Metrics in W & B (only input_space_prototypes)
+## Tracking Outlier Metrics (Input Prototypes)
 
-**Launch the tracking run that logs both feature and input prototypes.** Use the stored feature prototypes via `--track-feature-prototypes-from "$RUN_DIR"` and enable input-space logging with `--track-input-prototypes` (no extra setup needed for inputs):
-   ```bash
-    python training.py --dataset cifar10 --model mlp --loss ce \
-    --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 \
-    --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
-    --batch-sharpness --classes 1 9 --track-input-prototypes
-   ```
+Input-space prototypes are the primary path for outlier tracking. Use `--input-prototypes-mode` with `--input-prototypes-holdout-count` to control held-out subsets. In `train` mode all prototypes can be used for training/augmentation; in `val` mode the held-out subsets are excluded from training and metrics are logged on the held-out sets.
+
+Example (train mode, no holdout):
+```bash
+python training.py --dataset cifar10 --model mlp --loss ce \
+  --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 \
+  --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
+  --batch-sharpness --classes 1 9 \
+  --train-input-prototypes generate --input-prototypes-mode train
+```
+
+Example (validation mode with held-out subsets):
+```bash
+python training.py --dataset cifar10 --model mlp --loss ce \
+  --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 \
+  --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
+  --batch-sharpness --classes 1 9 \
+  --train-input-prototypes generate --input-prototypes-mode val \
+  --input-prototypes-holdout-count "boundary=10,inliers=10,x_outlier=5,y_outlier=5"
+```
+
+Deprecated flags (still accepted): `--track-input-prototypes` (no train/val split) and `--input-prototype-holdout-*` (use `--input-prototypes-holdout-count`).
 
 ## Generating Per-Sample Loss GIFs
 
@@ -50,59 +65,6 @@ python tools/make_joint_proto.py \
   --out "$RUN_DIR/prototypes_loss.gif" \
   --fps 4
   ```
-
-## Tracking Outlier Metrics in Weights & Biases (not being used for all experiments anymore)
-
-To populate the `feature_space_prototypes/*` and `input_space_prototypes/*` panels in W&B, follow this two-stage process:
-
-1. **Export feature-space prototypes (one-time per dataset/model).** Run any training job with `--feature-prototypes` so the plaintext run folder gets a `feature_prototypes/` package. For example:
-   ```bash
-    python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --feature-prototypes
-   ```
-
-   When it finishes, note the latest run directory:
-   ```bash
-    RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
-    echo "$RUN_DIR"
-   ```
-
-2. **Launch the tracking run that logs both feature and input prototypes.** Use the stored feature prototypes via `--track-feature-prototypes-from "$RUN_DIR"` and enable input-space logging with `--track-input-prototypes` (no extra setup needed for inputs):
-   ```bash
-    python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --per-sample --track-feature-prototypes-from "$RUN_DIR" --track-input-prototypes
-   ```
-
-   W&B will now log `feature_space_prototypes/...` series sourced from the reference run and `input_space_prototypes/...` series computed on-the-fly.
-
-
-## k-NN Outlier Mining & Tracking
-# This is a legacy command - use the earlier --track-feature-prototypes-from instructions for the same functionality with more data prototypes. 
-
-1. **Run once with `--knn-outliers` to mine ambiguous samples.**
-   ```bash
-   python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 -- loss ce\
-     --steps 150000 --num-data 8192 \
-     --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
-     --lambdamax --batch-sharpness \
-     --knn-outliers
-   ```
-   After the run finishes you will find `knn_outlier_indices.json` and `knn_outliers.json` in the plaintext run directory. For example, my last run lived in  
-   `/home/anakhag/projects/eos_results/plaintext/cifar10_mlp/20251124_0820_35_lr0.01000_b8/`.
-2. **Identify the most recent run directory:**
-  ```bash
-  RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
-  echo "$RUN_DIR"
-  ```
-
-3. **Track those stored samples (plus an equally sized inlier set) during a fresh run.**
-   ```bash
-    python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 -- loss ce\
-      --steps 150000 --num-data 8192 \
-      --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
-      --lambdamax --batch-sharpness \
-      --track-knn-outliers-from $RUN_DIR \
-      --track-knn-topk 5
-   ```
-   When `--track-knn-outliers-from` is set, the training loop automatically loads the stored indices, logs per-class metrics for those outliers under the `knn_outlier/<run>/class_*/*` series in Weights & Biases, and also samples the same number of inliers per class that get logged under `knn_inlier/<run>/class_*/*`. This allows you to compare loss/accuracy/λ_max/grad H grad for memorized versus typical points as training progresses.
 
 ___
 
