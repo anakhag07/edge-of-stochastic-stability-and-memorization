@@ -21,7 +21,7 @@ def get_dataset_presets():
     dataset_presets = {
             'cifar10_2cls': {
                 'input_dim': 3*32*32,
-                'output_dim': 1
+                'output_dim': 2
             },
             'cifar10': {
                 'input_dim': 3*32*32,
@@ -50,18 +50,18 @@ def get_dataset_presets():
 
 
 
-def prepare_cifar10_2cls(dataset_folder: Path, num_data: int, classes: list, dataset_seed: int = 888):
+def prepare_cifar10_2cls(dataset_folder: Path, num_data: int, classes: list, dataset_seed: int = 888, loss_type='mse'):
     datafolder = dataset_folder / 'cifar10'
     trainset = datasets.CIFAR10(root=datafolder, train=True, download=False)
     testset = datasets.CIFAR10(root=datafolder, train=False, download=False)
 
     CLASS1, CLASS2 = classes
-
+    label_map = {CLASS1: 0, CLASS2: 1}
     train_size = num_data
 
     for partition in ['train', 'test']:
         partition_set = trainset if partition == 'train' else testset
-        
+
         idx1 = [i for i, target in enumerate(partition_set.targets) if target == CLASS1]
         idx2 = [i for i, target in enumerate(partition_set.targets) if target == CLASS2]
 
@@ -73,34 +73,24 @@ def prepare_cifar10_2cls(dataset_folder: Path, num_data: int, classes: list, dat
         idx.sort()
 
         partition_data = partition_set.data[idx]
-        partition_target = np.array(partition_set.targets)[idx]
-        partition_target = np.array([-1 if target == CLASS2 else 1 for target in partition_target])
+        partition_target = np.array([label_map[t] for t in np.array(partition_set.targets)[idx]])
 
-        X = T.tensor(partition_data)
-        Y = T.tensor(partition_target)
-
-        # Normalize the images
-        X = X / 255.0
-        X = X.float()
-
+        X = T.tensor(partition_data).float() / 255.0
         X = X - T.tensor([0.4914, 0.4822, 0.4465])
         X = X / T.tensor([0.2023, 0.1994, 0.2010])
+        X = rearrange(X, 'b w h c -> b c w h').detach()
 
-        X = rearrange(X, 'b w h c -> b c w h')
-
-        X = X.detach()
-
-        # Now Y
-        Y = Y.float()
-        Y = Y.detach()
+        Y = T.tensor(partition_target, dtype=torch.long)
+        if loss_type == 'mse':
+            Y = F.one_hot(Y, num_classes=2).float()
+        else:
+            Y = Y.long()
 
         if partition == 'train':
-            X_train = X
-            Y_train = Y
+            X_train, Y_train = X, Y
         else:
-            X_test = X
-            Y_test = Y
-        
+            X_test, Y_test = X, Y
+
     return X_train, Y_train, X_test, Y_test
 
 
@@ -441,9 +431,9 @@ def prepare_dataset(dataset: str, dataset_folder: Union[str, Path], num_data: in
     dataset_folder = Path(dataset_folder)
     train_size = num_data
     if dataset == 'cifar10_2cls':
-        if loss_type == 'ce':
-            raise NotImplementedError("Cross-entropy loss is not supported for 2-class CIFAR-10 dataset YET")
-        return prepare_cifar10_2cls(dataset_folder, num_data, classes, dataset_seed=dataset_seed)
+        # if loss_type == 'ce':
+        #     raise NotImplementedError("Cross-entropy loss is not supported for 2-class CIFAR-10 dataset YET")
+        return prepare_cifar10_2cls(dataset_folder, num_data, classes, dataset_seed=dataset_seed, loss_type=loss_type)
     if dataset == 'cifar10':
         return prepare_cifar10(dataset_folder, num_data, dataset_seed=dataset_seed, loss_type=loss_type)
     if dataset == 'cifar10_ez':
