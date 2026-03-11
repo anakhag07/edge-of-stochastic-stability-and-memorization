@@ -3,7 +3,7 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
 
 ## Tracking Outlier Metrics (Input Prototypes)
 
-Input-space prototypes are the primary path for outlier tracking. Use `--input-prototypes-mode` with `--input-prototypes-holdout-count` to control held-out subsets. In `train` mode all prototypes can be used for training/augmentation; in `val` mode the held-out subsets are excluded from training and metrics are logged on the held-out sets.
+Input-space prototypes are the primary path for outlier tracking. Use `--input-prototypes-mode` with explicit holdout flags to control held-out subsets. In `train` mode all prototypes can be used for training/augmentation; in `val` mode the held-out subsets are excluded from training and metrics are logged on the held-out sets.
 
 Example (train mode, no holdout):
 ```bash
@@ -21,10 +21,14 @@ python training.py --dataset cifar10 --model mlp --loss ce \
   --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
   --batch-sharpness --classes 1 9 \
   --train-input-prototypes generate --input-prototypes-mode val \
-  --input-prototypes-holdout-count "boundary=10,inliers=10,x_outlier=5,y_outlier=5"
+  --input-prototypes-holdout-boundary-count 10 \
+  --input-prototypes-holdout-inliers-count 10 \
+  --input-prototypes-holdout-x-outlier-count 5 \
+  --input-prototypes-holdout-y-outlier-count 5
 ```
 
-Deprecated flags (still accepted): `--track-input-prototypes` (no train/val split) and `--input-prototype-holdout-*` (use `--input-prototypes-holdout-count`).
+Deprecated flags (still accepted): `--track-input-prototypes` (no train/val split) and `--input-prototype-holdout-*`.
+Removed flag: `--input-prototypes-holdout-count`.
 
 ## Generating Per-Sample Loss GIFs
 
