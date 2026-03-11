@@ -186,46 +186,16 @@ def _build_input_prototype_counts(args) -> Dict[str, int]:
     return counts
 
 
-_INPUT_PROTOTYPE_SUBSETS = {
-    "boundary",
-    "inliers",
-    "x_outlier",
-    "y_outlier",
-}
-
-
-def _parse_input_prototype_holdout_counts(raw: str) -> Dict[str, int]:
-    if raw is None:
-        return {}
-    value = raw.strip()
-    if not value:
-        return {}
-
+def _build_input_prototype_holdout_counts(args) -> Dict[str, int]:
     counts = {}
-    for part in value.split(","):
-        if not part.strip():
-            continue
-        if "=" not in part:
-            raise ValueError(
-                "--input-prototypes-holdout-count expects comma-separated key=value pairs "
-                "like boundary=10,inliers=10,x_outlier=5,y_outlier=5"
-            )
-        key, raw_count = part.split("=", 1)
-        key = key.strip().lower().replace("-", "_")
-        if key not in _INPUT_PROTOTYPE_SUBSETS:
-            raise ValueError(
-                f"Unknown input prototype subset '{key}' in --input-prototypes-holdout-count. "
-                f"Expected one of {sorted(_INPUT_PROTOTYPE_SUBSETS)}."
-            )
-        try:
-            count = int(raw_count)
-        except ValueError as exc:
-            raise ValueError(
-                f"Holdout count for '{key}' must be an integer (got '{raw_count}')."
-            ) from exc
-        if count < 1:
-            raise ValueError(f"Holdout count for '{key}' must be >= 1.")
-        counts[key] = count
+    if args.input_prototypes_holdout_boundary_count is not None:
+        counts["boundary"] = args.input_prototypes_holdout_boundary_count
+    if args.input_prototypes_holdout_inliers_count is not None:
+        counts["inliers"] = args.input_prototypes_holdout_inliers_count
+    if args.input_prototypes_holdout_x_outlier_count is not None:
+        counts["x_outlier"] = args.input_prototypes_holdout_x_outlier_count
+    if args.input_prototypes_holdout_y_outlier_count is not None:
+        counts["y_outlier"] = args.input_prototypes_holdout_y_outlier_count
     return counts
 
 
@@ -2726,9 +2696,14 @@ if __name__ == '__main__':
                         help='Override count per class for x-outlier prototypes')
     parser.add_argument('--input-prototypes-y-outlier-count', type=int, default=None,
                         help='Override count per class for y-outlier prototypes')
-    parser.add_argument('--input-prototypes-holdout-count', type=str, default=None,
-                        help='Per-subset holdout count (per class) for validation mode, e.g. '
-                             '"boundary=10,inliers=10,x_outlier=5,y_outlier=5"')
+    parser.add_argument('--input-prototypes-holdout-boundary-count', type=int, default=None,
+                        help='Holdout count per class for boundary prototypes in validation mode')
+    parser.add_argument('--input-prototypes-holdout-inliers-count', type=int, default=None,
+                        help='Holdout count per class for inlier prototypes in validation mode')
+    parser.add_argument('--input-prototypes-holdout-x-outlier-count', type=int, default=None,
+                        help='Holdout count per class for x-outlier prototypes in validation mode')
+    parser.add_argument('--input-prototypes-holdout-y-outlier-count', type=int, default=None,
+                        help='Holdout count per class for y-outlier prototypes in validation mode')
     parser.add_argument('--input-prototypes-holdout', type=str, default='auto',
                         choices=['auto', 'boundary_inliers', 'none'],
                         help='[DEPRECATED] Hold out boundary/inlier indices from training when using train-input-prototypes '
@@ -2821,6 +2796,16 @@ if __name__ == '__main__':
         "input_prototypes_inliers_count",
         "input_prototypes_x_outlier_count",
         "input_prototypes_y_outlier_count",
+    ):
+        flag_value = getattr(args, flag_name)
+        if flag_value is not None and flag_value < 1:
+            raise ValueError(f"--{flag_name.replace('_', '-')} must be >= 1 when provided")
+
+    for flag_name in (
+        "input_prototypes_holdout_boundary_count",
+        "input_prototypes_holdout_inliers_count",
+        "input_prototypes_holdout_x_outlier_count",
+        "input_prototypes_holdout_y_outlier_count",
     ):
         flag_value = getattr(args, flag_name)
         if flag_value is not None and flag_value < 1:
@@ -2925,7 +2910,10 @@ if __name__ == '__main__':
         args.train_input_prototypes is not None
         or args.test_input_prototypes is not None
         or args.input_prototypes_mode is not None
-        or args.input_prototypes_holdout_count is not None
+        or args.input_prototypes_holdout_boundary_count is not None
+        or args.input_prototypes_holdout_inliers_count is not None
+        or args.input_prototypes_holdout_x_outlier_count is not None
+        or args.input_prototypes_holdout_y_outlier_count is not None
     )
     train_proto_source = _parse_input_prototype_source(args.train_input_prototypes)
     test_proto_source = _parse_input_prototype_source(args.test_input_prototypes)
@@ -3028,14 +3016,14 @@ if __name__ == '__main__':
 
     explicit_proto_mode = args.input_prototypes_mode is not None
     input_proto_mode = args.input_prototypes_mode or "train"
-    holdout_counts = _parse_input_prototype_holdout_counts(args.input_prototypes_holdout_count)
+    holdout_counts = _build_input_prototype_holdout_counts(args)
 
     heldout_prototype_data = None
     heldout_prototype_indices = None
     prototype_data_for_aug = train_prototype_data
 
-    if explicit_proto_mode and input_proto_mode == "train" and args.input_prototypes_holdout_count:
-        print("Warning: --input-prototypes-holdout-count is ignored in train mode.")
+    if explicit_proto_mode and input_proto_mode == "train" and holdout_counts:
+        print("Warning: input prototype holdout flags are ignored in train mode.")
 
     if explicit_proto_mode and input_proto_mode == "val":
         if test_proto_source["mode"] not in (None, "none"):
@@ -3054,7 +3042,7 @@ if __name__ == '__main__':
 
         if not holdout_counts:
             raise ValueError(
-                "Validation mode requires --input-prototypes-holdout-count to define held-out subsets. "
+                "Validation mode requires input prototype holdout flags to define held-out subsets. "
                 "Provide counts for every subset you want tracked."
             )
 
