@@ -2064,6 +2064,38 @@ def _compute_metrics_on_subset_data(
     if "grad_hessian_grad" in metrics:
         results["grad_hessian_grad"] = float(compute_grad_H_grad(loss_value, net).item())
 
+    if "grad_vmax_cos2" in metrics:
+        # Alignment of prototype gradient with global top eigenvector.
+        # cos²=1: gradient IS v_max (full alignment, drives global instability)
+        # cos²=0: gradient orthogonal to v_max (irrelevant to global oscillation)
+        print(f"DEBUG eigvec type: {type(eigenvector_cache.eigenvectors[0])}, shape: {eigenvector_cache.eigenvectors[0].shape}")
+        if (eigenvector_cache is not None
+                and hasattr(eigenvector_cache, 'eigenvectors')
+                and len(eigenvector_cache.eigenvectors) > 0):
+    
+            # Compute prototype gradient (same loss already computed above for gHg)
+            params = [p for p in net.parameters() if p.requires_grad]
+            net.zero_grad()
+            preds = net(X_subset).squeeze(dim=-1)
+            loss_for_grad = loss_fn(preds, Y_subset)
+            grad_list = torch.autograd.grad(
+                loss_for_grad, params, create_graph=False, retain_graph=False
+            )
+            grad_flat = torch.cat([g.reshape(-1) for g in grad_list]).detach()
+    
+            v_max = eigenvector_cache.eigenvectors[0].to(grad_flat.device)
+            v_max = v_max / (v_max.norm() + 1e-12)  # ensure unit norm
+    
+            g_norm = grad_flat.norm()
+            if g_norm > 1e-12:
+                cos2 = ((grad_flat / g_norm) @ v_max).pow(2).item()
+            else:
+                cos2 = float('nan')
+    
+            results["grad_vmax_cos2"] = cos2
+        else:
+            results["grad_vmax_cos2"] = float('nan')
+        
     if "per_example_loss_mean" in metrics or "per_example_loss_std" in metrics:
         with torch.no_grad():
             per_example_losses = compute_per_example_losses(net, X_subset, Y_subset, loss_fn)
