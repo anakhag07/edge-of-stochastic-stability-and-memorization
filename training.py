@@ -67,7 +67,7 @@ DATASET_FOLDER = Path(os.environ.get('DATASETS'))
 # export RESULTS=/scratch/gpfs/andreyev/eoss/results
 RES_FOLDER = Path(os.environ.get('RESULTS'))
 
-KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad", "batch_sharpness"]
+KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad", "batch_sharpness","grad_vmax_cos2"]
 TRAIN_OUTLIER_TRACKING_METRICS = [
     "per_example_loss_mean",
     "per_example_loss_std",
@@ -383,6 +383,8 @@ INPUT_PROTOTYPE_TRACKING_MAP = {
     'y_outlier': 'input_space_prototypes/synthetic_y_outlier',
     'injected_x_outlier': 'input_space_prototypes/injected_x_outlier',
     'injected_y_outlier': 'input_space_prototypes/injected_y_outlier',
+    'injected_inliers':   'input_space_prototypes/injected_inliers',
+    'injected_boundary':  'input_space_prototypes/injected_boundary',
 }
 
 
@@ -1387,16 +1389,19 @@ class MeasurementRunner:
             
             if isinstance(optimizer, (optim.Adam, optim.AdamW)):
                 eos_threshold = 38.0 / optimizer.param_groups[0]['lr']
+                sharpness_metric = 'lmax_precond_adam'
             else:
                 eos_threshold = 2.0 / optimizer.param_groups[0]['lr']
+                sharpness_metric = 'lmax'
             
-            if not getattr(self, '_t_star_logged', False) and metrics['lmax'] >= eos_threshold:
+            if not getattr(self, '_t_star_logged', False) and metrics.get(sharpness_metric, float('nan')) >= eos_threshold:
                 self._t_star_logged = True
                 metrics['t_star'] = step_number
                 try:
                     wandb.run.summary["t_star"] = step_number
-                    wandb.run.summary["lmax_at_t_star"] = metrics['lmax']
+                    wandb.run.summary["lmax_at_t_star"] = metrics.get(sharpness_metric, float('nan'))
                     wandb.run.summary["eos_threshold"] = eos_threshold
+                    wandb.run.summary["sharpness_metric"] = sharpness_metric
                 except:
                     pass
 
@@ -2720,7 +2725,12 @@ if __name__ == '__main__':
     parser.add_argument('--train-input-y-outliers', type=int, default=None,
                         help='Augment the training set with this many input-space y-outliers per class; '
                              'also logs input-space prototype subsets')
-
+    parser.add_argument('--train-input-inliers', type=int, default=None,
+                        help='Augment the training set with this many input inliers per class; '
+                             'also logs input-space prototype subsets')
+    parser.add_argument('--train-input-boundary', type=int, default=None,
+                        help='Augment the training set with this many input boundary points per class; '
+                             'also logs input-space prototype subsets')
     # ----- Argument Parsing -----
     args = parser.parse_args()
 
@@ -3156,16 +3166,64 @@ if __name__ == '__main__':
         )
 
     prototype_data = combined_prototype_data
+    prototype_data_for_aug = train_prototype_data
 
-    if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None) and train_prototype_data is None:
+    holdout_mode = args.input_prototypes_holdout
+    if holdout_mode == "auto":
+        if use_new_proto_flags and train_proto_source["mode"] not in (None, "none"):
+            holdout_mode = "boundary_inliers"
+        elif args.track_input_prototypes and (
+            args.input_prototype_holdout_per_class is not None or args.input_prototype_holdout_frac is not None
+        ):
+            holdout_mode = "boundary_inliers"
+        else:
+            holdout_mode = "none"
+
+    if holdout_mode == "boundary_inliers" and train_prototype_indices:
+        holdout_tensors = []
+        boundary_idx = train_prototype_indices.get("boundary") if train_prototype_indices else None
+        inlier_idx = train_prototype_indices.get("inliers") if train_prototype_indices else None
+        if boundary_idx is not None:
+            holdout_tensors.append(boundary_idx)
+        if inlier_idx is not None:
+            holdout_tensors.append(inlier_idx)
+        if holdout_tensors:
+            holdout_indices = torch.unique(torch.cat(holdout_tensors, dim=0))
+            if holdout_indices.numel() > 0:
+                orig_n = train_x.shape[0]
+                train_x, train_y = _drop_indices_from_dataset(train_x, train_y, holdout_indices)
+                removed = orig_n - train_x.shape[0]
+                print(
+                    f"[holdout] removed {removed} samples from training set for input prototypes "
+                    f"(boundary+inliers, {holdout_indices.numel()} unique indices)"
+                )
+                data = (train_x, train_y, test_x, test_y)
+                tuple_data = data
+                if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
+                        or args.train_input_inliers is not None or args.train_input_boundary is not None):
+                    prototype_data_for_aug, _ = generate_prototype_sets(
+                        train_x, train_y, proto_classes, n_prototype=n_proto, return_indices=True
+                    )
+                    prototype_data_for_aug, _ = trim_prototype_sets(
+                        prototype_data_for_aug,
+                        proto_classes,
+                        input_proto_counts,
+                        None,
+                    )
+    elif holdout_mode == "boundary_inliers" and train_proto_source["mode"] not in (None, "none"):
+        print("Warning: input prototype holdout requested but no indices were available; skipping holdout.")
+>>>>>>> shauna/feb24
+
+    if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
+            or args.train_input_inliers is not None or args.train_input_boundary is not None) and train_prototype_data is None:
         raise ValueError("Training input outliers requires train-input-prototypes.")
 
     train_outlier_tracking = {}
-    if args.train_input_x_outliers is not None or args.train_input_y_outliers is not None:
+    if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
+            or args.train_input_inliers is not None or args.train_input_boundary is not None):
         classes = proto_classes
         if len(classes) != 2:
-            raise ValueError("Training input outliers requires exactly two classes.")
-
+            raise ValueError("Training input injection requires exactly two classes.")
         outlier_augments = []
         seed_base = (args.dataset_seed or 0) + 100
 
@@ -3203,6 +3261,32 @@ if __name__ == '__main__':
             if input_proto_mode != "val":
                 prototype_data["y_outlier"] = (X_y_sel, Y_y_sel)
             outlier_augments.append((X_y_sel, _coerce_labels_like(train_y, Y_y_sel)))
+
+        if args.train_input_inliers is not None:
+            X_in, Y_in = prototype_data_for_aug["inliers"]
+            X_in_sel, Y_in_sel = _select_outlier_subset_by_class(
+                X_in,
+                Y_in,
+                classes,
+                args.train_input_inliers,
+                seed_base + 2,
+                "inliers",
+            )
+            train_outlier_tracking["inliers"] = (X_in_sel, Y_in_sel)
+            outlier_augments.append((X_in_sel, _coerce_labels_like(train_y, Y_in_sel)))
+
+        if args.train_input_boundary is not None:
+            X_b, Y_b = prototype_data_for_aug["boundary"]
+            X_b_sel, Y_b_sel = _select_outlier_subset_by_class(
+                X_b,
+                Y_b,
+                classes,
+                args.train_input_boundary,
+                seed_base + 3,
+                "boundary",
+            )
+            train_outlier_tracking["boundary"] = (X_b_sel, Y_b_sel)
+            outlier_augments.append((X_b_sel, _coerce_labels_like(train_y, Y_b_sel)))
 
         if outlier_augments:
             aug_X = [train_x] + [payload[0] for payload in outlier_augments]
