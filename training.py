@@ -3212,7 +3212,7 @@ if __name__ == '__main__':
                     )
     elif holdout_mode == "boundary_inliers" and train_proto_source["mode"] not in (None, "none"):
         print("Warning: input prototype holdout requested but no indices were available; skipping holdout.")
->>>>>>> shauna/feb24
+
 
     if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
             or args.train_input_inliers is not None or args.train_input_boundary is not None) and train_prototype_data is None:
