@@ -54,18 +54,14 @@ from utils.measure import *
 from utils.measure import compute_train_test_gap_from_tensors
 from utils.frequency import frequency_calculator, MeasurementContext
 from utils.quadratic import QuadraticApproximation, flatten_params, set_model_params, unflatten_params
+from utils.training_cli import build_parser as cli_build_parser, parse_args_with_config as cli_parse_args_with_config
 
 from torch.autograd import grad
 import json
 
-if 'DATASETS' not in os.environ:
-    raise ValueError("Please set the environment variable 'DATASETS'. Use 'export DATASETS=/path/to/datasets'")
-if 'RESULTS' not in os.environ:
-    raise ValueError("Please set the environment variable 'RESULTS'. Use 'export RESULTS=/path/to/results'")
-
-DATASET_FOLDER = Path(os.environ.get('DATASETS'))
+DATASET_FOLDER = Path(os.environ['DATASETS']) if 'DATASETS' in os.environ else None
 # export RESULTS=/scratch/gpfs/andreyev/eoss/results
-RES_FOLDER = Path(os.environ.get('RESULTS'))
+RES_FOLDER = Path(os.environ['RESULTS']) if 'RESULTS' in os.environ else None
 
 KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad", "batch_sharpness","grad_vmax_cos2"]
 TRAIN_OUTLIER_TRACKING_METRICS = [
@@ -75,6 +71,71 @@ TRAIN_OUTLIER_TRACKING_METRICS = [
     "grad_hessian_grad",
     "batch_sharpness",
 ]
+
+
+def _refresh_runtime_paths() -> None:
+    global DATASET_FOLDER, RES_FOLDER
+
+    if 'DATASETS' not in os.environ:
+        raise ValueError("Please set the environment variable 'DATASETS'. Use 'export DATASETS=/path/to/datasets'")
+    if 'RESULTS' not in os.environ:
+        raise ValueError("Please set the environment variable 'RESULTS'. Use 'export RESULTS=/path/to/results'")
+
+    DATASET_FOLDER = Path(os.environ['DATASETS'])
+    RES_FOLDER = Path(os.environ['RESULTS'])
+
+
+def _is_config_comment_key(key: str) -> bool:
+    return key.startswith("__comment") or key.startswith("_comment")
+
+
+def _flatten_config_mapping(config_value, *, source_path: Path, flat_config: Optional[Dict[str, object]] = None):
+    if flat_config is None:
+        flat_config = {}
+
+    if not isinstance(config_value, dict):
+        raise ValueError(f"Config file must contain a JSON object at the top level: {source_path}")
+
+    for key, value in config_value.items():
+        if _is_config_comment_key(str(key)):
+            continue
+        if isinstance(value, dict):
+            _flatten_config_mapping(value, source_path=source_path, flat_config=flat_config)
+            continue
+        if key in flat_config:
+            raise ValueError(f"Duplicate config key '{key}' found in {source_path}")
+        flat_config[key] = value
+
+    return flat_config
+
+
+def _load_json_config_defaults(parser: argparse.ArgumentParser, config_path: str) -> Dict[str, object]:
+    path = Path(config_path)
+    with open(path, 'r', encoding='utf-8') as f:
+        payload = json.load(f)
+
+    flat_config = _flatten_config_mapping(payload, source_path=path)
+    valid_dests = {action.dest for action in parser._actions}
+    unknown_keys = sorted(key for key in flat_config if key not in valid_dests)
+    if unknown_keys:
+        raise ValueError(
+            f"Unknown config key(s) in {path}: {', '.join(unknown_keys)}"
+        )
+    return flat_config
+
+
+def _extract_config_path(argv: Optional[List[str]] = None) -> Optional[str]:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument('--config', type=str, default=None)
+    config_args, _ = config_parser.parse_known_args(argv)
+    return config_args.config
+
+
+def parse_args_with_config(parser: argparse.ArgumentParser, argv: Optional[List[str]] = None):
+    config_path = _extract_config_path(argv)
+    if config_path:
+        parser.set_defaults(**_load_json_config_defaults(parser, config_path))
+    return parser.parse_args(argv)
 
 
 def _load_reference_knn_indices(dataset_name: str, model_name: str, run_name: str) -> Dict[int, List[int]]:
@@ -2483,23 +2544,9 @@ def train(
 
 
 
-if __name__ == '__main__':
-    # -------------------------------------
-    # Section: Runtime Setup
-    # -------------------------------------
-    # ----- Reproducibility Seeds -----
-    # seed = 88881
-    # torch.backends.cudnn.deterministic = False
-    # torch.backends.cudnn.benchmark = True
-    # torch.manual_seed(seed)
-    # torch.cuda.manual_seed_all(seed)
-    # np.random.seed(seed)
-    # random.seed(seed)
-    
-    # -------------------------------------
-    # Section: Argument Parser
-    # -------------------------------------
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Training script')
+    parser.add_argument('--config', type=str, default=None, help='Path to a JSON config file. CLI flags override config values.')
     # --- Seed ---
     parser.add_argument("--seed", type=int, default=88881)
 
@@ -2553,7 +2600,6 @@ if __name__ == '__main__':
         help='Log Adam-preconditioned top Hessian eigenvalue (AEoS sharpness).')
 
     # --- Measurement Flags (Primary) ---
-    # parser.add_argument('--fullbs', action='store_true', help='If set, compute the lambda_max, aka FullBS')
     parser.add_argument('--lambdamax', '--lmax', action='store_true', help='If set, compute the lambda_max, aka FullBS')
     parser.add_argument('--batch-sharpness', '--batch-sharpness-step', '--bs', action='store_true', dest='batch_sharpness',
                         help='If set, compute the batch sharpness: E[gHg/g²] with the expectation taken across mini-batches. Use --batch-sharpness-step for backward compatibility.')
@@ -2567,7 +2613,7 @@ if __name__ == '__main__':
     parser.add_argument('--one-step-loss-change', action='store_true', help='If set, compute the expected one-step change in loss using Monte Carlo estimation')
     parser.add_argument('--gradient-norm', action='store_true', help='If set, compute the Monte Carlo estimate of squared norm of mini-batch gradients')
     parser.add_argument('--final', action='store_true', help='If set, compute the lambda_max and step sharpness at the end')
-    
+
     # --- Measurement Flags (Tertiary, aka almost completely useless) ---
     parser.add_argument('--batch-sharpness-exp-inside', action='store_true', help='If set, compute the batch sharpness using E[gHg]/E[g²], where the expectation is inside the ratio. Compare with step-sharpness, where the expectation stays outside the ratio.')
     parser.add_argument('--batch-lambdamax','--batchlmax', action='store_true', help='If set, compute the batch lambda_max(H_B), aka batch lambda max')
@@ -2588,7 +2634,7 @@ if __name__ == '__main__':
     # --- Noise Configuration ---
     parser.add_argument('--gd-noise', '--gd_noise', type=str, default=None, help='Do noisy GD, to simulate SGD. Supported noises: sgd, diag, iso, const')
     parser.add_argument('--noise-mag', '--noise_mag', type=float, default=None, help='The noise magnitude for the constant noise')
-    
+
     # --- SDE Configuration ---
     parser.add_argument('--sde', action='store_true', help='Simulate the SDE dynamics (the one that correspond to the SGD). It integrates the SDE using the Euler-Maruyama method')
     parser.add_argument('--sde-h', '--sde_h', type=float, default=0.01, help='SDE *integration* time step size (default: 0.01)')
@@ -2622,7 +2668,6 @@ if __name__ == '__main__':
     parser.add_argument('--train-test-gap', action='store_true', help='If set, compute the training and testing accuracy and gap (heavy, runs rarely)')
 
     # --- NEW: Per-Sample Histogram Configuration ---
-
     parser.add_argument('--per-sample', action='store_true',
                         help='Track per-sample loss/residual/curvature histograms over time and save frames')
     parser.add_argument('--per-sample-every', type=int, default=100,
@@ -2639,7 +2684,6 @@ if __name__ == '__main__':
                         help='Which metrics to histogram (default: loss resid kappa)')
     parser.add_argument('--no-frames', action='store_true',
                         help='Only save counts/quantiles as .npz; do not render PNG frames')
-
 
     # --- NEW: Memorization via Outliers identified by Alignment with Top Hessian Eigenvector ---
     parser.add_argument('--memorization-hessian-outliers', action='store_true', help='Compute memorization stats based on alignment with top Hessian eigenvector (heavy; runs rarely)')
@@ -2678,8 +2722,7 @@ if __name__ == '__main__':
                         help='Extrapolation factor used when building feature-space x-outliers')
     parser.add_argument('--track-feature-prototypes-from', type=str, default=None,
                         help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
-    
-    
+
     # new input prototypes train vs val mode
     parser.add_argument('--input-prototypes-mode', type=str, default=None,
                         choices=['train', 'val'],
@@ -2731,8 +2774,28 @@ if __name__ == '__main__':
     parser.add_argument('--train-input-boundary', type=int, default=None,
                         help='Augment the training set with this many input boundary points per class; '
                              'also logs input-space prototype subsets')
-    # ----- Argument Parsing -----
-    args = parser.parse_args()
+    return parser
+
+
+if __name__ == '__main__':
+    _refresh_runtime_paths()
+    # -------------------------------------
+    # Section: Runtime Setup
+    # -------------------------------------
+    # ----- Reproducibility Seeds -----
+    # seed = 88881
+    # torch.backends.cudnn.deterministic = False
+    # torch.backends.cudnn.benchmark = True
+    # torch.manual_seed(seed)
+    # torch.cuda.manual_seed_all(seed)
+    # np.random.seed(seed)
+    # random.seed(seed)
+    
+    # -------------------------------------
+    # Section: Argument Parser
+    # -------------------------------------
+    parser = cli_build_parser(EXTRAPOLATION_FACTOR)
+    args = cli_parse_args_with_config(parser)
 
 
     # -------------------------------------

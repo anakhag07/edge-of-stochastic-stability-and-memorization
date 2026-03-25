@@ -68,3 +68,10 @@ python training.py --dataset cifar10 --model mlp --loss ce \
   --batch 4 --lr 0.05 --steps 20 --num-data 64 \
   --dataset-seed 1 --init-seed 1 --disable-wandb --cpu
 ```
+
+Config-based equivalent:
+
+```bash
+conda activate eoss
+python training.py --config configs/smoke_train.json
+```

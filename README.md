@@ -122,7 +122,12 @@ This repository accompanies the paper [Edge of Stochastic Stability: Revisiting 
   --lambdamax --batch-sharpness --disable-wandb \
   --cpu
   ```
- Runs training, writes results to a legacy `results.txt` under `$RESULTS`. Should take less than a minute to run.
+  Runs training, writes results to a legacy `results.txt` under `$RESULTS`. Should take less than a minute to run.
+- **Sanity run from JSON config**:
+  ```bash
+  python training.py --config configs/smoke_train.json
+  ```
+  JSON config files may use nested groups and `__comment` keys for section labels. CLI flags still work and override config values, e.g. `python training.py --config configs/smoke_train.json --steps 40`.
 - **Inspect the latest run**:
   ```bash
   python visualization/plot_results.py
@@ -155,6 +160,14 @@ This repository accompanies the paper [Edge of Stochastic Stability: Revisiting 
     --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
     --stop-loss 0.00001 
     --lambdamax --batch-sharpness
+  ```
+  Equivalent config-first invocation:
+  ```bash
+  python training.py --config path/to/experiment.json
+  ```
+  with optional overrides such as:
+  ```bash
+  python training.py --config path/to/experiment.json --lr 0.02 --batch 16
   ```
   Note: this is too computationally demanding to run on CPU - recommended to run on GPU, e.g. through slurm
   - 150k-step CIFAR-10 run with SGD on an MLP using batch size 8 and learning rate 0.01.
