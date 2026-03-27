@@ -1,5 +1,5 @@
 # edge-of-stochastic-stability-and-memorization
-This repository builds on edge-of-stochastic-stability repo to quantify memorization during training and relationship to edge of stochastic stability and progressive sharpening. The information on the original repository follows here. 
+This repository builds on edge-of-stochastic-stability repo to quantify memorization during training and relationship to edge of stochastic stability and progressive sharpening. The information on the repository follows here. 
 
 ## Edge of Stochastic Stability (EoSS)
 
