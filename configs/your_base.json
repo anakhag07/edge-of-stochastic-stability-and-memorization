@@ -37,12 +37,9 @@
   },
 
   "sharpness": {
-    "__comment": "lambda_max tracking and optional lr schedules triggered by lambda_max",
+    "__comment": "lambda_max tracking and optional one-shot lr drop triggered by lambda_max",
     "lambdamax": true,
     "batch_sharpness": true,
-    "lmax_decay": false,
-    "lmax_decay_target_lr": 0.000001,
-    "lmax_decay_steps": 10000,
     "lmax_drop": false,
     "lmax_drop_mult": 0.5,
     "lmax_drop_target_lr": null
@@ -72,28 +69,6 @@
     "input_inliers": null,
     "input_x_outliers": null,
     "input_y_outliers": null
-  },
-
-  "feature_tracking": {
-    "__comment": "Reference plaintext run folders used for tracking/reusing subsets",
-    "track_feature_prototypes_from": null,
-    "track_knn_outliers_from": null,
-    "track_knn_topk": 5
-  },
-
-  "posthoc_outliers": {
-    "__comment": "Post-training mining/export toggles",
-    "knn_outliers": false,
-    "knn_neighbors": 32,
-    "knn_top_per_class": 10,
-    "knn_feature_batch": 512,
-    "knn_chunk_size": 1024,
-    "knn_no_normalize": false,
-    "feature_prototypes": false,
-    "feature_prototype_batch": 512,
-    "feature_prototype_topk": 50,
-    "feature_prototype_kneighbors": 32,
-    "feature_prototype_no_normalize": false
   },
 
   "continuation": {

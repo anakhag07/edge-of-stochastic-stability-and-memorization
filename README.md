@@ -40,46 +40,6 @@ python tools/generate_input_prototypes.py --dataset cifar10_2cls --model mlp \
   --input-boundary 50 --input-inliers 50 --input-x-outliers 50 --input-y-outliers 50
 ```
 
-## Generating Per-Sample Loss GIFs
-
-Create an animated GIF showing how the per-sample loss distribution evolves over training by following the steps below:
-0. Launch a training run with per-sample histogram logging enabled (`--per-sample`):
-  ```bash
-  python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --per-sample
-  ```
-  This command logs the per-sample histograms under each run directory.
-  
-1. Identify the most recent run directory:
-  ```bash
-  RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
-  echo "$RUN_DIR"
-  ```
-
-2. Locate the latest per-sample histogram folder:
-  ```bash
-  LATEST_PS=$(find "$RESULTS"/plaintext/cifar10_mlp -maxdepth 5 -type d -name per_sample_histograms | sort | tail -1)
-  echo "$LATEST_PS"
-  ```
-This finds the newest per_sample_histograms directory, which contains the saved PNG frames.
-
-3. Generate the GIF
-Run:
-  ```bash
-python tools/make_gif.py \
-  --frames-dir "$LATEST_PS/frames" \
-  --metric loss \
-  --out "$RUN_DIR/loss_hist_evolution.gif" \
-  --fps 6
-  ```
-4. (Optional) Create prototype GIFs
-  ```bash
-python tools/make_joint_proto.py \
-  --proto-dir "$LATEST_PS/prototypes" \
-  --metric loss \
-  --out "$RUN_DIR/prototypes_loss.gif" \
-  --fps 4
-  ```
-
 ___
 
 

@@ -107,16 +107,6 @@ def init_wandb(args, step_to_start):
         "total_fisher_eigenval","sharpness_static","GNI","accuracy",
         "hessian_trace",
         "param_distance","gradient_norm_squared","quadratic_loss_gn","proj_grad_ratio",
-        "memorization_hessian_outliers/outliers/mean_loss",
-        "memorization_hessian_outliers/outliers/mean_alignment",
-        "memorization_hessian_outliers/outliers/accuracy",
-        "memorization_hessian_outliers/bulk/mean_loss",
-        "memorization_hessian_outliers/bulk/mean_alignment",
-        "memorization_hessian_outliers/bulk/accuracy",
-        "memorization_hessian_outliers/train/accuracy",
-        "memorization_hessian_outliers/hessian/lambdamax",
-        "memorization_hessian_outliers/outliers/fraction",
-        "memorization_hessian_outliers/outliers/count",
     ]:
         wandb.define_metric(m, step_metric="step")
 
@@ -202,55 +192,6 @@ def log_metrics(metrics: Mapping[str, Any]) -> None:
 
     if filtered_metrics:
         wandb.log(filtered_metrics)
-
-
-def log_knn_outlier_results(
-    scalar_metrics: Mapping[str, Any],
-    rows: list,
-    *,
-    table_name: str = "knn_outliers/table",
-) -> None:
-    """
-    Log k-NN outlier summary statistics and (optionally) a table of per-example rows.
-    """
-    if not WANDB_AVAILABLE or wandb.run is None:
-        return
-
-    log_payload = {}
-    for key, value in scalar_metrics.items():
-        if value is None:
-            continue
-        if isinstance(value, (float, np.floating)) and np.isnan(value):
-            continue
-        log_payload[key] = value
-
-    if log_payload:
-        wandb.log(log_payload, commit=False)
-
-    if rows:
-        columns = [
-            "dataset_index",
-            "class_id",
-            "same_class_ratio",
-            "balance_deviation",
-            "neighbor_entropy",
-            "top_two_gap",
-            "avg_neighbor_distance",
-        ]
-        table = wandb.Table(columns=columns)
-        for row in rows:
-            table.add_data(
-                row.get("dataset_index"),
-                row.get("class_id"),
-                row.get("same_class_ratio"),
-                row.get("balance_deviation"),
-                row.get("neighbor_entropy"),
-                row.get("top_two_gap"),
-                row.get("avg_neighbor_distance"),
-            )
-        wandb.log({table_name: table}, commit=False)
-
-
 def save_checkpoint_wandb(model, optimizer, step, epoch, loss, run_id=None, save_every_n_steps=None):
     """
     Save model checkpoint to separate wandb_checkpoints directory organized by run ID.

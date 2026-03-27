@@ -45,6 +45,12 @@ def test_input_prototype_mode_defaults_to_train():
         "--input-prototypes-holdout-boundary-count",
         "--input-prototype-holdout-per-class",
         "--train-input-x-outliers",
+        "--per-sample",
+        "--knn-outliers",
+        "--feature-prototypes",
+        "--track-feature-prototypes-from",
+        "--track-knn-outliers-from",
+        "--lmax-decay",
     ],
 )
 def test_legacy_input_prototype_flags_are_removed(legacy_flag):

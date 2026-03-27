@@ -16,18 +16,11 @@ import torch.nn.functional as F
 import time
 import torch.optim as optim
 
-import imageio.v2 as imageio
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 from utils.data import (
     prepare_dataset,
     get_dataset_presets,
     generate_prototype_sets,
-    generate_feature_space_prototype_sets,
     EXTRAPOLATION_FACTOR,
-    trim_prototype_sets,
 )
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
 from utils.nets import ResNet
@@ -42,7 +35,6 @@ from utils.input_prototypes import (
 from utils.wandb_utils import (
     init_wandb,
     log_metrics,
-    log_knn_outlier_results,
     save_checkpoint_wandb,
     find_closest_checkpoint_wandb,
     load_checkpoint_wandb,
@@ -140,84 +132,6 @@ def parse_args_with_config(parser: argparse.ArgumentParser, argv: Optional[List[
         parser.set_defaults(**_load_json_config_defaults(parser, config_path))
     return parser.parse_args(argv)
 
-
-def _load_reference_knn_indices(dataset_name: str, model_name: str, run_name: str) -> Dict[int, List[int]]:
-    plaintext_root = RES_FOLDER / 'plaintext' / f"{dataset_name}_{model_name}"
-    ref_run_dir = plaintext_root / run_name
-    indices_path = ref_run_dir / 'knn_outlier_indices.json'
-    if not indices_path.exists():
-        raise FileNotFoundError(
-            f"Cannot find knn_outlier_indices.json at {indices_path}. "
-            "Ensure the reference run name is correct."
-        )
-
-    with open(indices_path, 'r') as f:
-        indices_payload = json.load(f)
-
-    per_class_indices = indices_payload.get('per_class_indices', {})
-    if not per_class_indices:
-        raise ValueError(f"No per-class indices found in {indices_path}")
-
-    cleaned = {}
-    for class_key, idx_list in per_class_indices.items():
-        class_id = int(class_key)
-        cleaned[class_id] = [int(idx) for idx in idx_list]
-    return cleaned
-
-
-def _build_tracked_subsets(per_class_indices: Dict[int, List[int]], track_top: int):
-    tracked_subsets = []
-    trimmed_by_class: Dict[int, List[int]] = {}
-    for class_id, idx_list in per_class_indices.items():
-        trimmed = [int(idx) for idx in idx_list[:track_top]]
-        if not trimmed:
-            continue
-        trimmed_by_class[class_id] = trimmed
-        tracked_subsets.append({
-            "name": f"class_{class_id}",
-            "class_id": class_id,
-            "indices": trimmed,
-        })
-    return tracked_subsets, trimmed_by_class
-
-
-def _sample_inlier_subsets(
-    labels: torch.Tensor,
-    excluded_by_class: Dict[int, List[int]],
-    seed: int,
-) -> List[dict]:
-    if labels is None or not excluded_by_class:
-        return []
-
-    label_tensor = labels.detach().cpu()
-    if label_tensor.ndim > 1:
-        label_tensor = label_tensor.argmax(dim=1)
-    label_tensor = label_tensor.to(dtype=torch.long)
-    rng = random.Random(seed)
-
-    subsets = []
-    for class_id, excluded in excluded_by_class.items():
-        class_mask = (label_tensor == class_id)
-        class_indices = class_mask.nonzero(as_tuple=False).view(-1).tolist()
-        if not class_indices:
-            continue
-        excluded_set = set(excluded)
-        candidates = [idx for idx in class_indices if idx not in excluded_set]
-        if not candidates:
-            continue
-        desired = min(len(excluded), len(candidates))
-        if desired <= 0:
-            continue
-        if len(candidates) > desired:
-            sampled = rng.sample(candidates, desired)
-        else:
-            sampled = candidates
-        subsets.append({
-            "name": f"class_{class_id}",
-            "class_id": class_id,
-            "indices": sampled,
-        })
-    return subsets
 
 
 def _build_input_prototype_counts(args) -> Dict[str, int]:
@@ -394,13 +308,6 @@ def _validate_input_prototype_metadata(metadata: dict, *, dataset: str, classes:
         )
 
 
-FEATURE_PROTOTYPE_TRACKING_MAP = {
-    'feature_boundary': 'feature_space_prototypes/knn_outlier',
-    'feature_inliers': 'feature_space_prototypes/knn_inlier',
-    'feature_x_outlier': 'feature_space_prototypes/synthetic_x_outlier',
-    'feature_y_outlier': 'feature_space_prototypes/synthetic_y_outlier',
-}
-
 INPUT_PROTOTYPE_TRACKING_MAP = {
     'boundary': 'input_space_prototypes/boundary_points',
     'inliers': 'input_space_prototypes/inlier_points',
@@ -514,28 +421,6 @@ def prepare_train_outlier_subset_configs(
     return configs
 
 
-def prepare_feature_prototype_subset_configs(prototype_data: dict) -> List[dict]:
-    if not prototype_data:
-        return []
-
-    configs = []
-    for proto_key, log_prefix in FEATURE_PROTOTYPE_TRACKING_MAP.items():
-        if proto_key not in prototype_data:
-            continue
-        X_p, Y_p = prototype_data[proto_key]
-        configs.append({
-            "enabled": True,
-            "subsets": [{
-                "name": None,
-                "class_id": None,
-                "X_tensor": X_p.detach().cpu(),
-                "Y_tensor": Y_p.detach().cpu(),
-            }],
-            "metrics": KNN_TRACKING_METRICS,
-            "log_prefix": log_prefix,
-        })
-    return configs
-
 
 def prepare_prototype_subset_configs(prototype_data: dict, base_batch_size: int) -> List[dict]:
     """
@@ -588,129 +473,6 @@ def prepare_prototype_subset_configs(prototype_data: dict, base_batch_size: int)
     return configs
 
 
-def _feature_prototype_dir(dataset_name: str, model_name: str, run_name: str) -> Path:
-    plaintext_root = RES_FOLDER / 'plaintext' / f"{dataset_name}_{model_name}"
-    return plaintext_root / run_name / 'feature_prototypes'
-
-
-def _metadata_to_cpu(payload):
-    if torch.is_tensor(payload):
-        return payload.detach().cpu()
-    if isinstance(payload, dict):
-        return {k: _metadata_to_cpu(v) for k, v in payload.items()}
-    if isinstance(payload, list):
-        return [_metadata_to_cpu(v) for v in payload]
-    return payload
-
-
-def _save_feature_prototype_package(
-    save_dir: Path,
-    prototypes: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
-    metadata: Dict[str, dict],
-):
-    target_dir = save_dir / 'feature_prototypes'
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    package = {
-        "prototypes": {
-            name: {
-                "inputs": X.detach().cpu(),
-                "labels": Y.detach().cpu(),
-            }
-            for name, (X, Y) in prototypes.items()
-        },
-        "metadata": _metadata_to_cpu(metadata),
-    }
-
-    torch.save(package, target_dir / 'prototypes.pt')
-
-    summary = {
-        "classes": metadata.get("classes"),
-        "counts": {name: int(payload["inputs"].shape[0]) for name, payload in package["prototypes"].items()},
-    }
-    indices = metadata.get("indices")
-    if indices:
-        summary["indices"] = {name: [int(idx) for idx in tensor.tolist()] for name, tensor in indices.items()}
-
-    with open(target_dir / 'summary.json', 'w') as f:
-        json.dump(summary, f, indent=2)
-
-
-def _load_reference_feature_prototypes(dataset_name: str, model_name: str, run_name: str):
-    proto_dir = _feature_prototype_dir(dataset_name, model_name, run_name)
-    proto_path = proto_dir / 'prototypes.pt'
-    if not proto_path.exists():
-        raise FileNotFoundError(
-            f"Cannot find feature prototype package at {proto_path}. "
-            "Ensure the reference run computed feature-space prototypes."
-        )
-
-    package = torch.load(proto_path, map_location='cpu')
-    proto_payload = package.get("prototypes", {})
-    if not proto_payload:
-        raise ValueError(f"No prototype tensors stored in {proto_path}")
-
-    prototypes = {}
-    for name, payload in proto_payload.items():
-        inputs = payload.get("inputs")
-        labels = payload.get("labels")
-        if inputs is None or labels is None:
-            continue
-        prototypes[name] = (inputs, labels)
-
-    if not prototypes:
-        raise ValueError(f"Feature prototype file {proto_path} did not contain usable tensors.")
-
-    metadata = package.get("metadata", {})
-    return prototypes, metadata
-
-
-def prepare_knn_subset_tracking_configs(args, dataset_name: str, model_name: str, data) -> List[dict]:
-    if not args.track_knn_outliers_from:
-        return []
-
-    per_class_indices = _load_reference_knn_indices(dataset_name, model_name, args.track_knn_outliers_from)
-    allowed_classes = set(args.classes or [])
-    if allowed_classes:
-        per_class_indices = {cid: idxs for cid, idxs in per_class_indices.items() if cid in allowed_classes}
-        if not per_class_indices:
-            raise ValueError(
-                f"No reference KNN indices for requested classes {sorted(allowed_classes)} "
-                f"in run {args.track_knn_outliers_from}"
-            )
-
-    track_top = max(1, args.track_knn_topk)
-
-    tracked_subsets, trimmed_by_class = _build_tracked_subsets(per_class_indices, track_top)
-    if not tracked_subsets:
-        raise ValueError(
-            f"No indices remained after applying --track-knn-topk={track_top} "
-            f"for run {args.track_knn_outliers_from}"
-        )
-
-    configs = [{
-        "enabled": True,
-        "subsets": tracked_subsets,
-        "metrics": KNN_TRACKING_METRICS,
-        "log_prefix": f"knn_outlier/{args.track_knn_outliers_from}",
-    }]
-
-    _, Y_train, _, _ = data
-    inlier_seed = (args.dataset_seed or 0) + 1337
-    inlier_subsets = _sample_inlier_subsets(Y_train, trimmed_by_class, seed=inlier_seed)
-    if inlier_subsets:
-        configs.append({
-            "enabled": True,
-            "subsets": inlier_subsets,
-            "metrics": KNN_TRACKING_METRICS,
-            "log_prefix": f"knn_inlier/{args.track_knn_outliers_from}",
-        })
-    else:
-        print("Warning: Unable to sample knn_inlier subsets; insufficient inlier candidates.")
-
-    return configs
-
-
 
 """
 # -------------------------------------
@@ -755,150 +517,6 @@ def compute_prototype_metrics(net, loss_fn, prototype_data, device, base_batch_s
 
 
 
-# -------------------------------------
-# NEW: Per-sample histograms setup
-# -------------------------------------
-class PerSampleHistograms:
-    def __init__(self, min_log10, max_log10, bins, metrics):
-        self.min_log10 = min_log10
-        self.max_log10 = max_log10
-        self.bins = bins
-        self.metrics = metrics
-        self.histograms = {metric: np.zeros((bins,)) for metric in metrics}
-        self.counts = {metric: 0 for metric in metrics}
-        self.quantiles = {metric: np.zeros((bins,)) for metric in metrics}
-
-# @torch.no_grad()
-
-def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, device='cuda'):
-    """
-    Return dict of numpy arrays: loss, resid_norm, kappa, grad_norm for dataset (X, Y).
-    loss_type: 'ce' (cross-entropy) or 'mse' (SquaredLoss: 0.5 * ||y - yhat||^2).
-    """
-    was_training = net.training
-    net.eval()
-
-    out_loss, out_resid, out_kappa, out_grad_norm = [], [], [], []
-
-    for i in range(0, len(X), batch_size):
-        xb = X[i:i + batch_size].to(device)
-        yb = Y[i:i + batch_size].to(device)
-
-        grad_norms_batch = []
-
-        for j in range(xb.shape[0]):
-            xb_j = xb[j:j + 1]  # [1, ...]
-            yb_j = yb[j:j + 1]  # [1] or [1, C]
-
-            net.zero_grad()
-
-            z_j = net(xb_j)
-
-            if loss_type == 'ce':
-                # Cross-entropy for a single sample
-                loss_j = F.cross_entropy(z_j, yb_j.long(), reduction='sum')
-            else:
-                # MSE: 0.5 * ||y - yhat||^2
-                zf = z_j
-                yf = yb_j
-
-                if zf.ndim > 1 and zf.size(-1) == 1:
-                    zf = zf.squeeze(-1)
-                if yf.ndim > 1 and yf.size(-1) == 1:
-                    yf = yf.squeeze(-1)
-
-                loss_j = 0.5 * (zf - yf).pow(2).sum()
-
-            loss_j.backward()
-
-            grads = []
-            for param in net.parameters():
-                if param.grad is not None:
-                    grads.append(param.grad.view(-1))
-
-            if grads:
-                g = torch.cat(grads)
-                grad_norms_batch.append(torch.linalg.norm(g).item())
-            else:
-                grad_norms_batch.append(0.0)
-
-        out_grad_norm.extend(grad_norms_batch)
-
-        # ----------------------------------------------------
-        # Loss / resid_norm / kappa
-        # ----------------------------------------------------
-        with torch.no_grad():
-            z = net(xb)
-
-            if loss_type == 'ce':
-                # Per-sample CE loss
-                loss = F.cross_entropy(z, yb.long(), reduction='none')
-
-                # Residual wrt logits: p - y_onehot
-                p = torch.softmax(z, dim=1)
-                y1 = F.one_hot(yb.long(), num_classes=z.size(1)).float()
-                resid = p - y1
-                resid_norm = resid.norm(dim=1)
-
-                # Curvature proxy: Frobenius norm of softmax Hessian
-                C = p.size(1)
-                I = torch.eye(C, device=p.device).unsqueeze(0)  # [1, C, C]
-                Hout = I * p.unsqueeze(2) - p.unsqueeze(2) * p.unsqueeze(1)
-                kappa = torch.linalg.norm(Hout, dim=(1, 2))
-
-            else:
-                # MSE: SquaredLoss 0.5 * ||y - yhat||^2
-                zf = z
-                yf = yb
-
-                if zf.ndim > 1 and zf.size(-1) == 1:
-                    zf = zf.squeeze(-1)
-                if yf.ndim > 1 and yf.size(-1) == 1:
-                    yf = yf.squeeze(-1)
-                if yf.ndim == 1 and zf.ndim == 2:
-                    yf = F.one_hot(yf.long(), num_classes=zf.size(-1)).float()
-
-                diff = zf - yf                       # [B] or [B, D]
-                loss = 0.5 * (diff ** 2)
-                if loss.ndim > 1:
-                    loss = loss.sum(dim=1)
-
-                if diff.ndim > 1:
-                    resid_norm = diff.norm(dim=1)
-                else:
-                    resid_norm = diff.abs()
-
-                # For plain MSE, output-space curvature is constant
-                kappa = torch.ones_like(loss)
-
-        out_loss.append(loss.cpu())
-        out_resid.append(resid_norm.cpu())
-        out_kappa.append(kappa.cpu())
-
-    if was_training:
-        net.train()
-
-    return {
-        'loss': torch.cat(out_loss).numpy(),
-        'resid': torch.cat(out_resid).numpy(),
-        'kappa': torch.cat(out_kappa).numpy(),
-        'grad_norm': np.asarray(out_grad_norm),
-    }
-
-def _hist_log10(values, bin_edges):
-    v = np.asarray(values)
-    v = np.clip(v, a_min=np.finfo(float).tiny, a_max=None)  # avoid log of 0
-    lv = np.log10(v)
-    counts, _ = np.histogram(lv, bins=bin_edges)
-    return counts
-
-def _quantiles(values, qs=(0.1,0.5,0.9,0.99)):
-    v = np.asarray(values)
-    return np.quantile(v, qs)
-
-def _ensure_dir(p):
-    Path(p).mkdir(parents=True, exist_ok=True)
-
 def _format_duration(seconds):
     seconds = max(int(seconds), 0)
     minutes, secs = divmod(seconds, 60)
@@ -908,20 +526,6 @@ def _format_duration(seconds):
     if minutes:
         return f"{minutes}m {secs}s"
     return f"{secs}s"
-
-def _render_frame(bin_edges, counts_train, counts_test, title, out_png_path):
-    plt.figure(figsize=(6,4))
-    centers = 0.5*(bin_edges[1:]+bin_edges[:-1])
-    plt.step(centers, counts_train, where='mid', label='train', alpha=0.8)
-    plt.step(centers, counts_test, where='mid', label='test', alpha=0.6)
-    plt.yscale('log') # log applied
-    plt.xlabel('log10(value)')
-    plt.ylabel('log10(count)')
-    plt.title(title)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_png_path, dpi=140)
-    plt.close()
 
 
 
@@ -1087,11 +691,9 @@ class MeasurementRunner:
         gd_noise,
         proj_switch_step,
         quad_approx,
-        memorization_outlier_frac: float,
         # NEW:
         prototype_data,
         full_inputs_test=None,
-        per_sample_cfg=None,
         subset_tracking_cfgs=None,
         log_every_step: bool = False,
         precond_pi_vec = None,
@@ -1128,38 +730,10 @@ class MeasurementRunner:
         self.gd_noise = gd_noise
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
-        self.memorization_outlier_frac = memorization_outlier_frac 
         self._precond_pi_vec = precond_pi_vec
 
-        # NEW: Per-sample config
         self.full_inputs_test = full_inputs_test
-        self.per_sample_cfg = per_sample_cfg
         self.log_every_step = log_every_step
-        
-        # NEW: Per-sample initialization logic
-        if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
-            self.per_sample_histograms = PerSampleHistograms(
-                min_log10=per_sample_cfg['hist_min_log10'],
-                max_log10=per_sample_cfg['hist_max_log10'],
-                bins=per_sample_cfg['hist_bins'],
-                metrics=per_sample_cfg.get('metrics', per_sample_cfg.get('hist_metrics', ['loss'])))
-            # Initialize bin edges for log10 histogram
-            self.bin_edges = np.linspace(
-                per_sample_cfg['hist_min_log10'],
-                per_sample_cfg['hist_max_log10'],
-                per_sample_cfg['hist_bins'] + 1
-            )
-            # Initialize directories for saving
-            self.ps_dir = save_dir / 'per_sample_histograms'
-            self.frames_dir = self.ps_dir / 'frames'
-            _ensure_dir(self.ps_dir)
-            if not per_sample_cfg.get('no_frames', False):
-                _ensure_dir(self.frames_dir)
-        else:
-            self.per_sample_histograms = None
-            self.bin_edges = None
-            self.ps_dir = None
-            self.frames_dir = None
 
         self.subset_trackers = []
         if subset_tracking_cfgs:
@@ -1199,7 +773,7 @@ class MeasurementRunner:
                         "subsets": tracked_subsets,
                         "metrics": cfg.get('metrics', ["full_loss", "accuracy", "lambda_max"]),
                         "metric_kwargs": cfg.get('metric_kwargs', {}),
-                        "log_prefix": cfg.get('log_prefix', "knn_outlier"),
+                        "log_prefix": cfg.get('log_prefix', "subset"),
                     })
 
         self.eigenvalues_log = []
@@ -1247,7 +821,6 @@ class MeasurementRunner:
             'quadratic_loss_gn': None,
             'proj_grad_ratio': None,
             'hessian_trace': np.nan,
-            'memorization_hessian_outliers': None,
             'train_acc': np.nan, # NEW
             'test_acc': np.nan,  # NEW
             'train_test_gap': np.nan, # NEW
@@ -1453,21 +1026,7 @@ class MeasurementRunner:
                     eps=0.01,
                 )
 
-        # ----- Memorization via Hessian outliers -----
-        if 'memorization_hessian_outliers' in self.measurements:
-            if frequency_calculator.should_measure('memorization_hessian_outliers', ctx):
-                optimizer.zero_grad()
-                mem_stats = compute_outlier_vs_bulk_stats_hessian(
-                    net=self.net,
-                    X_train=self.X,
-                    Y_train=self.Y,
-                    loss_fn=self.loss_fn,
-                    optimizer=optimizer,
-                    frac=self.memorization_outlier_frac,
-                )
-                if mem_stats:
-                    metrics.update({f"memorization_hessian_outliers/{k}": v for k, v in mem_stats.items()})
-        
+
         # ----- NEW: Train/Test Gap -----
         if 'train_test_gap' in self.measurements and self.X_test is not None:
             if frequency_calculator.should_measure('train_test_gap',ctx):
@@ -1478,7 +1037,7 @@ class MeasurementRunner:
                 metrics['test_acc'] = vals['test_acc']
                 metrics['train_test_gap'] = vals['gap']
 
-        if self.subset_trackers and frequency_calculator.should_measure('knn_outlier_metrics', ctx):
+        if self.subset_trackers and frequency_calculator.should_measure('subset_metrics', ctx):
             for tracker in self.subset_trackers:
                 metric_kwargs = tracker.get('metric_kwargs', {})
                 for subset in tracker['subsets']:
@@ -1515,50 +1074,6 @@ class MeasurementRunner:
                         prefix = tracker['log_prefix']
                     for key, value in subset_results.items():
                         metrics[f"{prefix}/{key}"] = value
-
-        # ----- NEW: Per-sample histograms -----
-        if self.per_sample_cfg and self.per_sample_cfg['enabled']:
-            every = self.per_sample_cfg['every']
-            if step_number % every == 0:
-                loss_type = 'ce' if isinstance(self.loss_fn, nn.CrossEntropyLoss) else 'mse'
-                # train
-                stats_tr = _per_sample_stats(self.net, self.loss_fn, self.X, self.Y, loss_type=loss_type, batch_size=self.batch_size, device=self.device)
-                # test (if present)
-                if (self.X_test is not None) and (len(self.X_test) > 0):
-                    stats_te = _per_sample_stats(self.net, self.loss_fn, self.X_test, self.Y_test, loss_type=loss_type, batch_size=self.batch_size, device=self.device)
-                else:
-                    stats_te = {k: np.zeros_like(v) for k, v in stats_tr.items()}
-
-                # collect metrics
-                for metric in self.per_sample_histograms.metrics:
-                    # Quantiles (log to wandb)
-                    quantiles_tr = _quantiles(stats_tr[metric])
-                    quantiles_te = _quantiles(stats_te[metric])
-                    
-                    for q, name in zip((0.1, 0.5, 0.9, 0.99), ('q10','q50','q90','q99')):
-                        metrics[f'ps_quantiles/{metric}_train_{name}'] = np.quantile(stats_tr[metric], q)
-                        metrics[f'ps_quantiles/{metric}_test_{name}'] = np.quantile(stats_te[metric], q)
-
-                    # Histograms (save to file)
-                    counts_tr = _hist_log10(stats_tr[metric], self.bin_edges)
-                    counts_te = _hist_log10(stats_te[metric], self.bin_edges)
-
-                    # Store for saving to file later
-                    np.savez(
-                        self.ps_dir / f'step_{step_number:05d}_{metric}.npz',
-                        bin_edges=self.bin_edges,
-                        counts_train=counts_tr,
-                        counts_test=counts_te,
-                        quantiles_train=quantiles_tr,
-                        quantiles_test=quantiles_te
-                    )
-
-                    # Render frame
-                    if not self.per_sample_cfg.get('no_frames', False):
-                        title = f'Step {step_number}: log10({metric})'
-                        out_path = self.frames_dir / f'{step_number:05d}_{metric}.png'
-                        _render_frame(self.bin_edges, counts_tr, counts_te, title, out_path)
-
 
 
         # ----- Gradient-noise interaction (GNI) -----
@@ -1696,48 +1211,6 @@ class MeasurementRunner:
             )
 
 
-        # ----- NEW: Prototype per-sample stats over time -----
-        if self.prototype_data is not None and self.per_sample_cfg and self.per_sample_cfg['enabled']:
-            proto_every = self.per_sample_cfg["every"]
-            if step_number % proto_every == 0:
-                loss_type = 'ce' if isinstance(self.loss_fn, nn.CrossEntropyLoss) else 'mse'
-
-                proto_dir = self.ps_dir / "prototypes"
-                _ensure_dir(proto_dir)
-
-                for name, (X_p, Y_p) in self.prototype_data.items():
-                    X_p = X_p.to(self.device)
-                    Y_p = Y_p.to(self.device)
-
-                    # Per-sample stats
-                    stats = _per_sample_stats(
-                        self.net,
-                        self.loss_fn,
-                        X_p,
-                        Y_p,
-                        loss_type=loss_type,
-                        batch_size=len(X_p),
-                        device=self.device,
-                    )
-                    
-                    # NEW: Add batch sharpness for this prototype set
-                    # Compute full loss on this prototype set
-                    self.net.zero_grad()
-                    preds = self.net(X_p).squeeze(dim=-1)
-                    proto_loss = self.loss_fn(preds, Y_p)
-                    
-                    # Compute batch sharpness (gHg/g²)
-                    batch_sharpness = compute_grad_H_grad(proto_loss, self.net).item()
-                    
-                    # Add to stats
-                    stats['batch_sharpness'] = batch_sharpness
-                    stats['mean_loss'] = np.mean(stats['loss'])
-                    
-                    out_path = proto_dir / f"step_{step_number:05d}_{name}.npz"
-                    np.savez(out_path, **stats)
-
-
-
         metrics['epoch_loss_update'] = epoch_loss_update
         return metrics
  
@@ -1780,7 +1253,6 @@ def train(
             quad_switch_lr: float = None,  # lr to use after switching to quadratic approximation
             precise_plots: bool = False,  # Enable more frequent measurements for precise plotting
             rare_measure: bool = False,  # Make expensive measurements rarer
-            memorization_outlier_frac: float = 0.05,  # Fraction of samples marked as outliers for memorization metric
             # Gradient projection configuration
             proj_switch_step: int = None,  # Step to start projecting minibatch gradients
             proj_top_l: int = None,        # Number of top eigendirections to use for projection
@@ -1788,15 +1260,9 @@ def train(
             wandb_run=None,
             wandb_enabled: bool = False,
             wandb_run_id: str = None,
-            per_sample_cfg=None, #NEW 
-            knn_outlier_cfg=None,
             subset_tracking_cfgs=None,
             prototype_data=None,
             log_every_step: bool = False,
-            lmax_decay: bool = False,
-            lmax_decay_target_lr: float = 0.001,
-            lmax_decay_steps: int = 10000,
-            lmax_decay_initial_lr: float = None,
             lmax_drop: bool = False,
             lmax_drop_mult: float = 0.5,
             lmax_drop_target_lr: float = None,
@@ -1833,13 +1299,9 @@ def train(
 
     X, Y = X_train, Y_train
 
-    # ----- Lmax Decay Setup -----
+    # ----- LR Drop Setup -----
     decay_active = False
-    decay_start_step = None
-    decay_start_lr = None
-    if lmax_decay_initial_lr is None:
-        lmax_decay_initial_lr = optimizer.param_groups[0]['lr']
-    lmax_decay_threshold = 2.0 / lmax_decay_initial_lr
+    lmax_decay_threshold = 2.0 / optimizer.param_groups[0]['lr']
 
     # ----- Device Alignment -----
     net = net.to(device)
@@ -1939,8 +1401,6 @@ def train(
         gd_noise=gd_noise,
         proj_switch_step=proj_switch_step,
         quad_approx=quad_approx,
-        memorization_outlier_frac=memorization_outlier_frac,
-        per_sample_cfg=per_sample_cfg,
         subset_tracking_cfgs=subset_tracking_cfgs,
         prototype_data=prototype_data,    
         full_inputs_test=None,
@@ -2020,7 +1480,6 @@ def train(
                 step_number=step_number,
             )
             if lmax_drop:
-                # Adam: trigger off AEoS ratio ~ 1
                 if args.adam and ('adam_edge_ratio' in metrics):
                     r = metrics.get('adam_edge_ratio', float('nan'))
                     if (not decay_active) and math.isfinite(r) and (r >= 1.0):
@@ -2035,7 +1494,7 @@ def train(
                 else:
                     lmax_value = metrics.get('lmax', float('nan'))
                     if (not decay_active) and math.isfinite(lmax_value) and (lmax_value >= lmax_decay_threshold):
-                        decay_active = True  # reuse as "already dropped"
+                        decay_active = True
                         old_lr = optimizer.param_groups[0]['lr']
                         new_lr = old_lr * float(lmax_drop_mult)
                         if lmax_drop_target_lr is not None:
@@ -2044,30 +1503,6 @@ def train(
                             pg['lr'] = new_lr
                         print(f"[LR DROP] step={step_number} lmax={lmax_value:.4f} thresh={lmax_decay_threshold:.4f} lr: {old_lr:g} -> {new_lr:g}")
 
-                
-            # --- Lmax-based Learning Rate Decay Logic ---
-            if lmax_decay:
-                lmax_value = metrics.get('lmax', float('nan'))
-                if not decay_active and math.isfinite(lmax_value):
-                    if lmax_value >= lmax_decay_threshold:
-                        decay_active = True
-                        decay_start_step = step_number
-                        decay_start_lr = optimizer.param_groups[0]['lr']
-                        print(
-                            f"Lmax decay triggered at step {step_number}: "
-                            f"lmax={lmax_value:.4f} >= {lmax_decay_threshold:.4f}"
-                        )
-
-                if decay_active:
-                    steps_elapsed = step_number - decay_start_step
-                    t = min(steps_elapsed / max(lmax_decay_steps, 1), 1.0)
-                    new_lr = decay_start_lr + t * (lmax_decay_target_lr - decay_start_lr)
-                    for pg in optimizer.param_groups:
-                        pg['lr'] = new_lr
-    
-            if lmax_drop and lmax_decay:
-                raise ValueError("Use either --lmax-drop or --lmax-decay, not both.")
-            
             # --- Epoch-Level Loss Tracking ---
             if metrics['epoch_loss_update'] is not None:
                 if math.isnan(metrics['epoch_loss_update']):
@@ -2355,37 +1790,6 @@ def train(
     )
     print(f"Final checkpoint saved: {final_checkpoint_path}")
 
-    # ----- NEW: per-sample stats on prototype sets -----
-    if prototype_data is not None:
-        print("Computing per-sample metrics for prototype sets...")
-        loss_type = 'ce' if isinstance(loss_fn, nn.CrossEntropyLoss) else 'mse'
-
-        _validate_nonempty_prototype_subsets(
-            prototype_data,
-            context="final per-sample prototype metrics",
-            require_nonempty=True,
-        )
-
-        proto_dir = save_to / "prototype_final"
-        _ensure_dir(proto_dir)
-
-        for name, (X_p, Y_p) in prototype_data.items():
-            X_p = X_p.to(device)
-            Y_p = Y_p.to(device)
-
-            stats = _per_sample_stats(
-                net,
-                loss_fn,
-                X_p,
-                Y_p,
-                loss_type=loss_type,
-                batch_size=batch_size,
-                device=device,
-            )
-            out_path = proto_dir / f"final_{name}.npz"
-            np.savez(out_path, **stats)
-            print(f"  saved {name} -> {out_path}")
-
     results_file.close()
 
     measurement_runner.close()
@@ -2395,106 +1799,6 @@ def train(
         _log_train_time()
         wandb_run.finish()
         wandb_finished = True
-
-    if knn_outlier_cfg and knn_outlier_cfg.get('enabled', False):
-        print("Computing k-NN neighbor-mix outliers...")
-        feature_batch = knn_outlier_cfg.get('feature_batch_size', 512)
-        k_neighbors = knn_outlier_cfg.get('k_neighbors', 32)
-        top_k_per_class = knn_outlier_cfg.get('top_k_per_class', 5)
-        balance_target = knn_outlier_cfg.get('balance_target', 0.5)
-        chunk_size = knn_outlier_cfg.get('chunk_size', 1024)
-        normalize = knn_outlier_cfg.get('normalize', True)
-        return_indices = knn_outlier_cfg.get('return_neighbor_indices', True)
-
-        features = extract_feature_matrix(
-            net,
-            X,
-            batch_size=feature_batch,
-            flatten_outputs=True,
-        )
-        label_tensor = Y.detach().cpu()
-
-        outlier_summary = identify_knn_outliers_by_neighbor_mix(
-            features,
-            label_tensor,
-            k_neighbors=k_neighbors,
-            top_k_per_class=top_k_per_class,
-            balance_target=balance_target,
-            chunk_size=chunk_size,
-            normalize=normalize,
-            return_neighbor_indices=return_indices,
-        )
-
-        per_class_indices = {}
-        per_class_stats = {}
-        flattened_rows = []
-        global_balance_dev = []
-        global_entropy = []
-        global_gap = []
-
-        for class_id, entries in outlier_summary.get("outliers", {}).items():
-            if not entries:
-                continue
-            per_class_indices[int(class_id)] = [int(e["dataset_index"]) for e in entries]
-
-            ratios = np.array([e["same_class_ratio"] for e in entries], dtype=np.float32)
-            devs = np.array([e["balance_deviation"] for e in entries], dtype=np.float32)
-            entropies = np.array([e["neighbor_entropy"] for e in entries], dtype=np.float32)
-            gaps = np.array([e["top_two_gap"] for e in entries], dtype=np.float32)
-
-            per_class_stats[int(class_id)] = {
-                "count": len(entries),
-                "mean_same_class_ratio": float(ratios.mean()),
-                "mean_balance_deviation": float(devs.mean()),
-                "mean_neighbor_entropy": float(entropies.mean()),
-                "mean_top_two_gap": float(gaps.mean()),
-            }
-
-            global_balance_dev.extend(devs.tolist())
-            global_entropy.extend(entropies.tolist())
-            global_gap.extend(gaps.tolist())
-
-            for entry in entries:
-                flattened_rows.append({
-                    "dataset_index": int(entry["dataset_index"]),
-                    "class_id": int(class_id),
-                    "same_class_ratio": float(entry["same_class_ratio"]),
-                    "balance_deviation": float(entry["balance_deviation"]),
-                    "neighbor_entropy": float(entry["neighbor_entropy"]),
-                    "top_two_gap": float(entry["top_two_gap"]),
-                    "avg_neighbor_distance": float(entry["avg_neighbor_distance"]),
-                })
-
-        outlier_path = save_to / 'knn_outliers.json'
-        with open(outlier_path, 'w') as f:
-            json.dump(outlier_summary, f, indent=2)
-
-        indices_payload = {
-            "k_neighbors": k_neighbors,
-            "top_k_per_class": top_k_per_class,
-            "class_ids": outlier_summary.get("class_ids", []),
-            "per_class_indices": {str(k): v for k, v in per_class_indices.items()},
-            "flat_indices": sorted({idx for v in per_class_indices.values() for idx in v}),
-        }
-        with open(save_to / 'knn_outlier_indices.json', 'w') as f:
-            json.dump(indices_payload, f, indent=2)
-
-        if wandb_enabled and wandb_run is not None:
-            total_flagged = len(flattened_rows)
-            wandb_metrics = {
-                "knn_outliers/total_flagged": total_flagged,
-                "knn_outliers/mean_balance_deviation": float(np.mean(global_balance_dev)) if global_balance_dev else float('nan'),
-                "knn_outliers/mean_neighbor_entropy": float(np.mean(global_entropy)) if global_entropy else float('nan'),
-                "knn_outliers/mean_top_two_gap": float(np.mean(global_gap)) if global_gap else float('nan'),
-            }
-            for class_id, stats in per_class_stats.items():
-                prefix = f"knn_outliers/class_{class_id}"
-                for name, value in stats.items():
-                    wandb_metrics[f"{prefix}/{name}"] = value
-
-            log_knn_outlier_results(wandb_metrics, flattened_rows)
-
-        print(f"k-NN outlier summary saved to {outlier_path}")
 
 
     # ----- Optional Final Measurements -----
@@ -2610,9 +1914,6 @@ if __name__ == '__main__':
             "Provide at least one of --input-boundary, --input-inliers, --input-x-outliers, or --input-y-outliers."
         )
 
-    if args.memorization_outlier_frac <= 0 or args.memorization_outlier_frac >= 1:
-        raise ValueError("--memorization-outlier-frac must be in (0, 1)")
-
     # Validate gradient projection feature flags and conflicts
     if (args.proj_switch_step is not None) or (args.proj_top_l is not None) or args.proj_to_residual:
         if args.proj_switch_step is None or args.proj_top_l is None:
@@ -2640,17 +1941,6 @@ if __name__ == '__main__':
     if len(exclusive_modes) > 1:
         raise ValueError(f"Cannot use multiple training modes simultaneously: {', '.join(exclusive_modes)}. Please choose only one.")
 
-    if args.feature_prototypes and (args.classes is None or len(args.classes) != 2):
-        raise ValueError("--feature-prototypes requires specifying exactly two classes via --classes")
-
-    if args.lmax_decay_steps < 1:
-        raise ValueError("--lmax-decay-steps must be >= 1")
-    if args.lmax_decay_target_lr < 0:
-        raise ValueError("--lmax-decay-target-lr must be >= 0")
-    if args.lmax_decay and not args.lambdamax:
-        print("--lmax-decay requires --lambdamax; enabling lambda_max measurement.")
-        args.lambdamax = True
-    
     # ----- Measurement Selection -----
     measurements = {name for name, enabled in [
     ('lmax', args.lambdamax),
@@ -2666,7 +1956,6 @@ if __name__ == '__main__':
     ('final', args.final),
     ('param_distance', args.param_distance),
     ('hessian_trace', args.hessian_trace),
-    ('memorization_hessian_outliers', args.memorization_hessian_outliers),
     ('train_test_gap', args.train_test_gap),
     ('lmax_precond_adam', args.precond_lmax),
     ] if enabled}
@@ -2739,21 +2028,7 @@ if __name__ == '__main__':
         )
     input_proto_mode = args.input_prototypes_mode
     prototype_data = dict(selected_prototype_data)
-    combined_prototype_data = dict(prototype_data)
-    if args.track_feature_prototypes_from:
-        tracked_feature_prototypes, _ = _load_reference_feature_prototypes(
-            dataset,
-            args.model,
-            args.track_feature_prototypes_from,
-        )
-        for name, tensors in tracked_feature_prototypes.items():
-            combined_prototype_data[name] = tensors
-        print(
-            f"Loaded feature-space prototypes from run {args.track_feature_prototypes_from} "
-            f"({len(tracked_feature_prototypes)} subsets)"
-        )
-
-    prototype_data = combined_prototype_data
+    prototype_data = dict(prototype_data)
     train_outlier_tracking = {}
     if input_proto_mode == "val" and prototype_data:
         missing_index_subsets = [
@@ -2891,25 +2166,7 @@ if __name__ == '__main__':
     else:
         checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
     
-    knn_outlier_cfg = None
-    if args.knn_outliers:
-        if args.knn_neighbors < 2:
-            raise ValueError("--knn-neighbors must be >= 2 when --knn-outliers is set")
-        if args.knn_top_per_class < 1:
-            raise ValueError("--knn-top-per-class must be >= 1 when --knn-outliers is set")
-
-        knn_outlier_cfg = {
-            "enabled": True,
-            "k_neighbors": args.knn_neighbors,
-            "top_k_per_class": args.knn_top_per_class,
-            "feature_batch_size": args.knn_feature_batch,
-            "chunk_size": args.knn_chunk_size,
-            "normalize": not args.knn_no_normalize,
-            "return_neighbor_indices": True,
-        }
-
-    subset_tracking_cfgs = prepare_knn_subset_tracking_configs(args, dataset, args.model, data) if args.track_knn_outliers_from else []
-    subset_tracking_cfgs.extend(prepare_feature_prototype_subset_configs(prototype_data))
+    subset_tracking_cfgs = []
     track_input_metrics = bool(prototype_data) or bool(train_outlier_tracking)
     if track_input_metrics:
         subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prototype_data, base_batch_size=batch_size))
@@ -2922,18 +2179,6 @@ if __name__ == '__main__':
         }
         subset_tracking_cfgs.extend(prepare_prototype_subset_configs(injected_tracking, base_batch_size=batch_size))
 
-
-    per_sample_cfg = None
-    if args.per_sample:
-        per_sample_cfg = {
-            'enabled': True,
-            'every': max(1, int(args.per_sample_every)),
-            'hist_min_log10': args.hist_min_log10,
-            'hist_max_log10': args.hist_max_log10,
-            'hist_bins': args.hist_bins,
-            'metrics': args.per_sample_metrics,   # ['loss','resid','kappa']
-            'no_frames': args.no_frames,
-        }
 
     # ----- Training Invocation -----
     train(
@@ -2968,7 +2213,6 @@ if __name__ == '__main__':
         use_gauss_newton=args.use_gauss_newton,
         precise_plots=args.precise_plots,
         rare_measure=args.rare_measure,
-        memorization_outlier_frac=args.memorization_outlier_frac,
         proj_switch_step=args.proj_switch_step,
         proj_top_l=args.proj_top_l,
         proj_to_residual=args.proj_to_residual,
@@ -2976,39 +2220,10 @@ if __name__ == '__main__':
         wandb_enabled=wandb_enabled,
         wandb_run_id=wandb_run_id,
         #NEW
-        per_sample_cfg=per_sample_cfg,
-        knn_outlier_cfg=knn_outlier_cfg,
         subset_tracking_cfgs=subset_tracking_cfgs,
         prototype_data=prototype_data,
         log_every_step=args.log_every_step,
-        lmax_decay=args.lmax_decay,
-        lmax_decay_target_lr=args.lmax_decay_target_lr,
-        lmax_decay_steps=args.lmax_decay_steps,
-        lmax_decay_initial_lr=args.lr,
         lmax_drop=args.lmax_drop,
         lmax_drop_mult=args.lmax_drop_mult,
         lmax_drop_target_lr=args.lmax_drop_target_lr,
     )
-
-    if args.feature_prototypes:
-        print("Computing feature-space prototypes for export...")
-        feature_batch = args.feature_prototype_batch
-        features = extract_feature_matrix(
-            net=net,
-            inputs=train_x,
-            batch_size=feature_batch,
-            flatten_outputs=True,
-        )
-        proto_sets, proto_meta = generate_feature_space_prototype_sets(
-            net=None,
-            Y_train=train_y,
-            classes=tuple(args.classes),
-            precomputed_features=features,
-            original_inputs=train_x,
-            normalize_features=not args.feature_prototype_no_normalize,
-            k_neighbors=args.feature_prototype_kneighbors,
-            prototypes_per_class=args.feature_prototype_topk,
-            extrapolation_factor=args.feature_prototype_extrapolation,
-        )
-        _save_feature_prototype_package(run_folder, proto_sets, proto_meta)
-        print(f"Feature-space prototypes saved to {run_folder / 'feature_prototypes'}")

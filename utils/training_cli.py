@@ -84,9 +84,6 @@ def build_parser(extrapolation_factor: float) -> argparse.ArgumentParser:
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for training')
 
     # --- LR Schedule Controls ---
-    parser.add_argument('--lmax-decay', action='store_true', help='Enable linear lr decay once lambda_max >= 2/initial_lr')
-    parser.add_argument('--lmax-decay-target-lr', type=float, default=0.0001, help='Target lr for linear decay after lmax trigger')
-    parser.add_argument('--lmax-decay-steps', type=int, default=10000, help='Number of steps to linearly decay to target lr')
     parser.add_argument('--lmax-drop', action='store_true', help='One-time LR drop once lambda_max exceeds threshold (2/initial_lr).')
     parser.add_argument('--lmax-drop-mult', type=float, default=0.5, help='Multiply LR by this factor on trigger. (0.5 = 50%% drop, 0.8 = 20%% drop)')
     parser.add_argument('--lmax-drop-target-lr', type=float, default=None, help='Optional floor: LR after drop is max(LR*mult, target).')
@@ -163,36 +160,6 @@ def build_parser(extrapolation_factor: float) -> argparse.ArgumentParser:
     parser.add_argument('--wandb-notes', type=str, default=None, help='Optional notes/description attached to the wandb run')
     parser.add_argument('--disable-wandb', action='store_true', help='Disable Weights & Biases logging for debugging/testing')
     parser.add_argument('--train-test-gap', action='store_true', help='If set, compute the training and testing accuracy and gap (heavy, runs rarely)')
-
-    # --- Per-sample Tracking ---
-    parser.add_argument('--per-sample', action='store_true', help='Track per-sample loss/residual/curvature histograms over time and save frames')
-    parser.add_argument('--per-sample-every', type=int, default=100, help='Snapshot cadence in steps for per-sample histograms (default: 100)')
-    parser.add_argument('--hist-min-log10', type=float, default=-6.0, help='Left edge for log10 binning (default: -6)')
-    parser.add_argument('--hist-max-log10', type=float, default=2.0, help='Right edge for log10 binning (default: 2)')
-    parser.add_argument('--hist-bins', type=int, default=80, help='Number of bins for log10 histograms (default: 80)')
-    parser.add_argument('--per-sample-metrics', type=str, nargs='+', default=['loss', 'resid', 'kappa'], choices=['loss', 'resid', 'kappa'], help='Which metrics to histogram (default: loss resid kappa)')
-    parser.add_argument('--no-frames', action='store_true', help='Only save counts/quantiles as .npz; do not render PNG frames')
-
-    # --- Post-hoc Outlier Analysis ---
-    parser.add_argument('--memorization-hessian-outliers', action='store_true', help='Compute memorization stats based on alignment with top Hessian eigenvector (heavy; runs rarely)')
-    parser.add_argument('--memorization-outlier-frac', type=float, default=0.05, help='Fraction of examples treated as outliers for Hessian-alignment memorization stats')
-    parser.add_argument('--knn-outliers', action='store_true', help='After training, run a k-NN pass to flag ambiguous samples')
-    parser.add_argument('--knn-neighbors', type=int, default=32, help='Number of neighbors used for the ambiguity score')
-    parser.add_argument('--knn-top-per-class', type=int, default=10, help='How many outliers to keep per class')
-    parser.add_argument('--knn-feature-batch', type=int, default=512, help='Batch size used during the post-hoc embedding pass')
-    parser.add_argument('--knn-chunk-size', type=int, default=1024, help='Chunk size used while computing the k-NN graph')
-    parser.add_argument('--knn-no-normalize', action='store_true', help='Disable L2-normalization of feature vectors before k-NN')
-    parser.add_argument('--track-knn-outliers-from', type=str, default=None, help='Existing plaintext run folder name (e.g., 20251124_0820_35_lr0.01000_b8) whose knn_outlier_indices.json should be tracked during training')
-    parser.add_argument('--track-knn-topk', type=int, default=5, help='Number of stored outliers per class to track from the reference run')
-
-    # --- Feature-space Prototypes ---
-    parser.add_argument('--feature-prototypes', action='store_true', help='After training, export feature-space prototype sets for reuse')
-    parser.add_argument('--feature-prototype-batch', type=int, default=512, help='Batch size for feature extraction when exporting feature prototypes')
-    parser.add_argument('--feature-prototype-topk', type=int, default=50, help='Maximum prototypes per class to store from feature space')
-    parser.add_argument('--feature-prototype-kneighbors', type=int, default=32, help='k-NN neighborhood size when identifying boundary points in feature space')
-    parser.add_argument('--feature-prototype-no-normalize', action='store_true', help='Disable L2 normalization before computing feature-space prototypes')
-    parser.add_argument('--feature-prototype-extrapolation', type=float, default=extrapolation_factor, help='Extrapolation factor used when building feature-space x-outliers')
-    parser.add_argument('--track-feature-prototypes-from', type=str, default=None, help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
 
     # --- Input-space Prototypes ---
     parser.add_argument('--input-prototypes-mode', type=str, default='train', choices=['train', 'val'], help='Input prototype mode: train includes the selected prototype subsets in training; val excludes real-data subsets from training and tracks them as held-out evaluation sets.')
