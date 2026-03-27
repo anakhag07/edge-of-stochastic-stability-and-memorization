@@ -1,110 +1,120 @@
 # edge-of-stochastic-stability-and-memorization
 This repository builds on edge-of-stochastic-stability repo to quantify memorization during training and relationship to edge of stochastic stability and progressive sharpening. The information on the original repository follows here. 
 
-## Tracking Outlier Metrics (Input Prototypes)
-
-Input-space prototypes now use one source flag, one mode flag, and four per-subset count flags. All four counts are per class. Base configs should leave `input_prototype_source` unset unless they also request at least one subset count.
-
-- `--input-prototype-source`: `generate` or `from:<path-or-run>`
-- `--input-prototypes-mode`: `train` or `val`
-- `--input-boundary`, `--input-inliers`, `--input-x-outliers`, `--input-y-outliers`: selected prototypes per class
-
-In `train` mode, the selected prototype subsets are appended to the training set and tracked during training.
-
-In `val` mode, the selected prototype subsets are tracked but not trained on. Real-data subsets (`boundary`, `inliers`) are removed from the base training set before optimization; synthetic subsets (`x_outlier`, `y_outlier`) remain track-only.
-
-Example (train mode):
-```bash
-python training.py --dataset cifar10_2cls --model mlp --loss ce \
-  --batch 10000 --lr 0.01 --steps 150000 --num-data 10000 --init-scale 0.2 \
-  --dataset-seed 888 --init-seed 8312 --lambdamax --batch-sharpness --classes 3 5 \
-  --input-prototype-source from:$PROTO --input-prototypes-mode train \
-  --input-x-outliers 25 --input-y-outliers 25 --input-inliers 25 --input-boundary 25
-```
-
-Example (validation mode):
-```bash
-python training.py --dataset cifar10_2cls --model mlp --loss ce \
-  --batch 10000 --lr 0.01 --steps 150000 --num-data 10000 --init-scale 0.2 \
-  --dataset-seed 888 --init-seed 8312 --lambdamax --batch-sharpness --classes 3 5 \
-  --input-prototype-source from:$PROTO --input-prototypes-mode val \
-  --input-x-outliers 25 --input-y-outliers 25 --input-inliers 25 --input-boundary 25
-```
-
-Full-GD batch behavior follows the effective training set size after prototype processing. Use `--batch full` to request explicit full-batch GD; `train` mode grows the batch to include injected prototypes and `val` mode shrinks it to match the held-out-adjusted training set.
-
-Reusable prototype packages can be generated with:
-```bash
-python tools/generate_input_prototypes.py --dataset cifar10_2cls --model mlp \
-  --classes 3 5 --num-data 10000 --loss ce --dataset-seed 888 \
-  --input-boundary 50 --input-inliers 50 --input-x-outliers 50 --input-y-outliers 50
-```
-
-___
-
-
-
-
-## Example Usage for New Metrics
-Args: 
---
-
 ## Edge of Stochastic Stability (EoSS)
 
 This repository accompanies the paper [Edge of Stochastic Stability: Revisiting the Edge of Stability for SGD](https://arxiv.org/abs/2412.20553) by Arseniy Andreyev and Pierfrancesco Beneventano. Feel free to reuse it in any way - if you ended up using this code, please consider citing it by citing our paper.
 
 ## Key Capabilities
-- Run training for MLP/CNN/ResNet on CIFAR‑10/Fashion‑MNIST/SVHN with SGD, SGDM, or Adam.
-- Measure core quantities: Batch Sharpness, $\lambda_{\max}$ (and other top eigenvalues of the Hessian of the loss), GNI, and Hessian trace
-- Log to Weights & Biases for visualization, sweeps, and plots
-- Easily extend with new measurements (see “Adding new measurements” checklist).
-- Restart runs from a checkpoint and change hyper‑parameters mid‑training.
+- Run training for MLP/CNN/ResNet on CIFAR-10/Fashion-MNIST/SVHN with SGD, SGDM, or Adam.
+- Measure core quantities: Batch Sharpness, $\lambda_{\max}$ (and other top eigenvalues of the Hessian of the loss), GNI, and Hessian trace.
+- Log to Weights & Biases for visualization, sweeps, and plots.
+- Restart runs from a checkpoint and change hyper-parameters mid-training.
 
 ## Quick Start
-- **Setup** (virtual environment highly recommended):
+- **Setup**:
   ```bash
   conda create -n eoss python=3.12
   conda activate eoss
   pip install -r requirements.txt
   ```
-  OR
-  ```bash
-  python3 -m venv eoss
-  source eoss/bin/activate
-  pip install -r requirements.txt
-  ```
-  note on conda: it seems to be deprecated by the "community" - although the code still works, although feel free to use an alternative
 - **Point to data/results roots**:
   ```bash
   export DATASETS="/path/to/datasets"
   export RESULTS="/path/to/results"
   ```
-  It is recommended to make those persistent -- e.g. by adding them into your .bashrc
-- **Download the datasets**
-```bash
+  It is recommended to make those persistent, e.g. in your `.bashrc`.
+- **Download the datasets**:
+  ```bash
   python setup/download_datasets.py
   ```
-  If you are running on MacOS, this might fail because the python process doesn't have disk access. A *potential* solution is to enable full disk access in System Settings.
-- **Sanity run (CPU-friendly)**:
-  ```bash
-  python training.py --dataset cifar10 --model mlp --batch 4 --lr 0.05 \
-  --steps 1000 --num-data 64 \
-  --lambdamax --batch-sharpness --disable-wandb \
-  --cpu
-  ```
-  Runs training, writes results to a legacy `results.txt` under `$RESULTS`. Should take less than a minute to run.
-- **Sanity run from JSON config**:
+- **Run a smoke test**:
   ```bash
   python training.py --config configs/smoke_train.json
   ```
-  JSON config files may use nested groups and `__comment` keys for section labels. CLI flags still work and override config values, e.g. `python training.py --config configs/smoke_train.json --steps 40`.
+  CLI flags still override config values, e.g. `python training.py --config configs/smoke_train.json --steps 40`.
 - **Inspect the latest run**:
   ```bash
   python visualization/plot_results.py
   ```
-  Produces quick plots from the most recent `results.txt` into `visualization/img/`.
 
+## Input Prototypes
 
+Input-space prototypes are configured through the main training entry point in `training.py`, with the canonical parser/config interface defined in `utils/training_cli.py`.
+
+The prototype workflow has three moving parts:
+- `--input-prototypes-mode`: `train` or `val`
+- `--input-prototype-source`: `generate` or `from:<path-or-run>`
+- `--input-boundary`, `--input-inliers`, `--input-x-outliers`, `--input-y-outliers`: counts per class for each subset
+
+All four subset counts are per class.
+
+- In `train` mode, the selected prototype subsets are appended to the training set and tracked during training.
+- In `val` mode, the selected prototype subsets are tracked but not trained on. `boundary` and `inliers` are removed from the base training set, while `x_outlier` and `y_outlier` remain tracked-only synthetic subsets.
+- `--batch` is over the full dataset, not per class. Use `--batch full` for explicit full-batch GD; it resolves against the effective training-set size after prototype inclusion or exclusion.
+
+Generate a reusable prototype package with:
+```bash
+python tools/generate_input_prototypes.py \
+  --dataset cifar10_2cls \
+  --model mlp \
+  --classes 3 5 \
+  --num-data 10000 \
+  --loss ce \
+  --dataset-seed 888 \
+  --input-boundary 50 \
+  --input-inliers 50 \
+  --input-x-outliers 50 \
+  --input-y-outliers 50
+```
+
+Train mode example:
+```bash
+python training.py \
+  --dataset cifar10_2cls \
+  --classes 3 5 \
+  --num-data 10000 \
+  --model mlp \
+  --loss ce \
+  --batch full \
+  --lr 0.01 \
+  --steps 150000 \
+  --init-scale 0.2 \
+  --dataset-seed 888 \
+  --init-seed 8312 \
+  --input-prototype-source from:$PROTO \
+  --input-prototypes-mode train \
+  --input-boundary 25 \
+  --input-inliers 25 \
+  --input-x-outliers 25 \
+  --input-y-outliers 25 \
+  --lambdamax \
+  --batch-sharpness
+```
+
+Validation mode example:
+```bash
+python training.py \
+  --dataset cifar10_2cls \
+  --classes 3 5 \
+  --num-data 10000 \
+  --model mlp \
+  --loss ce \
+  --batch full \
+  --lr 0.01 \
+  --steps 150000 \
+  --init-scale 0.2 \
+  --dataset-seed 888 \
+  --init-seed 8312 \
+  --input-prototype-source generate \
+  --input-prototypes-mode val \
+  --input-boundary 25 \
+  --input-inliers 25 \
+  --input-x-outliers 25 \
+  --input-y-outliers 25 \
+  --lambdamax \
+  --batch-sharpness
+```
 
 ## Standard Training Run
 
@@ -213,7 +223,8 @@ There is a somewhat rudimentary way to run hyperparameter sweeps. Basically, you
 5. Add a minimal test in `tests/` if you want.
 
 ## Repo map (only useful files)
-- `training.py` – CLI entry point; sets up datasets/models, orchestrates SGD, and wires every measurement and checkpoint hook.
+- `training.py` – executable entry point; sets up datasets/models, orchestrates SGD, and wires measurements and checkpoint hooks.
+- `utils/training_cli.py` – canonical CLI/config parser; defines supported flags, JSON config loading, and config-overrides behavior.
 - `utils/measure.py` – all measurement kernels (batch sharpness, λ_max eigens, GNI, gradient norms, etc.).
 - `utils/frequency.py` – schedules when measurements/checkpoints fire based on step counts and flags.
 - `utils/wandb_utils.py` – W&B init, logging, checkpoint save/restore, run naming, continuation helpers.

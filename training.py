@@ -1300,8 +1300,8 @@ def train(
     X, Y = X_train, Y_train
 
     # ----- LR Drop Setup -----
-    decay_active = False
-    lmax_decay_threshold = 2.0 / optimizer.param_groups[0]['lr']
+    lmax_drop_applied = False
+    lmax_drop_threshold = 2.0 / optimizer.param_groups[0]['lr']
 
     # ----- Device Alignment -----
     net = net.to(device)
@@ -1482,8 +1482,8 @@ def train(
             if lmax_drop:
                 if args.adam and ('adam_edge_ratio' in metrics):
                     r = metrics.get('adam_edge_ratio', float('nan'))
-                    if (not decay_active) and math.isfinite(r) and (r >= 1.0):
-                        decay_active = True
+                    if (not lmax_drop_applied) and math.isfinite(r) and (r >= 1.0):
+                        lmax_drop_applied = True
                         old_lr = optimizer.param_groups[0]['lr']
                         new_lr = old_lr * float(lmax_drop_mult)
                         if lmax_drop_target_lr is not None:
@@ -1493,15 +1493,15 @@ def train(
                         print(f"[ADAM LR DROP] step={step_number} edge_ratio={r:.3f} lr: {old_lr:g} -> {new_lr:g}")
                 else:
                     lmax_value = metrics.get('lmax', float('nan'))
-                    if (not decay_active) and math.isfinite(lmax_value) and (lmax_value >= lmax_decay_threshold):
-                        decay_active = True
+                    if (not lmax_drop_applied) and math.isfinite(lmax_value) and (lmax_value >= lmax_drop_threshold):
+                        lmax_drop_applied = True
                         old_lr = optimizer.param_groups[0]['lr']
                         new_lr = old_lr * float(lmax_drop_mult)
                         if lmax_drop_target_lr is not None:
                             new_lr = max(new_lr, float(lmax_drop_target_lr))
                         for pg in optimizer.param_groups:
                             pg['lr'] = new_lr
-                        print(f"[LR DROP] step={step_number} lmax={lmax_value:.4f} thresh={lmax_decay_threshold:.4f} lr: {old_lr:g} -> {new_lr:g}")
+                        print(f"[LR DROP] step={step_number} lmax={lmax_value:.4f} thresh={lmax_drop_threshold:.4f} lr: {old_lr:g} -> {new_lr:g}")
 
             # --- Epoch-Level Loss Tracking ---
             if metrics['epoch_loss_update'] is not None:

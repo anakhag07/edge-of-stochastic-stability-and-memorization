@@ -50,10 +50,15 @@ def test_input_prototype_mode_defaults_to_train():
         "--feature-prototypes",
         "--track-feature-prototypes-from",
         "--track-knn-outliers-from",
-        "--lmax-decay",
     ],
 )
 def test_legacy_input_prototype_flags_are_removed(legacy_flag):
     parser = build_parser(0.5)
     with pytest.raises(SystemExit):
         parser.parse_args([legacy_flag, "1"])
+
+
+def test_legacy_lmax_decay_flag_is_removed():
+    parser = build_parser(0.5)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--lmax-decay", "1"])
