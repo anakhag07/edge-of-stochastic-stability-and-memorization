@@ -49,11 +49,29 @@ def test_cli_overrides_json_config_values():
     assert args.cpu is True
 
 
+def test_cli_batch_full_overrides_json_config_value():
+    config_path = _write_config(
+        {
+            "training": {"batch": 7, "lr": 0.125},
+        }
+    )
+
+    args = parse_args_with_config(build_parser(0.5), ['--config', config_path, '--batch', 'full'])
+
+    assert args.batch == 'full'
+    assert args.lr == 0.125
+
+
 def test_unknown_json_key_raises_helpful_error():
     config_path = _write_config({"training": {"not_a_real_flag": 1}})
 
     with pytest.raises(ValueError, match="Unknown config key"):
         parse_args_with_config(build_parser(0.5), ['--config', config_path])
+
+
+def test_invalid_batch_string_is_rejected():
+    with pytest.raises(SystemExit):
+        parse_args_with_config(build_parser(0.5), ['--batch', 'giant'])
 
 
 def test_legacy_cli_still_works_without_config():
@@ -62,6 +80,26 @@ def test_legacy_cli_still_works_without_config():
     assert args.batch == 5
     assert args.lr == 0.02
     assert args.cpu is True
+
+
+def test_batch_full_parses_without_config():
+    args = parse_args_with_config(build_parser(0.5), ['--batch', 'full', '--lr', '0.02'])
+
+    assert args.batch == 'full'
+    assert args.lr == 0.02
+
+
+def test_batch_full_can_come_from_json_config():
+    config_path = _write_config(
+        {
+            "training": {"batch": "full", "lr": 0.125},
+        }
+    )
+
+    args = parse_args_with_config(build_parser(0.5), ['--config', config_path])
+
+    assert args.batch == 'full'
+    assert args.lr == 0.125
 
 
 def test_sample_smoke_config_parses():

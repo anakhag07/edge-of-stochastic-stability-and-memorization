@@ -33,8 +33,11 @@ from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepa
 from utils.nets import ResNet
 from utils.storage import initialize_folders
 from utils.input_prototypes import (
+    build_input_subset_counts,
+    parse_input_prototype_source,
     resolve_input_prototype_path,
     load_input_prototype_package,
+    select_input_prototype_subsets,
 )
 from utils.wandb_utils import (
     init_wandb,
@@ -217,47 +220,8 @@ def _sample_inlier_subsets(
     return subsets
 
 
-def _parse_input_prototype_source(raw: str):
-    if raw is None:
-        return {"mode": None, "value": None}
-
-    value = raw.strip()
-    lowered = value.lower()
-    if lowered in ("none", "off", "false"):
-        return {"mode": "none", "value": None}
-    if lowered in ("generate", "gen"):
-        return {"mode": "generate", "value": None}
-    if value.startswith("from:"):
-        return {"mode": "from", "value": value[5:]}
-    if value.startswith("run:"):
-        return {"mode": "from", "value": value[4:]}
-    return {"mode": "from", "value": value}
-
-
 def _build_input_prototype_counts(args) -> Dict[str, int]:
-    counts = {}
-    if args.input_prototypes_boundary_count is not None:
-        counts["boundary"] = args.input_prototypes_boundary_count
-    if args.input_prototypes_inliers_count is not None:
-        counts["inliers"] = args.input_prototypes_inliers_count
-    if args.input_prototypes_x_outlier_count is not None:
-        counts["x_outlier"] = args.input_prototypes_x_outlier_count
-    if args.input_prototypes_y_outlier_count is not None:
-        counts["y_outlier"] = args.input_prototypes_y_outlier_count
-    return counts
-
-
-def _build_input_prototype_holdout_counts(args) -> Dict[str, int]:
-    counts = {}
-    if args.input_prototypes_holdout_boundary_count is not None:
-        counts["boundary"] = args.input_prototypes_holdout_boundary_count
-    if args.input_prototypes_holdout_inliers_count is not None:
-        counts["inliers"] = args.input_prototypes_holdout_inliers_count
-    if args.input_prototypes_holdout_x_outlier_count is not None:
-        counts["x_outlier"] = args.input_prototypes_holdout_x_outlier_count
-    if args.input_prototypes_holdout_y_outlier_count is not None:
-        counts["y_outlier"] = args.input_prototypes_holdout_y_outlier_count
-    return counts
+    return build_input_subset_counts(args)
 
 
 def _validate_nonempty_prototype_subsets(
@@ -2545,236 +2509,7 @@ def train(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description='Training script')
-    parser.add_argument('--config', type=str, default=None, help='Path to a JSON config file. CLI flags override config values.')
-    # --- Seed ---
-    parser.add_argument("--seed", type=int, default=88881)
-
-    # --- Training Parameters ---
-    parser.add_argument('--batch', type=int, default=64, help='Input batch size for training')
-    parser.add_argument('--epochs', type=int, help='Number of epochs to train')
-    parser.add_argument('--steps', type=int, default=10000, help='Number of steps to train. Either epochs or steps should be provided')
-    parser.add_argument('--cpu', action='store_true', help='Force training to run on CPU even if CUDA is available')
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for training')
-
-    # --- Lmax LR Decay Configuration ---
-    parser.add_argument('--lmax-decay', action='store_true',
-                        help='Enable linear lr decay once lambda_max >= 2/initial_lr')
-    parser.add_argument('--lmax-decay-target-lr', type=float, default=0.0001,
-                        help='Target lr for linear decay after lmax trigger')
-    parser.add_argument('--lmax-decay-steps', type=int, default=10000,
-                        help='Number of steps to linearly decay to target lr')
-
-    # --- LR Drop Configuration ---
-    parser.add_argument('--lmax-drop', action='store_true',
-                        help='One-time LR drop once lambda_max exceeds threshold (2/initial_lr).')
-    parser.add_argument('--lmax-drop-mult', type=float, default=0.5,
-                        help='Multiply LR by this factor on trigger. (0.5 = 50%% drop, 0.8 = 20%% drop)')
-    parser.add_argument('--lmax-drop-target-lr', type=float, default=None,
-                        help='Optional floor: LR after drop is max(LR*mult, target).')
-
-    # --- Loss Configuration ---
-    parser.add_argument('--stop-loss', '--stop_loss', type=float, default=None, help='Stop training if loss goes below this value')
-    parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'ce'], help='Loss function to use (mse or ce)')
-
-    # --- Dataset Configuration ---
-    parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset to use for training')
-    parser.add_argument('--classes', type=int, nargs=2, default=[1, 9], help='Two class labels to use for training. Default is [1, 9], as being probably the most difficult classes to separate')
-    parser.add_argument('--num-data', '--num_data', type=int, default=1024, help='Number of datapoints to train on')
-
-    # --- Model Configuration ---
-    parser.add_argument('--model', type=str, default='mlp', help='Network architecture to use for training')
-    parser.add_argument('--init-scale', '--init_scale', type=float, default=0.2, help='Initialization scale for network weights')
-    parser.add_argument('--no-init', '--no_init', action='store_true', help='If set, do not initialize network weights')
-
-    # --- wandb Continuation Options ---
-    parser.add_argument('--cont-run-id', '--cont_run_id', type=str, default=None, help='Wandb run ID to continue training from')
-    parser.add_argument('--cont-step', '--cont_step', type=int, default=None, help='Step to continue training from (uses closest available checkpoint)')
-    parser.add_argument('--checkpoint-every', '--checkpoint_every', type=int, default=None, help='Save checkpoint every N steps (default: auto-calculated based on total steps)')
-
-    # --- Optimizer Variants ---
-    parser.add_argument('--momentum', type=float, default=None, help='Momentum for SGD optimizer')
-    parser.add_argument('--adam', action='store_true', help='If set, use Adam optimizer instead of SGD')
-    parser.add_argument('--weight-decay', type=float, default=0.0)
-    parser.add_argument('--precond-lmax', action='store_true',
-        help='Log Adam-preconditioned top Hessian eigenvalue (AEoS sharpness).')
-
-    # --- Measurement Flags (Primary) ---
-    parser.add_argument('--lambdamax', '--lmax', action='store_true', help='If set, compute the lambda_max, aka FullBS')
-    parser.add_argument('--batch-sharpness', '--batch-sharpness-step', '--bs', action='store_true', dest='batch_sharpness',
-                        help='If set, compute the batch sharpness: E[gHg/g²] with the expectation taken across mini-batches. Use --batch-sharpness-step for backward compatibility.')
-    parser.add_argument('--step-sharpness', action='store_true', dest='step_sharpness',
-                        help='If set, compute the step sharpness: the current-mini-batch Rayleigh quotient g·Hg/g². Average across steps to recover the traditional batch sharpness.')
-    parser.add_argument('--gni', action='store_true', help='If set, compute the Gradient-Noise Interaction quantity.')
-
-    # --- Measurement Flags (Secondary, aka still useful) ---
-    parser.add_argument('--hessian-trace', action='store_true', help='Estimate the trace of the full-batch loss Hessian via a Hutchinson-style estimator')
-    parser.add_argument('--grad-projection', action='store_true', help='Compute grad_projection_i: fraction of full-batch gradient lying in span of top-i cached Hessian eigenvectors (i up to 20); uses cached eigenvectors only; only for plain SGD')
-    parser.add_argument('--one-step-loss-change', action='store_true', help='If set, compute the expected one-step change in loss using Monte Carlo estimation')
-    parser.add_argument('--gradient-norm', action='store_true', help='If set, compute the Monte Carlo estimate of squared norm of mini-batch gradients')
-    parser.add_argument('--final', action='store_true', help='If set, compute the lambda_max and step sharpness at the end')
-
-    # --- Measurement Flags (Tertiary, aka almost completely useless) ---
-    parser.add_argument('--batch-sharpness-exp-inside', action='store_true', help='If set, compute the batch sharpness using E[gHg]/E[g²], where the expectation is inside the ratio. Compare with step-sharpness, where the expectation stays outside the ratio.')
-    parser.add_argument('--batch-lambdamax','--batchlmax', action='store_true', help='If set, compute the batch lambda_max(H_B), aka batch lambda max')
-    parser.add_argument('--fisher', action='store_true', help='If set, compute Fisher information matrix eigenvalue. Currently only works with one-dim output')
-    parser.add_argument('--param-distance', '--param_distance', action='store_true', help='If set, compute the distance from the reference weights')
-    parser.add_argument('--param-file', '--param_file', type=str, default=None, help='Path to reference parameters for computing parameter distance')
-    parser.add_argument('--log-every-step', action='store_true', help='Force all configured measurements to log every training step, bypassing frequency rules.')
-
-    # --- Measurement Configuration ---
-    parser.add_argument('--disable-cache-eigenvectors', '--disable_cache_eigenvectors', action='store_true', help='If set, disable eigenvector caching for warm starts to improve eigenvalue computation performance')
-    parser.add_argument('--use-power-iteration', '--use_power_iteration', action='store_true', help='If set, use power iteration method instead of LOBPCG for eigenvalue computation')
-    parser.add_argument('--num-eigenvalues', '--num_eigenvalues', '--k', type=int, default=1, help='Number of eigenvalues to compute when computing lambda_max (default: 1)')
-
-    parser.add_argument('--results-rarely', '--results_rarely', action='store_true', help='If set, results will be recorded less frequently')
-    parser.add_argument('--precise-plots', action='store_true', help='Enable more frequent measurements for precise plotting')
-    parser.add_argument('--rare-measure', dest='rare_measure', action='store_true', help='Activate regime where expensive measurements are performed rarely')
-
-    # --- Noise Configuration ---
-    parser.add_argument('--gd-noise', '--gd_noise', type=str, default=None, help='Do noisy GD, to simulate SGD. Supported noises: sgd, diag, iso, const')
-    parser.add_argument('--noise-mag', '--noise_mag', type=float, default=None, help='The noise magnitude for the constant noise')
-
-    # --- SDE Configuration ---
-    parser.add_argument('--sde', action='store_true', help='Simulate the SDE dynamics (the one that correspond to the SGD). It integrates the SDE using the Euler-Maruyama method')
-    parser.add_argument('--sde-h', '--sde_h', type=float, default=0.01, help='SDE *integration* time step size (default: 0.01)')
-    parser.add_argument('--sde-eta', '--sde_eta', type=float, default=None, help='Learning rate for SDE (uses --lr if not specified)')
-    parser.add_argument('--sde-seed', '--sde_seed', type=int, default=888, help='Random seed for SDE noise generation (default: 888)')
-
-    # --- Quadratic Approximation Configuration ---
-    parser.add_argument('--quad-switch-step', '--quad_switch_step', type=int, default=None, help='Step at which to switch from true NN dynamics to quadratic Taylor approximation dynamics')
-    parser.add_argument('--use-gauss-newton', '--use_gauss_newton', action='store_true', help='Use Gauss-Newton matrix instead of Hessian for quadratic approximation')
-    parser.add_argument('--quad-switch-lr', '--quad_switch_lr', type=float, default=None, help='lr to use after switching, used to test explosion')
-
-    # --- Gradient Projection Configuration ---
-    parser.add_argument('--proj-switch-step', dest='proj_switch_step', type=int, default=None,
-                        help='Step number to start projecting minibatch gradient onto top-l Hessian eigendirections (full batch)')
-    parser.add_argument('--proj-top-l', dest='proj_top_l', type=int, default=None,
-                        help='Number of top Hessian eigendirections to project against/onto after switch step')
-    parser.add_argument('--proj-to-residual', dest='proj_to_residual', action='store_true',
-                        help='After --proj-switch-step, apply gradient projected to orthogonal complement of top-l eigenspace')
-
-    # --- Randomness Settings ---
-    parser.add_argument('--dataset-seed', '--dataset_seed', type=int, default=888, help='Random seed for dataset preparation')
-    parser.add_argument('--init-seed', '--init_seed', type=int, default=8888, help='Random seed for network initialization')
-
-    # --- wandb Settings ---
-    parser.add_argument('--wandb-tag', type=str, default=None, help='Tag to add to the wandb run')
-    parser.add_argument('--wandb-name', type=str, default=None, help='Optional suffix appended to default wandb run name (sanitized)')
-    parser.add_argument('--wandb-notes', type=str, default=None, help='Optional notes/description attached to the wandb run')
-    parser.add_argument('--disable-wandb', action='store_true', help='Disable Weights & Biases logging for debugging/testing')
-
-    # --- New Measurement Flag ---
-    parser.add_argument('--train-test-gap', action='store_true', help='If set, compute the training and testing accuracy and gap (heavy, runs rarely)')
-
-    # --- NEW: Per-Sample Histogram Configuration ---
-    parser.add_argument('--per-sample', action='store_true',
-                        help='Track per-sample loss/residual/curvature histograms over time and save frames')
-    parser.add_argument('--per-sample-every', type=int, default=100,
-                        help='Snapshot cadence in steps for per-sample histograms (default: 100)')
-    parser.add_argument('--hist-min-log10', type=float, default=-6.0,
-                        help='Left edge for log10 binning (default: -6)')
-    parser.add_argument('--hist-max-log10', type=float, default=2.0,
-                        help='Right edge for log10 binning (default: 2)')
-    parser.add_argument('--hist-bins', type=int, default=80,
-                        help='Number of bins for log10 histograms (default: 80)')
-    parser.add_argument('--per-sample-metrics', type=str, nargs='+',
-                        default=['loss','resid','kappa'],
-                        choices=['loss','resid','kappa'],
-                        help='Which metrics to histogram (default: loss resid kappa)')
-    parser.add_argument('--no-frames', action='store_true',
-                        help='Only save counts/quantiles as .npz; do not render PNG frames')
-
-    # --- NEW: Memorization via Outliers identified by Alignment with Top Hessian Eigenvector ---
-    parser.add_argument('--memorization-hessian-outliers', action='store_true', help='Compute memorization stats based on alignment with top Hessian eigenvector (heavy; runs rarely)')
-    parser.add_argument('--memorization-outlier-frac', type=float, default=0.05, help='Fraction of examples treated as outliers for Hessian-alignment memorization stats')
-
-    # --- NEW: Outlier Mining Configuration ---
-    parser.add_argument('--knn-outliers', action='store_true',
-                        help='After training, run a k-NN pass to flag ambiguous samples')
-    parser.add_argument('--knn-neighbors', type=int, default=32,
-                        help='Number of neighbors used for the ambiguity score')
-    parser.add_argument('--knn-top-per-class', type=int, default=10,
-                        help='How many outliers to keep per class')
-    parser.add_argument('--knn-feature-batch', type=int, default=512,
-                        help='Batch size used during the post-hoc embedding pass')
-    parser.add_argument('--knn-chunk-size', type=int, default=1024,
-                        help='Chunk size used while computing the k-NN graph')
-    parser.add_argument('--knn-no-normalize', action='store_true',
-                        help='Disable L2-normalization of feature vectors before k-NN')
-    parser.add_argument('--track-knn-outliers-from', type=str, default=None,
-                        help='Existing plaintext run folder name (e.g., 20251124_0820_35_lr0.01000_b8) whose knn_outlier_indices.json should be tracked during training')
-    parser.add_argument('--track-knn-topk', type=int, default=5,
-                        help='Number of stored outliers per class to track from the reference run')
-
-    # --- NEW: Feature-space Prototype Tracking ---
-    parser.add_argument('--feature-prototypes', action='store_true',
-                        help='After training, export feature-space prototype sets for reuse')
-    parser.add_argument('--feature-prototype-batch', type=int, default=512,
-                        help='Batch size for feature extraction when exporting feature prototypes')
-    parser.add_argument('--feature-prototype-topk', type=int, default=50,
-                        help='Maximum prototypes per class to store from feature space')
-    parser.add_argument('--feature-prototype-kneighbors', type=int, default=32,
-                        help='k-NN neighborhood size when identifying boundary points in feature space')
-    parser.add_argument('--feature-prototype-no-normalize', action='store_true',
-                        help='Disable L2 normalization before computing feature-space prototypes')
-    parser.add_argument('--feature-prototype-extrapolation', type=float, default=EXTRAPOLATION_FACTOR,
-                        help='Extrapolation factor used when building feature-space x-outliers')
-    parser.add_argument('--track-feature-prototypes-from', type=str, default=None,
-                        help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
-
-    # new input prototypes train vs val mode
-    parser.add_argument('--input-prototypes-mode', type=str, default=None,
-                        choices=['train', 'val'],
-                        help='Unified input-prototype mode: train (include all prototypes in training) or val '
-                             '(hold out subsets and log metrics on held-out sets). When unset, legacy behavior applies.')
-    parser.add_argument('--train-input-prototypes', type=str, default=None,
-                        help='Input prototype source for training run: generate | from:<path or run> | none')
-    parser.add_argument('--test-input-prototypes', type=str, default=None,
-                        help='Input prototype source for logging/eval: from:<path or run> | none (defaults to train-input-prototypes when unset)')
-    parser.add_argument('--input-prototypes-frac', type=float, default=None,
-                        help='Fraction of training set (per class) to use for input prototypes when generating')
-    parser.add_argument('--input-prototypes-count', type=int, default=None,
-                        help='Count per class to use for all input prototype subsets when generating')
-    parser.add_argument('--input-prototypes-boundary-count', type=int, default=None,
-                        help='Override count per class for boundary prototypes')
-    parser.add_argument('--input-prototypes-inliers-count', type=int, default=None,
-                        help='Override count per class for inlier prototypes')
-    parser.add_argument('--input-prototypes-x-outlier-count', type=int, default=None,
-                        help='Override count per class for x-outlier prototypes')
-    parser.add_argument('--input-prototypes-y-outlier-count', type=int, default=None,
-                        help='Override count per class for y-outlier prototypes')
-    parser.add_argument('--input-prototypes-holdout-boundary-count', type=int, default=None,
-                        help='Holdout count per class for boundary prototypes in validation mode')
-    parser.add_argument('--input-prototypes-holdout-inliers-count', type=int, default=None,
-                        help='Holdout count per class for inlier prototypes in validation mode')
-    parser.add_argument('--input-prototypes-holdout-x-outlier-count', type=int, default=None,
-                        help='Holdout count per class for x-outlier prototypes in validation mode')
-    parser.add_argument('--input-prototypes-holdout-y-outlier-count', type=int, default=None,
-                        help='Holdout count per class for y-outlier prototypes in validation mode')
-    parser.add_argument('--input-prototypes-holdout', type=str, default='auto',
-                        choices=['auto', 'boundary_inliers', 'none'],
-                        help='[DEPRECATED] Hold out boundary/inlier indices from training when using train-input-prototypes '
-                             '(auto => boundary_inliers for legacy flags)')
-    parser.add_argument('--track-input-prototypes', action='store_true',
-                        help='[DEPRECATED] Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
-    parser.add_argument('--input-prototype-holdout-per-class', type=int, default=None,
-                        help='[DEPRECATED] Hold out this many boundary/inlier points per class from training')
-    parser.add_argument('--input-prototype-holdout-frac', type=float, default=None,
-                        help='[DEPRECATED] Hold out this fraction of the training set per class (used to size boundary/inlier prototypes)')
-    parser.add_argument('--train-input-x-outliers', type=int, default=None,
-                        help='Augment the training set with this many input-space x-outliers per class; '
-                             'also logs input-space prototype subsets')
-    parser.add_argument('--train-input-y-outliers', type=int, default=None,
-                        help='Augment the training set with this many input-space y-outliers per class; '
-                             'also logs input-space prototype subsets')
-    parser.add_argument('--train-input-inliers', type=int, default=None,
-                        help='Augment the training set with this many input inliers per class; '
-                             'also logs input-space prototype subsets')
-    parser.add_argument('--train-input-boundary', type=int, default=None,
-                        help='Augment the training set with this many input boundary points per class; '
-                             'also logs input-space prototype subsets')
-    return parser
+    return cli_build_parser(EXTRAPOLATION_FACTOR)
 
 
 if __name__ == '__main__':
@@ -2824,7 +2559,8 @@ if __name__ == '__main__':
     # -------------------------------------
     # ----- Argument Post-processing -----
     # --- Parameter Extraction ---
-    batch_size = args.batch
+    full_batch_requested = args.batch == 'full'
+    batch_size = None if full_batch_requested else args.batch
     dataset = args.dataset
     if args.cpu:
         if T.cuda.is_available():
@@ -2849,51 +2585,30 @@ if __name__ == '__main__':
 
     if args.steps is not None and args.epochs is not None:
         raise ValueError("You should provide either epochs or steps, not both")
-    # Allow tracking input prototypes even when training with input outliers.
-
-    for flag_name in ("train_input_x_outliers", "train_input_y_outliers"):
-        flag_value = getattr(args, flag_name)
-        if flag_value is not None and flag_value < 1:
-            raise ValueError(f"--{flag_name.replace('_', '-')} must be >= 1 when provided")
-
-    if args.input_prototypes_count is not None and args.input_prototypes_count < 1:
-        raise ValueError("--input-prototypes-count must be >= 1 when provided")
-    if args.input_prototypes_frac is not None:
-        if args.input_prototypes_frac <= 0 or args.input_prototypes_frac >= 1:
-            raise ValueError("--input-prototypes-frac must be in (0, 1)")
-    if args.input_prototypes_count is not None and args.input_prototypes_frac is not None:
-        raise ValueError("Provide only one of --input-prototypes-count or --input-prototypes-frac")
-
+    if batch_size is not None and batch_size < 1:
+        raise ValueError("--batch must be >= 1 when provided as an integer")
     for flag_name in (
-        "input_prototypes_boundary_count",
-        "input_prototypes_inliers_count",
-        "input_prototypes_x_outlier_count",
-        "input_prototypes_y_outlier_count",
+        "input_x_outliers",
+        "input_y_outliers",
+        "input_inliers",
+        "input_boundary",
     ):
         flag_value = getattr(args, flag_name)
         if flag_value is not None and flag_value < 1:
             raise ValueError(f"--{flag_name.replace('_', '-')} must be >= 1 when provided")
 
-    for flag_name in (
-        "input_prototypes_holdout_boundary_count",
-        "input_prototypes_holdout_inliers_count",
-        "input_prototypes_holdout_x_outlier_count",
-        "input_prototypes_holdout_y_outlier_count",
-    ):
-        flag_value = getattr(args, flag_name)
-        if flag_value is not None and flag_value < 1:
-            raise ValueError(f"--{flag_name.replace('_', '-')} must be >= 1 when provided")
-
-    if args.input_prototype_holdout_per_class is not None and args.input_prototype_holdout_per_class < 1:
-        raise ValueError("--input-prototype-holdout-per-class must be >= 1 when provided")
-    if args.input_prototype_holdout_frac is not None:
-        if args.input_prototype_holdout_frac <= 0 or args.input_prototype_holdout_frac >= 1:
-            raise ValueError("--input-prototype-holdout-frac must be in (0, 1)")
-    if (
-        args.input_prototype_holdout_per_class is not None
-        or args.input_prototype_holdout_frac is not None
-    ) and not args.track_input_prototypes and args.train_input_prototypes is None:
-        print("Warning: input prototype holdout sizing was provided without input prototype tracking; ignoring holdout.")
+    input_proto_counts = _build_input_prototype_counts(args)
+    input_proto_source = parse_input_prototype_source(args.input_prototype_source)
+    if input_proto_counts and input_proto_source["mode"] is None:
+        raise ValueError("Input prototype subset counts require --input-prototype-source.")
+    if input_proto_source["mode"] not in (None, "generate", "from", "none"):
+        raise ValueError("Unsupported input prototype source mode.")
+    if input_proto_source["mode"] == "none" and input_proto_counts:
+        raise ValueError("--input-prototype-source none cannot be combined with input prototype subset counts.")
+    if input_proto_source["mode"] in ("generate", "from") and not input_proto_counts:
+        raise ValueError(
+            "Provide at least one of --input-boundary, --input-inliers, --input-x-outliers, or --input-y-outliers."
+        )
 
     if args.memorization_outlier_frac <= 0 or args.memorization_outlier_frac >= 1:
         raise ValueError("--memorization-outlier-frac must be in (0, 1)")
@@ -2977,57 +2692,22 @@ if __name__ == '__main__':
     # --- Unpack dataset and build tuple_data ---
     train_x, train_y, test_x, test_y = data  
     tuple_data = (train_x, train_y, test_x, test_y)
+    original_train_len = int(train_x.shape[0])
 
-
-    use_new_proto_flags = (
-        args.train_input_prototypes is not None
-        or args.test_input_prototypes is not None
-        or args.input_prototypes_mode is not None
-        or args.input_prototypes_holdout_boundary_count is not None
-        or args.input_prototypes_holdout_inliers_count is not None
-        or args.input_prototypes_holdout_x_outlier_count is not None
-        or args.input_prototypes_holdout_y_outlier_count is not None
-    )
-    train_proto_source = _parse_input_prototype_source(args.train_input_prototypes)
-    test_proto_source = _parse_input_prototype_source(args.test_input_prototypes)
-
-    if train_proto_source["mode"] is None and args.track_input_prototypes:
-        train_proto_source = {"mode": "generate", "value": None}
-
-    if test_proto_source["mode"] is None and train_proto_source["mode"] not in (None, "none"):
-        test_proto_source = {"mode": train_proto_source["mode"], "value": train_proto_source["value"]}
 
     input_proto_counts = _build_input_prototype_counts(args)
-
-    def _base_proto_count():
-        if args.input_prototypes_count is not None:
-            return args.input_prototypes_count
-        if args.input_prototypes_frac is not None:
-            return max(1, int(round(train_x.shape[0] * args.input_prototypes_frac)))
-        if not use_new_proto_flags:
-            if args.input_prototype_holdout_per_class is not None:
-                return args.input_prototype_holdout_per_class
-            if args.input_prototype_holdout_frac is not None:
-                return max(1, int(round(train_x.shape[0] * args.input_prototype_holdout_frac)))
-        return max(1, int(round(train_x.shape[0] * 0.05)))
-
-    n_proto = _base_proto_count()
+    input_proto_source = parse_input_prototype_source(args.input_prototype_source)
     proto_classes = (0, 1) if dataset == 'cifar10_2cls' else tuple(args.classes)
-    if args.train_input_x_outliers is not None:
-        n_proto = max(n_proto, args.train_input_x_outliers)
-    if args.train_input_y_outliers is not None:
-        n_proto = max(n_proto, args.train_input_y_outliers)
-
-    train_prototype_data = None
-    train_prototype_indices = None
-    if train_proto_source["mode"] == "from":
+    selected_prototype_data = {}
+    selected_prototype_indices = None
+    if input_proto_source["mode"] == "from":
         proto_path = resolve_input_prototype_path(
-            train_proto_source["value"],
+            input_proto_source["value"],
             results_root=RES_FOLDER,
             dataset=dataset,
             model=args.model,
         )
-        train_prototype_data, train_prototype_indices, proto_meta = load_input_prototype_package(proto_path)
+        all_prototype_data, all_prototype_indices, proto_meta = load_input_prototype_package(proto_path)
         _validate_input_prototype_metadata(
             proto_meta,
             dataset=dataset,
@@ -3035,185 +2715,30 @@ if __name__ == '__main__':
             dataset_seed=args.dataset_seed,
             num_data=args.num_data,
         )
-        train_prototype_data, train_prototype_indices = trim_prototype_sets(
-            train_prototype_data,
-            tuple(args.classes),
-            input_proto_counts,
-            train_prototype_indices,
+        selected_prototype_data, selected_prototype_indices = select_input_prototype_subsets(
+            all_prototype_data,
+            all_prototype_indices,
+            classes=proto_classes,
+            counts_by_subset=input_proto_counts,
         )
         print(f"Loaded input prototypes from {proto_path}")
-    elif train_proto_source["mode"] == "generate":
-        train_prototype_data, train_prototype_indices = generate_prototype_sets(
-            train_x, train_y, proto_classes, n_prototype=n_proto, return_indices=True
-        )
-        train_prototype_data, train_prototype_indices = trim_prototype_sets(
-            train_prototype_data,
+    elif input_proto_source["mode"] == "generate":
+        n_prototype = max(input_proto_counts.values())
+        all_prototype_data, all_prototype_indices = generate_prototype_sets(
+            train_x,
+            train_y,
             proto_classes,
-            input_proto_counts,
-            train_prototype_indices,
+            n_prototype=n_prototype,
+            return_indices=True,
         )
-
-    log_prototype_data = None
-    if test_proto_source["mode"] == "from":
-        proto_path = resolve_input_prototype_path(
-            test_proto_source["value"],
-            results_root=RES_FOLDER,
-            dataset=dataset,
-            model=args.model,
+        selected_prototype_data, selected_prototype_indices = select_input_prototype_subsets(
+            all_prototype_data,
+            all_prototype_indices,
+            classes=proto_classes,
+            counts_by_subset=input_proto_counts,
         )
-        log_prototype_data, _, proto_meta = load_input_prototype_package(proto_path)
-        _validate_input_prototype_metadata(
-            proto_meta,
-            dataset=dataset,
-            classes=args.classes,
-            dataset_seed=args.dataset_seed,
-            num_data=args.num_data,
-        )
-        log_prototype_data, _ = trim_prototype_sets(
-            log_prototype_data,
-            tuple(args.classes),
-            input_proto_counts,
-            None,
-        )
-        print(f"Loaded test input prototypes from {proto_path}")
-    elif test_proto_source["mode"] == "generate":
-        log_prototype_data, _ = generate_prototype_sets(
-            train_x, train_y, proto_classes, n_prototype=n_proto, return_indices=True
-        )
-        log_prototype_data, _ = trim_prototype_sets(
-            log_prototype_data,
-            proto_classes,
-            input_proto_counts,
-            None,
-        )
-
-    explicit_proto_mode = args.input_prototypes_mode is not None
-    input_proto_mode = args.input_prototypes_mode or "train"
-    holdout_counts = _build_input_prototype_holdout_counts(args)
-
-    heldout_prototype_data = None
-    heldout_prototype_indices = None
-    prototype_data_for_aug = train_prototype_data
-
-    if explicit_proto_mode and input_proto_mode == "train" and holdout_counts:
-        print("Warning: input prototype holdout flags are ignored in train mode.")
-
-    if explicit_proto_mode and input_proto_mode == "val":
-        if test_proto_source["mode"] not in (None, "none"):
-            print("Warning: --test-input-prototypes ignored in validation mode; using held-out subsets from training prototypes.")
-
-        if not holdout_counts:
-            legacy_holdout = None
-            if args.input_prototype_holdout_per_class is not None:
-                legacy_holdout = args.input_prototype_holdout_per_class
-                print("Warning: using deprecated --input-prototype-holdout-per-class for validation holdout sizing.")
-            elif args.input_prototype_holdout_frac is not None:
-                legacy_holdout = max(1, int(round(train_x.shape[0] * args.input_prototype_holdout_frac)))
-                print("Warning: using deprecated --input-prototype-holdout-frac for validation holdout sizing.")
-            if legacy_holdout is not None:
-                holdout_counts = {"boundary": legacy_holdout, "inliers": legacy_holdout}
-
-        if not holdout_counts:
-            raise ValueError(
-                "Validation mode requires input prototype holdout flags to define held-out subsets. "
-                "Provide counts for every subset you want tracked."
-            )
-
-        if train_prototype_data is None:
-            raise ValueError(
-                "Validation mode requires training prototypes to hold out; set --train-input-prototypes."
-            )
-
-        holdout_seed = (args.dataset_seed or 0) + 4242
-        train_prototype_data, heldout_prototype_data, train_prototype_indices, heldout_prototype_indices = _split_input_prototype_sets(
-            train_prototype_data,
-            train_prototype_indices,
-            classes=tuple(args.classes),
-            holdout_counts=holdout_counts,
-            seed=holdout_seed,
-        )
-        prototype_data_for_aug = train_prototype_data
-
-        if heldout_prototype_indices:
-            holdout_tensors = []
-            boundary_idx = heldout_prototype_indices.get("boundary") if heldout_prototype_indices else None
-            inlier_idx = heldout_prototype_indices.get("inliers") if heldout_prototype_indices else None
-            if boundary_idx is not None:
-                holdout_tensors.append(boundary_idx)
-            if inlier_idx is not None:
-                holdout_tensors.append(inlier_idx)
-            if holdout_tensors:
-                holdout_indices = torch.unique(torch.cat(holdout_tensors, dim=0))
-                if holdout_indices.numel() > 0:
-                    orig_n = train_x.shape[0]
-                    train_x, train_y = _drop_indices_from_dataset(train_x, train_y, holdout_indices)
-                    removed = orig_n - train_x.shape[0]
-                    print(
-                        f"[holdout] removed {removed} samples from training set for input prototypes "
-                        f"(boundary+inliers, {holdout_indices.numel()} unique indices)"
-                    )
-                    data = (train_x, train_y, test_x, test_y)
-                    tuple_data = data
-                    if args.train_input_x_outliers is not None or args.train_input_y_outliers is not None:
-                        prototype_data_for_aug, _ = generate_prototype_sets(
-                            train_x, train_y, tuple(args.classes), n_prototype=n_proto, return_indices=True
-                        )
-                        prototype_data_for_aug, _ = trim_prototype_sets(
-                            prototype_data_for_aug,
-                            tuple(args.classes),
-                            input_proto_counts,
-                            None,
-                        )
-        log_prototype_data = heldout_prototype_data
-    else:
-        holdout_mode = args.input_prototypes_holdout
-        if holdout_mode == "auto":
-            if use_new_proto_flags and train_proto_source["mode"] not in (None, "none"):
-                holdout_mode = "boundary_inliers"
-            elif args.track_input_prototypes and (
-                args.input_prototype_holdout_per_class is not None or args.input_prototype_holdout_frac is not None
-            ):
-                holdout_mode = "boundary_inliers"
-            else:
-                holdout_mode = "none"
-
-        if holdout_mode == "boundary_inliers" and train_prototype_indices:
-            holdout_tensors = []
-            boundary_idx = train_prototype_indices.get("boundary") if train_prototype_indices else None
-            inlier_idx = train_prototype_indices.get("inliers") if train_prototype_indices else None
-            if boundary_idx is not None:
-                holdout_tensors.append(boundary_idx)
-            if inlier_idx is not None:
-                holdout_tensors.append(inlier_idx)
-            if holdout_tensors:
-                holdout_indices = torch.unique(torch.cat(holdout_tensors, dim=0))
-                if holdout_indices.numel() > 0:
-                    orig_n = train_x.shape[0]
-                    train_x, train_y = _drop_indices_from_dataset(train_x, train_y, holdout_indices)
-                    removed = orig_n - train_x.shape[0]
-                    print(
-                        f"[holdout] removed {removed} samples from training set for input prototypes "
-                        f"(boundary+inliers, {holdout_indices.numel()} unique indices)"
-                    )
-                    data = (train_x, train_y, test_x, test_y)
-                    tuple_data = data
-                    if args.train_input_x_outliers is not None or args.train_input_y_outliers is not None:
-                        prototype_data_for_aug, _ = generate_prototype_sets(
-                            train_x, train_y, tuple(args.classes), n_prototype=n_proto, return_indices=True
-                        )
-                        prototype_data_for_aug, _ = trim_prototype_sets(
-                            prototype_data_for_aug,
-                            tuple(args.classes),
-                            input_proto_counts,
-                            None,
-                        )
-        elif holdout_mode == "boundary_inliers" and train_proto_source["mode"] not in (None, "none"):
-            print("Warning: input prototype holdout requested but no indices were available; skipping holdout.")
-
-    if explicit_proto_mode and input_proto_mode == "val":
-        prototype_data = log_prototype_data if log_prototype_data is not None else {}
-    else:
-        prototype_data = log_prototype_data or train_prototype_data or {}
+    input_proto_mode = args.input_prototypes_mode
+    prototype_data = dict(selected_prototype_data)
     combined_prototype_data = dict(prototype_data)
     if args.track_feature_prototypes_from:
         tracked_feature_prototypes, _ = _load_reference_feature_prototypes(
@@ -3229,27 +2754,24 @@ if __name__ == '__main__':
         )
 
     prototype_data = combined_prototype_data
-    prototype_data_for_aug = train_prototype_data
+    train_outlier_tracking = {}
+    if input_proto_mode == "val" and prototype_data:
+        missing_index_subsets = [
+            name for name in ("boundary", "inliers")
+            if name in prototype_data and (selected_prototype_indices is None or name not in selected_prototype_indices)
+        ]
+        if missing_index_subsets:
+            raise ValueError(
+                "Validation mode requires dataset indices for real-data prototype subsets: "
+                + ", ".join(sorted(missing_index_subsets))
+            )
 
-    holdout_mode = args.input_prototypes_holdout
-    if holdout_mode == "auto":
-        if use_new_proto_flags and train_proto_source["mode"] not in (None, "none"):
-            holdout_mode = "boundary_inliers"
-        elif args.track_input_prototypes and (
-            args.input_prototype_holdout_per_class is not None or args.input_prototype_holdout_frac is not None
-        ):
-            holdout_mode = "boundary_inliers"
-        else:
-            holdout_mode = "none"
-
-    if holdout_mode == "boundary_inliers" and train_prototype_indices:
         holdout_tensors = []
-        boundary_idx = train_prototype_indices.get("boundary") if train_prototype_indices else None
-        inlier_idx = train_prototype_indices.get("inliers") if train_prototype_indices else None
-        if boundary_idx is not None:
-            holdout_tensors.append(boundary_idx)
-        if inlier_idx is not None:
-            holdout_tensors.append(inlier_idx)
+        if selected_prototype_indices is not None:
+            for name in ("boundary", "inliers"):
+                idx_tensor = selected_prototype_indices.get(name)
+                if idx_tensor is not None:
+                    holdout_tensors.append(idx_tensor)
         if holdout_tensors:
             holdout_indices = torch.unique(torch.cat(holdout_tensors, dim=0))
             if holdout_indices.numel() > 0:
@@ -3258,99 +2780,15 @@ if __name__ == '__main__':
                 removed = orig_n - train_x.shape[0]
                 print(
                     f"[holdout] removed {removed} samples from training set for input prototypes "
-                    f"(boundary+inliers, {holdout_indices.numel()} unique indices)"
+                    f"({holdout_indices.numel()} unique indices)"
                 )
                 data = (train_x, train_y, test_x, test_y)
                 tuple_data = data
-                if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
-                        or args.train_input_inliers is not None or args.train_input_boundary is not None):
-                    prototype_data_for_aug, _ = generate_prototype_sets(
-                        train_x, train_y, proto_classes, n_prototype=n_proto, return_indices=True
-                    )
-                    prototype_data_for_aug, _ = trim_prototype_sets(
-                        prototype_data_for_aug,
-                        proto_classes,
-                        input_proto_counts,
-                        None,
-                    )
-    elif holdout_mode == "boundary_inliers" and train_proto_source["mode"] not in (None, "none"):
-        print("Warning: input prototype holdout requested but no indices were available; skipping holdout.")
-
-
-    if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
-            or args.train_input_inliers is not None or args.train_input_boundary is not None) and train_prototype_data is None:
-        raise ValueError("Training input outliers requires train-input-prototypes.")
-
-    train_outlier_tracking = {}
-    if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
-            or args.train_input_inliers is not None or args.train_input_boundary is not None):
-        classes = proto_classes
-        if len(classes) != 2:
-            raise ValueError("Training input injection requires exactly two classes.")
-        outlier_augments = []
-        seed_base = (args.dataset_seed or 0) + 100
-
-        if args.train_input_x_outliers is not None:
-            X_x, Y_x = prototype_data_for_aug["x_outlier"]
-            swapped_classes = (classes[1], classes[0])
-            swapped_proto = generate_prototype_sets(train_x, train_y, swapped_classes, n_prototype=n_proto)
-            X_x_swapped, Y_x_swapped = swapped_proto["x_outlier"]
-            X_x_all = torch.cat([X_x, X_x_swapped], dim=0)
-            Y_x_all = torch.cat([Y_x, Y_x_swapped], dim=0)
-            X_x_sel, Y_x_sel = _select_outlier_subset_by_class(
-                X_x_all,
-                Y_x_all,
-                classes,
-                args.train_input_x_outliers,
-                seed_base,
-                "x_outlier",
-            )
-            train_outlier_tracking["x_outlier"] = (X_x_sel, Y_x_sel)
-            if input_proto_mode != "val":
-                prototype_data["x_outlier"] = (X_x_sel, Y_x_sel)
-            outlier_augments.append((X_x_sel, _coerce_labels_like(train_y, Y_x_sel)))
-
-        if args.train_input_y_outliers is not None:
-            X_y, Y_y = prototype_data_for_aug["y_outlier"]
-            X_y_sel, Y_y_sel = _select_outlier_subset_by_class(
-                X_y,
-                Y_y,
-                classes,
-                args.train_input_y_outliers,
-                seed_base + 1,
-                "y_outlier",
-            )
-            train_outlier_tracking["y_outlier"] = (X_y_sel, Y_y_sel)
-            if input_proto_mode != "val":
-                prototype_data["y_outlier"] = (X_y_sel, Y_y_sel)
-            outlier_augments.append((X_y_sel, _coerce_labels_like(train_y, Y_y_sel)))
-
-        if args.train_input_inliers is not None:
-            X_in, Y_in = prototype_data_for_aug["inliers"]
-            X_in_sel, Y_in_sel = _select_outlier_subset_by_class(
-                X_in,
-                Y_in,
-                classes,
-                args.train_input_inliers,
-                seed_base + 2,
-                "inliers",
-            )
-            train_outlier_tracking["inliers"] = (X_in_sel, Y_in_sel)
-            outlier_augments.append((X_in_sel, _coerce_labels_like(train_y, Y_in_sel)))
-
-        if args.train_input_boundary is not None:
-            X_b, Y_b = prototype_data_for_aug["boundary"]
-            X_b_sel, Y_b_sel = _select_outlier_subset_by_class(
-                X_b,
-                Y_b,
-                classes,
-                args.train_input_boundary,
-                seed_base + 3,
-                "boundary",
-            )
-            train_outlier_tracking["boundary"] = (X_b_sel, Y_b_sel)
-            outlier_augments.append((X_b_sel, _coerce_labels_like(train_y, Y_b_sel)))
-
+    elif input_proto_mode == "train" and prototype_data:
+        outlier_augments = [
+            (X_p, _coerce_labels_like(train_y, Y_p))
+            for X_p, Y_p in prototype_data.values()
+        ]
         if outlier_augments:
             aug_X = [train_x] + [payload[0] for payload in outlier_augments]
             aug_Y = [train_y] + [payload[1] for payload in outlier_augments]
@@ -3368,7 +2806,9 @@ if __name__ == '__main__':
     effective_train_len = int(train_x.shape[0])
     if effective_train_len == 0:
         raise ValueError("Training set is empty after holdout/augmentation.")
-    if batch_size > effective_train_len:
+    if full_batch_requested:
+        batch_size = effective_train_len
+    elif batch_size > effective_train_len:
         print(f"[batch] reducing batch size from {batch_size} to {effective_train_len} to match training set size")
         batch_size = effective_train_len
 

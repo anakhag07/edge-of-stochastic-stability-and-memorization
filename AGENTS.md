@@ -57,6 +57,7 @@ Before finishing a build session:
 ## Lessons Learned
 
 - Write down lessons from mistakes made to avoid repeating them.
+- Input-space prototype runs now use `--input-prototype-source`, `--input-prototypes-mode`, and per-class subset counts (`--input-boundary`, `--input-inliers`, `--input-x-outliers`, `--input-y-outliers`); reusable packages are generated with `tools/generate_input_prototypes.py`.
 
 ## Validation
 

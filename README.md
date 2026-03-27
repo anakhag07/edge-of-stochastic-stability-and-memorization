@@ -3,32 +3,42 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
 
 ## Tracking Outlier Metrics (Input Prototypes)
 
-Input-space prototypes are the primary path for outlier tracking. Use `--input-prototypes-mode` with explicit holdout flags to control held-out subsets. In `train` mode all prototypes can be used for training/augmentation; in `val` mode the held-out subsets are excluded from training and metrics are logged on the held-out sets.
+Input-space prototypes now use one source flag, one mode flag, and four per-subset count flags. All four counts are per class.
 
-Example (train mode, no holdout):
+- `--input-prototype-source`: `generate` or `from:<path-or-run>`
+- `--input-prototypes-mode`: `train` or `val`
+- `--input-boundary`, `--input-inliers`, `--input-x-outliers`, `--input-y-outliers`: selected prototypes per class
+
+In `train` mode, the selected prototype subsets are appended to the training set and tracked during training.
+
+In `val` mode, the selected prototype subsets are tracked but not trained on. Real-data subsets (`boundary`, `inliers`) are removed from the base training set before optimization; synthetic subsets (`x_outlier`, `y_outlier`) remain track-only.
+
+Example (train mode):
 ```bash
-python training.py --dataset cifar10 --model mlp --loss ce \
-  --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 \
-  --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
-  --batch-sharpness --classes 1 9 \
-  --train-input-prototypes generate --input-prototypes-mode train
+python training.py --dataset cifar10_2cls --model mlp --loss ce \
+  --batch 10000 --lr 0.01 --steps 150000 --num-data 10000 --init-scale 0.2 \
+  --dataset-seed 888 --init-seed 8312 --lambdamax --batch-sharpness --classes 3 5 \
+  --input-prototype-source from:$PROTO --input-prototypes-mode train \
+  --input-x-outliers 25 --input-y-outliers 25 --input-inliers 25 --input-boundary 25
 ```
 
-Example (validation mode with held-out subsets):
+Example (validation mode):
 ```bash
-python training.py --dataset cifar10 --model mlp --loss ce \
-  --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 \
-  --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
-  --batch-sharpness --classes 1 9 \
-  --train-input-prototypes generate --input-prototypes-mode val \
-  --input-prototypes-holdout-boundary-count 10 \
-  --input-prototypes-holdout-inliers-count 10 \
-  --input-prototypes-holdout-x-outlier-count 5 \
-  --input-prototypes-holdout-y-outlier-count 5
+python training.py --dataset cifar10_2cls --model mlp --loss ce \
+  --batch 10000 --lr 0.01 --steps 150000 --num-data 10000 --init-scale 0.2 \
+  --dataset-seed 888 --init-seed 8312 --lambdamax --batch-sharpness --classes 3 5 \
+  --input-prototype-source from:$PROTO --input-prototypes-mode val \
+  --input-x-outliers 25 --input-y-outliers 25 --input-inliers 25 --input-boundary 25
 ```
 
-Deprecated flags (still accepted): `--track-input-prototypes` (no train/val split) and `--input-prototype-holdout-*`.
-Removed flag: `--input-prototypes-holdout-count`.
+Full-GD batch behavior follows the effective training set size after prototype processing. Use `--batch full` to request explicit full-batch GD; `train` mode grows the batch to include injected prototypes and `val` mode shrinks it to match the held-out-adjusted training set.
+
+Reusable prototype packages can be generated with:
+```bash
+python tools/generate_input_prototypes.py --dataset cifar10_2cls --model mlp \
+  --classes 3 5 --num-data 10000 --loss ce --dataset-seed 888 \
+  --input-boundary 50 --input-inliers 50 --input-x-outliers 50 --input-y-outliers 50
+```
 
 ## Generating Per-Sample Loss GIFs
 

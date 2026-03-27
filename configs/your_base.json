@@ -1,0 +1,112 @@
+{
+  "__comment": "Reusable base config for training.py. CLI flags override any value here.",
+
+  "run": {
+    "__comment": "General runtime and deterministic seeds",
+    "seed": 88881,
+    "cpu": false,
+    "disable_wandb": false,
+    "dataset_seed": 111,
+    "init_seed": 8312
+  },
+
+  "experiment": {
+    "__comment": "Core dataset/model/loss choices",
+    "dataset": "cifar10",
+    "model": "mlp",
+    "loss": "ce",
+    "classes": [1, 9],
+    "num_data": 10000,
+    "init_scale": 0.2
+  },
+
+  "training": {
+    "__comment": "Main optimization settings; set batch to an integer or 'full' for full-batch GD after prototype inclusion/exclusion",
+    "batch": 128,
+    "lr": 0.01,
+    "steps": 20000,
+    "stop_loss": 0.00001
+  },
+
+  "optimizer": {
+    "__comment": "Choose one mode: plain SGD, Adam, or momentum SGD",
+    "adam": false,
+    "momentum": null,
+    "weight_decay": 0.0,
+    "precond_lmax": false
+  },
+
+  "sharpness": {
+    "__comment": "lambda_max tracking and optional lr schedules triggered by lambda_max",
+    "lambdamax": true,
+    "batch_sharpness": true,
+    "lmax_decay": false,
+    "lmax_decay_target_lr": 0.000001,
+    "lmax_decay_steps": 10000,
+    "lmax_drop": false,
+    "lmax_drop_mult": 0.5,
+    "lmax_drop_target_lr": null
+  },
+
+  "measurement_toggles": {
+    "__comment": "Usually leave these off unless a run specifically needs them",
+    "step_sharpness": false,
+    "gni": false,
+    "hessian_trace": false,
+    "grad_projection": false,
+    "one_step_loss_change": false,
+    "gradient_norm": false,
+    "fisher": false,
+    "train_test_gap": false,
+    "results_rarely": false,
+    "precise_plots": false,
+    "rare_measure": false,
+    "log_every_step": false
+  },
+
+  "input_prototypes": {
+    "__comment": "Unified train/val input-prototype workflow; counts are per class",
+    "input_prototypes_mode": "train",
+    "input_prototype_source": "generate",
+    "input_boundary": null,
+    "input_inliers": null,
+    "input_x_outliers": null,
+    "input_y_outliers": null
+  },
+
+  "feature_tracking": {
+    "__comment": "Reference plaintext run folders used for tracking/reusing subsets",
+    "track_feature_prototypes_from": null,
+    "track_knn_outliers_from": null,
+    "track_knn_topk": 5
+  },
+
+  "posthoc_outliers": {
+    "__comment": "Post-training mining/export toggles",
+    "knn_outliers": false,
+    "knn_neighbors": 32,
+    "knn_top_per_class": 10,
+    "knn_feature_batch": 512,
+    "knn_chunk_size": 1024,
+    "knn_no_normalize": false,
+    "feature_prototypes": false,
+    "feature_prototype_batch": 512,
+    "feature_prototype_topk": 50,
+    "feature_prototype_kneighbors": 32,
+    "feature_prototype_no_normalize": false
+  },
+
+  "continuation": {
+    "__comment": "Resume from an existing wandb checkpointed run if needed",
+    "cont_run_id": null,
+    "cont_step": null,
+    "checkpoint_every": null
+  },
+
+  "wandb": {
+    "__comment": "These supplement WANDB_PROJECT from the environment",
+    "wandb_tag": null,
+    "wandb_name": null,
+    "wandb_notes": null
+  }
+}
