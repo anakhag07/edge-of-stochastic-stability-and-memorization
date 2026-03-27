@@ -11,7 +11,6 @@ from torchvision import datasets
 from torch.utils.data import Dataset
 from pathlib import Path
 import torch.nn.functional as F
-from utils.measure import identify_knn_outliers_by_neighbor_mix
 
 
 
@@ -566,48 +565,10 @@ def generate_prototype_sets(
 
     v_diff_flat = c1_flat - c0_flat  # [1, D]
 
-    # Combined view for boundary KNN selection
-    combined_inputs = torch.cat([X_0, X_1], dim=0)
-    combined_labels = torch.cat([
-        T.full((n0,), class_0, dtype=class_labels.dtype),
-        T.full((n1,), class_1, dtype=class_labels.dtype),
-    ])
-    combined_flat = combined_inputs.view(n0 + n1, -1)
-
-    # ---------- 1. Boundary points (k-NN ambiguity) ----------
+    # ---------- 1. Boundary points ----------
     boundary_local_indices = {class_0: [], class_1: []}
 
-    if (n0 + n1) > 1:
-        knn_neighbors = min(32, n0 + n1 - 1)
-        if knn_neighbors >= 1:
-            knn_results = identify_knn_outliers_by_neighbor_mix(
-                combined_flat,
-                combined_labels,
-                k_neighbors=knn_neighbors,
-                top_k_per_class=max(k0, k1),
-                balance_target=0.5,
-                chunk_size=min(1024, n0 + n1),
-                normalize=True,
-                return_neighbor_indices=False,
-            )
-            for class_value, entries in knn_results.get("outliers", {}).items():
-                class_value = int(class_value)
-                if class_value not in boundary_local_indices:
-                    continue
-                limit = k0 if class_value == class_0 else k1
-                for entry in entries[:limit]:
-                    dataset_idx = int(entry["dataset_index"])
-                    if class_value == class_0:
-                        local_idx = dataset_idx
-                        if not (0 <= local_idx < n0):
-                            continue
-                    else:
-                        local_idx = dataset_idx - n0
-                        if not (0 <= local_idx < n1):
-                            continue
-                    boundary_local_indices[class_value].append(local_idx)
-
-    # Fallback to centroid-based selection if needed
+    # Select boundary candidates by cross-class centroid proximity.
     dist_0_to_1 = T.cdist(X0_flat, c1_flat).squeeze(1)  # [n0]
     dist_1_to_0 = T.cdist(X1_flat, c0_flat).squeeze(1)  # [n1]
     _, idx_0_boundary_fallback = T.topk(dist_0_to_1, k=k0, largest=False)

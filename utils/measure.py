@@ -26,8 +26,7 @@ __all__ = ['compute_train_test_gap_from_tensors','param_vector', 'param_length',
            'calculate_gradient_norm_squared_mc', 'calculate_expected_one_step_full_loss_change',
            'calculate_expected_one_step_batch_loss_change', 'compute_gradient_projection_ratios',
            'estimate_hessian_trace', 'gimme_new_rng', 'gimme_random_subset_idx',
-           'compute_per_example_losses',
-           'select_dataset_subset', 'compute_subset_metrics', 'compute_subset_metrics_from_tensors']
+           'compute_per_example_losses']
 
 
 class EigenvectorCache:
@@ -1645,4 +1644,3 @@ def compute_per_example_losses(net, X, Y, loss_fn) -> torch.Tensor:
         losses = torch.stack(losses_list)
 
     return losses.view(-1)
-

@@ -3,7 +3,7 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
 
 ## Tracking Outlier Metrics (Input Prototypes)
 
-Input-space prototypes now use one source flag, one mode flag, and four per-subset count flags. All four counts are per class.
+Input-space prototypes now use one source flag, one mode flag, and four per-subset count flags. All four counts are per class. Base configs should leave `input_prototype_source` unset unless they also request at least one subset count.
 
 - `--input-prototype-source`: `generate` or `from:<path-or-run>`
 - `--input-prototypes-mode`: `train` or `val`

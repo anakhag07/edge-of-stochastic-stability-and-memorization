@@ -64,7 +64,7 @@
   "input_prototypes": {
     "__comment": "Unified train/val input-prototype workflow; counts are per class",
     "input_prototypes_mode": "train",
-    "input_prototype_source": "generate",
+    "input_prototype_source": null,
     "input_boundary": null,
     "input_inliers": null,
     "input_x_outliers": null,
