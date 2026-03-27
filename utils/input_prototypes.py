@@ -1,12 +1,95 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Any
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from utils.data import trim_prototype_sets
+
 
 INPUT_PROTOTYPE_DIRNAME = "input_prototypes"
+INPUT_PROTOTYPE_SUBSETS = ("boundary", "inliers", "x_outlier", "y_outlier")
+
+
+def parse_input_prototype_source(raw: Optional[str]) -> Dict[str, Optional[str]]:
+    if raw is None:
+        return {"mode": None, "value": None}
+
+    value = raw.strip()
+    lowered = value.lower()
+    if lowered in ("none", "off", "false"):
+        return {"mode": "none", "value": None}
+    if lowered in ("generate", "gen"):
+        return {"mode": "generate", "value": None}
+    if value.startswith("from:"):
+        return {"mode": "from", "value": value[5:]}
+    if value.startswith("run:"):
+        return {"mode": "from", "value": value[4:]}
+    return {"mode": "from", "value": value}
+
+
+def build_input_subset_counts(args) -> Dict[str, int]:
+    counts = {}
+    if getattr(args, "input_boundary", None) is not None:
+        counts["boundary"] = args.input_boundary
+    if getattr(args, "input_inliers", None) is not None:
+        counts["inliers"] = args.input_inliers
+    if getattr(args, "input_x_outliers", None) is not None:
+        counts["x_outlier"] = args.input_x_outliers
+    if getattr(args, "input_y_outliers", None) is not None:
+        counts["y_outlier"] = args.input_y_outliers
+    return counts
+
+
+def select_input_prototype_subsets(
+    prototypes: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    indices: Optional[Dict[str, torch.Tensor]],
+    *,
+    classes: Tuple[int, int],
+    counts_by_subset: Dict[str, int],
+) -> Tuple[Dict[str, Tuple[torch.Tensor, torch.Tensor]], Optional[Dict[str, torch.Tensor]]]:
+    if not counts_by_subset:
+        return {}, {} if indices is not None else None
+
+    trimmed, trimmed_indices = trim_prototype_sets(
+        prototypes,
+        classes,
+        counts_by_subset,
+        indices,
+    )
+
+    selected = {}
+    selected_indices = {} if trimmed_indices is not None else None
+    for name in counts_by_subset:
+        if name not in trimmed:
+            raise ValueError(f"Requested input prototype subset '{name}' was not available.")
+        selected[name] = trimmed[name]
+        if selected_indices is not None and trimmed_indices and name in trimmed_indices:
+            selected_indices[name] = trimmed_indices[name]
+
+    return selected, selected_indices
+
+
+def build_input_prototype_metadata(
+    *,
+    dataset: str,
+    classes,
+    dataset_seed: int,
+    num_data: int,
+    loss_type: str,
+    counts_by_subset: Dict[str, int],
+) -> Dict[str, Any]:
+    return {
+        "dataset": dataset,
+        "classes": list(classes),
+        "dataset_seed": dataset_seed,
+        "num_data": num_data,
+        "loss_type": loss_type,
+        "sizing": {
+            "counts_by_subset": dict(counts_by_subset),
+        },
+    }
 
 
 def _to_cpu(payload):

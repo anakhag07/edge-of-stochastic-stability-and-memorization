@@ -1,0 +1,29 @@
+{
+  "__comment": "JSON supports no native comments, so this file uses __comment fields as section labels. They are ignored by training.py.",
+  "run": {
+    "__comment": "Core run settings",
+    "seed": 88881,
+    "cpu": true,
+    "disable_wandb": true
+  },
+  "training": {
+    "__comment": "Optimizer and loop settings",
+    "batch": 4,
+    "lr": 0.05,
+    "steps": 20
+  },
+  "data": {
+    "__comment": "Dataset selection and deterministic seeds",
+    "dataset": "cifar10",
+    "model": "mlp",
+    "loss": "ce",
+    "num_data": 64,
+    "dataset_seed": 1,
+    "init_seed": 1
+  },
+  "measurements": {
+    "__comment": "Minimal smoke-test measurements",
+    "lambdamax": true,
+    "batch_sharpness": true
+  }
+}

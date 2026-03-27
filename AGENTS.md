@@ -57,6 +57,7 @@ Before finishing a build session:
 ## Lessons Learned
 
 - Write down lessons from mistakes made to avoid repeating them.
+- Input-space prototype runs now use `--input-prototype-source`, `--input-prototypes-mode`, and per-class subset counts (`--input-boundary`, `--input-inliers`, `--input-x-outliers`, `--input-y-outliers`); reusable packages are generated with `tools/generate_input_prototypes.py`.
 
 ## Validation
 
@@ -67,4 +68,11 @@ conda activate eoss
 python training.py --dataset cifar10 --model mlp --loss ce \
   --batch 4 --lr 0.05 --steps 20 --num-data 64 \
   --dataset-seed 1 --init-seed 1 --disable-wandb --cpu
+```
+
+Config-based equivalent:
+
+```bash
+conda activate eoss
+python training.py --config configs/smoke_train.json
 ```

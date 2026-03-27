@@ -3,72 +3,42 @@ This repository builds on edge-of-stochastic-stability repo to quantify memoriza
 
 ## Tracking Outlier Metrics (Input Prototypes)
 
-Input-space prototypes are the primary path for outlier tracking. Use `--input-prototypes-mode` with explicit holdout flags to control held-out subsets. In `train` mode all prototypes can be used for training/augmentation; in `val` mode the held-out subsets are excluded from training and metrics are logged on the held-out sets.
+Input-space prototypes now use one source flag, one mode flag, and four per-subset count flags. All four counts are per class.
 
-Example (train mode, no holdout):
+- `--input-prototype-source`: `generate` or `from:<path-or-run>`
+- `--input-prototypes-mode`: `train` or `val`
+- `--input-boundary`, `--input-inliers`, `--input-x-outliers`, `--input-y-outliers`: selected prototypes per class
+
+In `train` mode, the selected prototype subsets are appended to the training set and tracked during training.
+
+In `val` mode, the selected prototype subsets are tracked but not trained on. Real-data subsets (`boundary`, `inliers`) are removed from the base training set before optimization; synthetic subsets (`x_outlier`, `y_outlier`) remain track-only.
+
+Example (train mode):
 ```bash
-python training.py --dataset cifar10 --model mlp --loss ce \
-  --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 \
-  --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
-  --batch-sharpness --classes 1 9 \
-  --train-input-prototypes generate --input-prototypes-mode train
+python training.py --dataset cifar10_2cls --model mlp --loss ce \
+  --batch 10000 --lr 0.01 --steps 150000 --num-data 10000 --init-scale 0.2 \
+  --dataset-seed 888 --init-seed 8312 --lambdamax --batch-sharpness --classes 3 5 \
+  --input-prototype-source from:$PROTO --input-prototypes-mode train \
+  --input-x-outliers 25 --input-y-outliers 25 --input-inliers 25 --input-boundary 25
 ```
 
-Example (validation mode with held-out subsets):
+Example (validation mode):
 ```bash
-python training.py --dataset cifar10 --model mlp --loss ce \
-  --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 \
-  --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax \
-  --batch-sharpness --classes 1 9 \
-  --train-input-prototypes generate --input-prototypes-mode val \
-  --input-prototypes-holdout-boundary-count 10 \
-  --input-prototypes-holdout-inliers-count 10 \
-  --input-prototypes-holdout-x-outlier-count 5 \
-  --input-prototypes-holdout-y-outlier-count 5
+python training.py --dataset cifar10_2cls --model mlp --loss ce \
+  --batch 10000 --lr 0.01 --steps 150000 --num-data 10000 --init-scale 0.2 \
+  --dataset-seed 888 --init-seed 8312 --lambdamax --batch-sharpness --classes 3 5 \
+  --input-prototype-source from:$PROTO --input-prototypes-mode val \
+  --input-x-outliers 25 --input-y-outliers 25 --input-inliers 25 --input-boundary 25
 ```
 
-Deprecated flags (still accepted): `--track-input-prototypes` (no train/val split) and `--input-prototype-holdout-*`.
-Removed flag: `--input-prototypes-holdout-count`.
+Full-GD batch behavior follows the effective training set size after prototype processing. Use `--batch full` to request explicit full-batch GD; `train` mode grows the batch to include injected prototypes and `val` mode shrinks it to match the held-out-adjusted training set.
 
-## Generating Per-Sample Loss GIFs
-
-Create an animated GIF showing how the per-sample loss distribution evolves over training by following the steps below:
-0. Launch a training run with per-sample histogram logging enabled (`--per-sample`):
-  ```bash
-  python training.py --dataset cifar10 --model mlp --loss ce --batch 8 --lr 0.01 --steps 150000 --num-data 8192 --init-scale 0.2 --dataset-seed 111 --init-seed 8312 --stop-loss 0.00001 --lambdamax --batch-sharpness --classes 1 9 --per-sample
-  ```
-  This command logs the per-sample histograms under each run directory.
-  
-1. Identify the most recent run directory:
-  ```bash
-  RUN_DIR=$(ls -td "$RESULTS"/plaintext/cifar10_mlp/* | head -1)
-  echo "$RUN_DIR"
-  ```
-
-2. Locate the latest per-sample histogram folder:
-  ```bash
-  LATEST_PS=$(find "$RESULTS"/plaintext/cifar10_mlp -maxdepth 5 -type d -name per_sample_histograms | sort | tail -1)
-  echo "$LATEST_PS"
-  ```
-This finds the newest per_sample_histograms directory, which contains the saved PNG frames.
-
-3. Generate the GIF
-Run:
-  ```bash
-python tools/make_gif.py \
-  --frames-dir "$LATEST_PS/frames" \
-  --metric loss \
-  --out "$RUN_DIR/loss_hist_evolution.gif" \
-  --fps 6
-  ```
-4. (Optional) Create prototype GIFs
-  ```bash
-python tools/make_joint_proto.py \
-  --proto-dir "$LATEST_PS/prototypes" \
-  --metric loss \
-  --out "$RUN_DIR/prototypes_loss.gif" \
-  --fps 4
-  ```
+Reusable prototype packages can be generated with:
+```bash
+python tools/generate_input_prototypes.py --dataset cifar10_2cls --model mlp \
+  --classes 3 5 --num-data 10000 --loss ce --dataset-seed 888 \
+  --input-boundary 50 --input-inliers 50 --input-x-outliers 50 --input-y-outliers 50
+```
 
 ___
 
@@ -122,7 +92,12 @@ This repository accompanies the paper [Edge of Stochastic Stability: Revisiting 
   --lambdamax --batch-sharpness --disable-wandb \
   --cpu
   ```
- Runs training, writes results to a legacy `results.txt` under `$RESULTS`. Should take less than a minute to run.
+  Runs training, writes results to a legacy `results.txt` under `$RESULTS`. Should take less than a minute to run.
+- **Sanity run from JSON config**:
+  ```bash
+  python training.py --config configs/smoke_train.json
+  ```
+  JSON config files may use nested groups and `__comment` keys for section labels. CLI flags still work and override config values, e.g. `python training.py --config configs/smoke_train.json --steps 40`.
 - **Inspect the latest run**:
   ```bash
   python visualization/plot_results.py
@@ -155,6 +130,14 @@ This repository accompanies the paper [Edge of Stochastic Stability: Revisiting 
     --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
     --stop-loss 0.00001 
     --lambdamax --batch-sharpness
+  ```
+  Equivalent config-first invocation:
+  ```bash
+  python training.py --config path/to/experiment.json
+  ```
+  with optional overrides such as:
+  ```bash
+  python training.py --config path/to/experiment.json --lr 0.02 --batch 16
   ```
   Note: this is too computationally demanding to run on CPU - recommended to run on GPU, e.g. through slurm
   - 150k-step CIFAR-10 run with SGD on an MLP using batch size 8 and learning rate 0.01.
