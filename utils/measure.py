@@ -26,9 +26,7 @@ __all__ = ['compute_train_test_gap_from_tensors','param_vector', 'param_length',
            'calculate_gradient_norm_squared_mc', 'calculate_expected_one_step_full_loss_change',
            'calculate_expected_one_step_batch_loss_change', 'compute_gradient_projection_ratios',
            'estimate_hessian_trace', 'gimme_new_rng', 'gimme_random_subset_idx',
-           'compute_per_example_losses', 'compute_outlier_vs_bulk_stats_hessian',
-           'extract_feature_matrix', 'identify_knn_outliers_by_neighbor_mix',
-           'select_dataset_subset', 'compute_subset_metrics', 'compute_subset_metrics_from_tensors']
+           'compute_per_example_losses']
 
 
 class EigenvectorCache:
@@ -2068,7 +2066,7 @@ def _compute_metrics_on_subset_data(
         if (eigenvector_cache is not None
                 and hasattr(eigenvector_cache, 'eigenvectors')
                 and len(eigenvector_cache.eigenvectors) > 0):
-    
+
             params = [p for p in net.parameters() if p.requires_grad]
             net.zero_grad()
             preds = net(X_subset).squeeze(dim=-1)
@@ -2077,12 +2075,12 @@ def _compute_metrics_on_subset_data(
                 loss_for_grad, params, create_graph=False, retain_graph=False
             )
             grad_flat = torch.cat([g.reshape(-1) for g in grad_list]).detach()
-    
+
             g_norm = grad_flat.norm()
-    
+
             if "grad_norm" in metrics:
                 results["grad_norm"] = float(g_norm.item())
-    
+
             if "grad_vmax_cos2" in metrics:
                 v_max = eigenvector_cache.eigenvectors[0].to(grad_flat.device)
                 v_max = v_max / (v_max.norm() + 1e-12)
@@ -2096,7 +2094,7 @@ def _compute_metrics_on_subset_data(
                 results["grad_norm"] = float('nan')
             if "grad_vmax_cos2" in metrics:
                 results["grad_vmax_cos2"] = float('nan')
-        
+
     if "per_example_loss_mean" in metrics or "per_example_loss_std" in metrics:
         with torch.no_grad():
             per_example_losses = compute_per_example_losses(net, X_subset, Y_subset, loss_fn)

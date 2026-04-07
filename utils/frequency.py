@@ -371,16 +371,8 @@ class FrequencyCalculator:
             """
             return True
 
-        def memorization_hessian_outliers_rule(ctx: MeasurementContext) -> bool:
-            """Frequency rule for Hessian-based memorization outlier detection."""
-            base_freq = 128 if ctx.batch_size >= 64 else 64
-            if ctx.precise_plots:
-                base_freq = min(base_freq, 64)
-            base_freq = _rare_scale(ctx, base_freq, heavy=True)
-            return ctx.step_number == 0 or ctx.step_number % base_freq == 0
-
-        def knn_outlier_metrics_rule(ctx: MeasurementContext) -> bool:
-            """Cadence for per-outlier metric tracking."""
+        def subset_metrics_rule(ctx: MeasurementContext) -> bool:
+            """Cadence for tracked subset metrics."""
             if ctx.step_number == 0:
                 return True
             base_freq = 512 if ctx.batch_size >= 32 else 256
@@ -412,8 +404,7 @@ class FrequencyCalculator:
             'one_step_loss_change': one_step_loss_change_rule,
             'grad_projection': grad_projection_rule,
             'proj_eigens_refresh': proj_eigens_refresh_rule,
-            'memorization_hessian_outliers': memorization_hessian_outliers_rule,
-            'knn_outlier_metrics': knn_outlier_metrics_rule,
+            'subset_metrics': subset_metrics_rule,
         })
     
     def should_measure(self, measurement_type: str, ctx: MeasurementContext) -> bool:
