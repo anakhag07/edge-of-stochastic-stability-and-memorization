@@ -24,6 +24,9 @@ class MeasurementContext:
     rare_measure: bool = False
     # Override all frequency rules and measure every step
     log_all_measurements: bool = False
+    # Dense measurement window: (start_step, end_step, every_n_steps)
+    # When step is in [start, end], all measurements fire every N steps.
+    dense_window: tuple = None
     # Add other variables as needed
 
 
@@ -416,11 +419,11 @@ class FrequencyCalculator:
     def should_measure(self, measurement_type: str, ctx: MeasurementContext) -> bool:
         """
         Check if a measurement should be performed at this step.
-        
+
         Args:
             measurement_type: Name of the measurement type
             ctx: Context containing step_number, batch_size, etc.
-            
+
         Returns:
             True if measurement should be performed
         """
@@ -428,6 +431,12 @@ class FrequencyCalculator:
             raise ValueError(f"Unknown measurement type: {measurement_type}")
         if getattr(ctx, "log_all_measurements", False):
             return True
+        # Dense window override: measure every N steps within [start, end]
+        dw = getattr(ctx, "dense_window", None)
+        if dw is not None:
+            start, end, every = dw
+            if start <= ctx.step_number <= end and ctx.step_number % every == 0:
+                return True
         return self.rules[measurement_type](ctx)
     
     def set_rule(self, measurement_type: str, rule_func: Callable[[MeasurementContext], bool]):

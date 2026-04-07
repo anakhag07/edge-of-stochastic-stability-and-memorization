@@ -641,14 +641,26 @@ def generate_prototype_sets(
     ])
 
     # ---------- 2. X-outliers (extrapolate along centroid diff) ----------
+    # Class 0: extrapolate away from class 1 (subtract v_diff)
     dist_0_to_0 = T.cdist(X0_flat, c0_flat).squeeze(1)  # [n0]
     _, idx_0_near = T.topk(dist_0_to_0, k=k0, largest=False)
 
-    X_seed = X0_flat[idx_0_near]                             # [k0, D]
-    X_x_outlier_flat = X_seed - EXTRAPOLATION_FACTOR * v_diff_flat  # [k0, D]
-    X_x_outlier = X_x_outlier_flat.view(k0, *X_0.shape[1:])  # back to [k0, C, H, W]
+    X_seed_0 = X0_flat[idx_0_near]                                # [k0, D]
+    X_x_outlier_0_flat = X_seed_0 - EXTRAPOLATION_FACTOR * v_diff_flat
+    X_x_outlier_0 = X_x_outlier_0_flat.view(k0, *X_0.shape[1:])
+    Y_x_outlier_0 = T.full((k0,), class_0, dtype=class_labels.dtype)
 
-    Y_x_outlier = T.full((k0,), class_0, dtype=class_labels.dtype)
+    # Class 1: extrapolate away from class 0 (add v_diff)
+    dist_1_to_1 = T.cdist(X1_flat, c1_flat).squeeze(1)  # [n1]
+    _, idx_1_near_x = T.topk(dist_1_to_1, k=k1, largest=False)
+
+    X_seed_1 = X1_flat[idx_1_near_x]                              # [k1, D]
+    X_x_outlier_1_flat = X_seed_1 + EXTRAPOLATION_FACTOR * v_diff_flat
+    X_x_outlier_1 = X_x_outlier_1_flat.view(k1, *X_1.shape[1:])
+    Y_x_outlier_1 = T.full((k1,), class_1, dtype=class_labels.dtype)
+
+    X_x_outlier = T.cat([X_x_outlier_0, X_x_outlier_1], dim=0)
+    Y_x_outlier = T.cat([Y_x_outlier_0, Y_x_outlier_1], dim=0)
 
     # ---------- 3. Y-outliers (flip labels near centroids) ----------
     # C0 near its own centroid, relabeled as class_1

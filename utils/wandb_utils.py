@@ -67,23 +67,45 @@ def init_wandb(args, step_to_start):
 
     # Handle continuation from existing wandb run
     if hasattr(args, 'cont_run_id') and args.cont_run_id is not None:
-        # Resume existing run
         wandb_config = vars(args)
-        wandb_config['fork_from'] = args.cont_run_id
-        wandb_config['fork_step'] = step_to_start
+        wandb_config['forked_from_run_id'] = args.cont_run_id
+        wandb_config['forked_from_step'] = step_to_start
 
-        run = wandb.init(
-            project=os.getenv("WANDB_PROJECT", "eoss"),
-            mode=os.getenv("WANDB_MODE", "offline"),
-            # id=args.cont_run_id,
-            name=run_name,
-            config=wandb_config,
-            fork_from=f"{args.cont_run_id}?_step={step_to_start}",
-            save_code=True,
-            tags=tags if tags else None,
-            notes=getattr(args, 'wandb_notes', None)
-        )
-        print(f"Resumed wandb run: {args.cont_run_id}")
+        # Try W&B native fork_from (requires online mode and server-side enablement)
+        wandb_mode = os.getenv("WANDB_MODE", "offline")
+        fork_from_str = None
+        if wandb_mode != "offline":
+            fork_from_str = f"{args.cont_run_id}?_step={step_to_start}"
+            print(f"Attempting W&B native fork: fork_from='{fork_from_str}'")
+
+        try:
+            run = wandb.init(
+                project=os.getenv("WANDB_PROJECT", "eoss"),
+                mode=wandb_mode,
+                name=run_name,
+                config=wandb_config,
+                save_code=True,
+                tags=tags if tags else None,
+                notes=getattr(args, 'wandb_notes', None),
+                **({"fork_from": fork_from_str} if fork_from_str else {}),
+            )
+            if fork_from_str:
+                print(f"W&B native fork succeeded: run={args.cont_run_id} step={step_to_start}")
+            else:
+                print(f"Continued from checkpoint (offline): run={args.cont_run_id} step={step_to_start}")
+        except Exception as e:
+            # Fall back to plain init if fork_from is rejected
+            print(f"W&B fork_from failed ({e}), falling back to plain init")
+            run = wandb.init(
+                project=os.getenv("WANDB_PROJECT", "eoss"),
+                mode=wandb_mode,
+                name=run_name,
+                config=wandb_config,
+                save_code=True,
+                tags=tags if tags else None,
+                notes=getattr(args, 'wandb_notes', None),
+            )
+            print(f"Continued from checkpoint (fallback): run={args.cont_run_id} step={step_to_start}")
     else:
         # Create new run
         run = wandb.init(

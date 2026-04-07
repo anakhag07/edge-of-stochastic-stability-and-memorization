@@ -67,7 +67,7 @@ DATASET_FOLDER = Path(os.environ.get('DATASETS'))
 # export RESULTS=/scratch/gpfs/andreyev/eoss/results
 RES_FOLDER = Path(os.environ.get('RESULTS'))
 
-KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad", "batch_sharpness","grad_vmax_cos2"]
+KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad", "batch_sharpness","grad_vmax_cos2", "grad_norm"]
 TRAIN_OUTLIER_TRACKING_METRICS = [
     "per_example_loss_mean",
     "per_example_loss_std",
@@ -911,13 +911,14 @@ class MeasurementRunner:
         per_sample_cfg=None,
         subset_tracking_cfgs=None,
         log_every_step: bool = False,
+        dense_window: tuple = None,
         precond_pi_vec = None,
     ):
         self.net = net
         self.loss_fn = loss_fn
         self.X, self.Y = full_inputs
-        
-        # NEW: fixed probe batch for preconditioned Adam sharpness 
+
+        # NEW: fixed probe batch for preconditioned Adam sharpness
         self._precond_probe_size = 4096
         n = len(self.X)
         g = torch.Generator(device="cpu")
@@ -945,13 +946,14 @@ class MeasurementRunner:
         self.gd_noise = gd_noise
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
-        self.memorization_outlier_frac = memorization_outlier_frac 
+        self.memorization_outlier_frac = memorization_outlier_frac
         self._precond_pi_vec = precond_pi_vec
 
         # NEW: Per-sample config
         self.full_inputs_test = full_inputs_test
         self.per_sample_cfg = per_sample_cfg
         self.log_every_step = log_every_step
+        self.dense_window = dense_window
         
         # NEW: Per-sample initialization logic
         if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
@@ -1610,6 +1612,7 @@ def train(
             subset_tracking_cfgs=None,
             prototype_data=None,
             log_every_step: bool = False,
+            dense_window: tuple = None,
             lmax_decay: bool = False,
             lmax_decay_target_lr: float = 0.001,
             lmax_decay_steps: int = 10000,
@@ -1617,6 +1620,8 @@ def train(
             lmax_drop: bool = False,
             lmax_drop_mult: float = 0.5,
             lmax_drop_target_lr: float = None,
+            lr_drop_at_step: int = None,
+            lr_drop_to: float = None,
     ):
     
     # -------------------------------------
@@ -1762,6 +1767,7 @@ def train(
         prototype_data=prototype_data,    
         full_inputs_test=None,
         log_every_step=log_every_step,
+        dense_window=dense_window,
     )
     # ----- Run Identification -----
     run_id = wandb_run_id or generate_run_id()
@@ -1814,6 +1820,7 @@ def train(
                 precise_plots=precise_plots,
                 rare_measure=rare_measure,
                 log_all_measurements=log_every_step,
+                dense_window=measurement_runner.dense_window,
             )
 
             X_batch = X_shuffled[i*batch_size : (i+1)*batch_size]
@@ -1884,7 +1891,15 @@ def train(
     
             if lmax_drop and lmax_decay:
                 raise ValueError("Use either --lmax-drop or --lmax-decay, not both.")
-            
+
+            # --- Scheduled LR drop (for fork runs: exact t* alignment) ---
+            if lr_drop_at_step is not None and lr_drop_to is not None:
+                if step_number == lr_drop_at_step:
+                    old_lr = optimizer.param_groups[0]['lr']
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = lr_drop_to
+                    print(f"[SCHEDULED LR DROP] step={step_number} lr: {old_lr:g} -> {lr_drop_to:g}")
+
             # --- Epoch-Level Loss Tracking ---
             if metrics['epoch_loss_update'] is not None:
                 if math.isnan(metrics['epoch_loss_update']):
@@ -2355,6 +2370,11 @@ if __name__ == '__main__':
                         help='Number of steps to linearly decay to target lr')
 
     # --- LR Drop Configuration ---
+    parser.add_argument('--lr-drop-at-step', type=int, default=None,
+                        help='Exact step at which to drop the learning rate (for fork runs). '
+                             'Use with --lr-drop-to. The run starts at --lr and switches at this step.')
+    parser.add_argument('--lr-drop-to', type=float, default=None,
+                        help='Target LR after --lr-drop-at-step fires.')
     parser.add_argument('--lmax-drop', action='store_true',
                         help='One-time LR drop once lambda_max exceeds threshold (2/initial_lr).')
     parser.add_argument('--lmax-drop-mult', type=float, default=0.5,
@@ -2411,6 +2431,10 @@ if __name__ == '__main__':
     parser.add_argument('--param-distance', '--param_distance', action='store_true', help='If set, compute the distance from the reference weights')
     parser.add_argument('--param-file', '--param_file', type=str, default=None, help='Path to reference parameters for computing parameter distance')
     parser.add_argument('--log-every-step', action='store_true', help='Force all configured measurements to log every training step, bypassing frequency rules.')
+    parser.add_argument('--dense-window', nargs=3, type=int, metavar=('START', 'END', 'EVERY'),
+                        default=None,
+                        help='Dense measurement window: measure every EVERY steps in [START, END]. '
+                             'E.g. --dense-window 400 3000 16 measures every 16 steps from step 400 to 3000.')
 
     # --- Measurement Configuration ---
     parser.add_argument('--disable-cache-eigenvectors', '--disable_cache_eigenvectors', action='store_true', help='If set, disable eigenvector caching for warm starts to improve eigenvalue computation performance')
@@ -2657,6 +2681,10 @@ if __name__ == '__main__':
     # Validate wandb continuation arguments
     if (args.cont_run_id is not None) != (args.cont_step is not None):
         raise ValueError("Both --cont-run-id and --cont-step must be provided together for wandb continuation")
+
+    # Validate scheduled LR drop arguments
+    if (args.lr_drop_at_step is not None) != (args.lr_drop_to is not None):
+        raise ValueError("Both --lr-drop-at-step and --lr-drop-to must be provided together")
 
     # Check for mutually exclusive training modes
     exclusive_modes = []
@@ -3145,6 +3173,7 @@ if __name__ == '__main__':
         subset_tracking_cfgs=subset_tracking_cfgs,
         prototype_data=prototype_data,
         log_every_step=args.log_every_step,
+        dense_window=tuple(args.dense_window) if args.dense_window else None,
         lmax_decay=args.lmax_decay,
         lmax_decay_target_lr=args.lmax_decay_target_lr,
         lmax_decay_steps=args.lmax_decay_steps,
@@ -3152,6 +3181,8 @@ if __name__ == '__main__':
         lmax_drop=args.lmax_drop,
         lmax_drop_mult=args.lmax_drop_mult,
         lmax_drop_target_lr=args.lmax_drop_target_lr,
+        lr_drop_at_step=args.lr_drop_at_step,
+        lr_drop_to=args.lr_drop_to,
     )
 
     if args.feature_prototypes:
