@@ -535,24 +535,52 @@ def generate_prototype_sets(
     n_prototype=None,
     prototype_frac=0.05,
     *,
+    n_boundary=None,
+    n_inlier=None,
     return_indices: bool = False,
 ):
 
     """
-    Generates prototype sets: boundary, x_outlier, y_outlier.
-    Works with image tensors [N, C, H, W] and one-hot labels.
+    Generates mutually exclusive prototype pools: boundary and inlier.
+
+    The boundary pool contains points with high k-NN class ambiguity.
+    The inlier pool contains points nearest to their own class centroid,
+    *excluding* any points already in the boundary pool.
+
+    X-outlier and y-outlier derivation happens downstream at injection time
+    (in training.py), not here.
+
+    Parameters
+    ----------
+    n_prototype : int, optional
+        Legacy parameter. When n_boundary/n_inlier are not set, both pools
+        default to n_prototype per class.
+    n_boundary : int, optional
+        Number of boundary points per class. Overrides n_prototype for boundary.
+    n_inlier : int, optional
+        Number of inlier points per class. Overrides n_prototype for inlier.
+
+    Returns
+    -------
+    prototypes : dict
+        {'boundary': (X, Y), 'inliers': (X, Y)}
+    indices : dict  (only when return_indices=True)
+        {'boundary': global_idx_tensor, 'inliers': global_idx_tensor}
     """
     if n_prototype is None:
         n_prototype = max(1, int(round(X_train.shape[0] * prototype_frac)))
+
+    k_boundary = n_boundary if n_boundary is not None else n_prototype
+    k_inlier = n_inlier if n_inlier is not None else n_prototype
 
     class_0, class_1 = classes
     X_0, X_1, idx_0, idx_1, class_labels = _split_by_classes(X_train, Y_train, classes)
 
     n0, n1 = X_0.size(0), X_1.size(0)
 
-    # How many prototypes per class we can actually take
-    k0 = min(n_prototype, n0)
-    k1 = min(n_prototype, n1)
+    # Clamp to available samples
+    kb0 = min(k_boundary, n0)
+    kb1 = min(k_boundary, n1)
 
     # Centroids in image space
     centroid_0 = X_0.mean(dim=0, keepdim=True)  # [1, C, H, W]
@@ -563,8 +591,6 @@ def generate_prototype_sets(
     X1_flat = X_1.view(n1, -1)
     c0_flat = centroid_0.view(1, -1)
     c1_flat = centroid_1.view(1, -1)
-
-    v_diff_flat = c1_flat - c0_flat  # [1, D]
 
     # Combined view for boundary KNN selection
     combined_inputs = torch.cat([X_0, X_1], dim=0)
@@ -584,7 +610,7 @@ def generate_prototype_sets(
                 combined_flat,
                 combined_labels,
                 k_neighbors=knn_neighbors,
-                top_k_per_class=max(k0, k1),
+                top_k_per_class=max(kb0, kb1),
                 balance_target=0.5,
                 chunk_size=min(1024, n0 + n1),
                 normalize=True,
@@ -594,7 +620,7 @@ def generate_prototype_sets(
                 class_value = int(class_value)
                 if class_value not in boundary_local_indices:
                     continue
-                limit = k0 if class_value == class_0 else k1
+                limit = kb0 if class_value == class_0 else kb1
                 for entry in entries[:limit]:
                     dataset_idx = int(entry["dataset_index"])
                     if class_value == class_0:
@@ -610,8 +636,8 @@ def generate_prototype_sets(
     # Fallback to centroid-based selection if needed
     dist_0_to_1 = T.cdist(X0_flat, c1_flat).squeeze(1)  # [n0]
     dist_1_to_0 = T.cdist(X1_flat, c0_flat).squeeze(1)  # [n1]
-    _, idx_0_boundary_fallback = T.topk(dist_0_to_1, k=k0, largest=False)
-    _, idx_1_boundary_fallback = T.topk(dist_1_to_0, k=k1, largest=False)
+    _, idx_0_boundary_fallback = T.topk(dist_0_to_1, k=kb0, largest=False)
+    _, idx_1_boundary_fallback = T.topk(dist_1_to_0, k=kb1, largest=False)
 
     def _ensure_boundary(class_value, desired_count, fallback_idx):
         existing = boundary_local_indices[class_value]
@@ -625,8 +651,8 @@ def generate_prototype_sets(
                     break
         boundary_local_indices[class_value] = existing[:desired_count]
 
-    _ensure_boundary(class_0, k0, idx_0_boundary_fallback)
-    _ensure_boundary(class_1, k1, idx_1_boundary_fallback)
+    _ensure_boundary(class_0, kb0, idx_0_boundary_fallback)
+    _ensure_boundary(class_1, kb1, idx_1_boundary_fallback)
 
     idx_0_boundary = torch.tensor(boundary_local_indices[class_0], dtype=torch.long)
     idx_1_boundary = torch.tensor(boundary_local_indices[class_1], dtype=torch.long)
@@ -636,68 +662,50 @@ def generate_prototype_sets(
 
     X_boundary = T.cat([X_0[idx_0_boundary], X_1[idx_1_boundary]], dim=0)
     Y_boundary = T.cat([
-        T.full((k0,), class_0, dtype=class_labels.dtype),
-        T.full((k1,), class_1, dtype=class_labels.dtype),
+        T.full((kb0,), class_0, dtype=class_labels.dtype),
+        T.full((kb1,), class_1, dtype=class_labels.dtype),
     ])
 
-    # ---------- 2. X-outliers (extrapolate along centroid diff) ----------
-    # Class 0: extrapolate away from class 1 (subtract v_diff)
+    # ---------- 2. Inliers (nearest to own centroid, excluding boundary) ----------
+    boundary_set_0 = set(idx_0_boundary.tolist())
+    boundary_set_1 = set(idx_1_boundary.tolist())
+
     dist_0_to_0 = T.cdist(X0_flat, c0_flat).squeeze(1)  # [n0]
-    _, idx_0_near = T.topk(dist_0_to_0, k=k0, largest=False)
-
-    X_seed_0 = X0_flat[idx_0_near]                                # [k0, D]
-    X_x_outlier_0_flat = X_seed_0 - EXTRAPOLATION_FACTOR * v_diff_flat
-    X_x_outlier_0 = X_x_outlier_0_flat.view(k0, *X_0.shape[1:])
-    Y_x_outlier_0 = T.full((k0,), class_0, dtype=class_labels.dtype)
-
-    # Class 1: extrapolate away from class 0 (add v_diff)
     dist_1_to_1 = T.cdist(X1_flat, c1_flat).squeeze(1)  # [n1]
-    _, idx_1_near_x = T.topk(dist_1_to_1, k=k1, largest=False)
 
-    X_seed_1 = X1_flat[idx_1_near_x]                              # [k1, D]
-    X_x_outlier_1_flat = X_seed_1 + EXTRAPOLATION_FACTOR * v_diff_flat
-    X_x_outlier_1 = X_x_outlier_1_flat.view(k1, *X_1.shape[1:])
-    Y_x_outlier_1 = T.full((k1,), class_1, dtype=class_labels.dtype)
+    # Sort by distance ascending, skip boundary indices
+    order_0 = dist_0_to_0.argsort()
+    ki0 = min(k_inlier, n0 - kb0)
+    inlier_local_0 = []
+    for li in order_0.tolist():
+        if li not in boundary_set_0:
+            inlier_local_0.append(li)
+        if len(inlier_local_0) == ki0:
+            break
 
-    X_x_outlier = T.cat([X_x_outlier_0, X_x_outlier_1], dim=0)
-    Y_x_outlier = T.cat([Y_x_outlier_0, Y_x_outlier_1], dim=0)
+    order_1 = dist_1_to_1.argsort()
+    ki1 = min(k_inlier, n1 - kb1)
+    inlier_local_1 = []
+    for li in order_1.tolist():
+        if li not in boundary_set_1:
+            inlier_local_1.append(li)
+        if len(inlier_local_1) == ki1:
+            break
 
-    # ---------- 3. Y-outliers (flip labels near centroids) ----------
-    # C0 near its own centroid, relabeled as class_1
-    X_y_outlier_0 = X_0[idx_0_near]
-    Y_y_outlier_0 = T.full((k0,), class_1, dtype=class_labels.dtype)
+    idx_0_inlier = torch.tensor(inlier_local_0, dtype=torch.long)
+    idx_1_inlier = torch.tensor(inlier_local_1, dtype=torch.long)
 
-    # C1 near its centroid, relabeled as class_0
-    dist_1_to_1 = T.cdist(X1_flat, c1_flat).squeeze(1)  # [n1]
-    _, idx_1_near = T.topk(dist_1_to_1, k=k1, largest=False)
-
-    X_y_outlier_1 = X_1[idx_1_near]
-    Y_y_outlier_1 = T.full((k1,), class_0, dtype=class_labels.dtype)
-
-    X_y_outlier = T.cat([X_y_outlier_0, X_y_outlier_1], dim=0)
-    Y_y_outlier = T.cat([Y_y_outlier_0, Y_y_outlier_1], dim=0)
-
-    
-    # ---------- 4. Inliers (close to centroids) ----------
-    # Class 0 Inliers (Features from C0, Label = C0)
-    X_inlier_0 = X_0[idx_0_near]
-    Y_inlier_0 = T.full((k0,), class_0, dtype=class_labels.dtype)
-
-    # Class 1 Inliers (Features from C1, Label = C1)
-    X_inlier_1 = X_1[idx_1_near]
-    Y_inlier_1 = T.full((k1,), class_1, dtype=class_labels.dtype)
-    
-    # Concatenate to form the final Inlier set
-    X_inlier = T.cat([X_inlier_0, X_inlier_1], dim=0)
-    Y_inlier = T.cat([Y_inlier_0, Y_inlier_1], dim=0)
-    inlier_idx_0_global = idx_0.index_select(0, idx_0_near)
-    inlier_idx_1_global = idx_1.index_select(0, idx_1_near)
+    X_inlier = T.cat([X_0[idx_0_inlier], X_1[idx_1_inlier]], dim=0)
+    Y_inlier = T.cat([
+        T.full((ki0,), class_0, dtype=class_labels.dtype),
+        T.full((ki1,), class_1, dtype=class_labels.dtype),
+    ])
+    inlier_idx_0_global = idx_0.index_select(0, idx_0_inlier)
+    inlier_idx_1_global = idx_1.index_select(0, idx_1_inlier)
     inlier_global_idx = torch.cat([inlier_idx_0_global, inlier_idx_1_global], dim=0)
 
     prototypes = {
         'boundary': (X_boundary, Y_boundary),
-        'x_outlier': (X_x_outlier, Y_x_outlier),
-        'y_outlier': (X_y_outlier, Y_y_outlier),
         'inliers': (X_inlier, Y_inlier),
     }
     if return_indices:

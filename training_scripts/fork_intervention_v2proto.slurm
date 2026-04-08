@@ -52,10 +52,10 @@ cd /home/kwags/eoss_shared
 RESULTS="/home/kwags/eos_results"
 
 # ---------- v2 prototype path (both-class x-outliers) ----------
-PROTO="$RESULTS/plaintext/cifar10_2cls_mlp/20260404_1350_54_input_prototypes/input_prototypes"
+PROTO="$RESULTS/plaintext/cifar10_2cls_mlp/20260408_1256_00_input_prototypes_v3/input_prototypes"
 
 # ---------- WANDB config (separate project) ----------
-export WANDB_PROJECT="fork-eoss-v2proto-full_gd-${MODEL}-${LOSS}-cifar10_2cls"
+export WANDB_PROJECT="fork-eoss-v3proto-full_gd-${MODEL}-${LOSS}-cifar10_2cls"
 export WANDB_ENTITY=shaunakwag-massachusetts-institute-of-technology
 export WANDB_DIR="$RESULTS/wandb_${WANDB_PROJECT}"
 mkdir -p "$WANDB_DIR"
@@ -75,7 +75,6 @@ COMMON_FLAGS="
     --dataset-seed 888
     --init-seed    $SEED
     --train-input-prototypes from:$PROTO
-    --input-prototypes-count 50
     --lambdamax
     --train-input-x-outliers 25
     --train-input-y-outliers 25
@@ -131,6 +130,12 @@ case $IDX in
             --cont-run-id  "$BASELINE_RUN_ID" \
             --cont-step    "$TSTAR_STEP" \
             --wandb-name   "$NAME"
+
+        # ── Auto-sync this run to W&B ──────────────────────────────────
+        echo "Syncing wandb offline runs..."
+        cd "$WANDB_DIR"
+        wandb sync --sync-all --include-offline --mark-synced --no-include-synced
+        echo "Sync complete."
         ;;
 
     *)

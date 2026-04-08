@@ -179,10 +179,6 @@ def _build_input_prototype_counts(args) -> Dict[str, int]:
         counts["boundary"] = args.input_prototypes_boundary_count
     if args.input_prototypes_inliers_count is not None:
         counts["inliers"] = args.input_prototypes_inliers_count
-    if args.input_prototypes_x_outlier_count is not None:
-        counts["x_outlier"] = args.input_prototypes_x_outlier_count
-    if args.input_prototypes_y_outlier_count is not None:
-        counts["y_outlier"] = args.input_prototypes_y_outlier_count
     return counts
 
 
@@ -2780,10 +2776,15 @@ if __name__ == '__main__':
 
     n_proto = _base_proto_count()
     proto_classes = (0, 1) if dataset == 'cifar10_2cls' else tuple(args.classes)
-    if args.train_input_x_outliers is not None:
-        n_proto = max(n_proto, args.train_input_x_outliers)
-    if args.train_input_y_outliers is not None:
-        n_proto = max(n_proto, args.train_input_y_outliers)
+    # Inlier pool must be large enough for inlier + y-outlier + x-outlier injection
+    n_inlier_needed = (
+        (args.train_input_inliers or 0)
+        + (args.train_input_y_outliers or 0)
+        + (args.train_input_x_outliers or 0)
+    )
+    n_boundary_needed = args.train_input_boundary or 0
+    if n_inlier_needed > 0 or n_boundary_needed > 0:
+        n_proto = max(n_proto, n_inlier_needed, n_boundary_needed)
 
     train_prototype_data = None
     train_prototype_indices = None
@@ -2811,7 +2812,10 @@ if __name__ == '__main__':
         print(f"Loaded input prototypes from {proto_path}")
     elif train_proto_source["mode"] == "generate":
         train_prototype_data, train_prototype_indices = generate_prototype_sets(
-            train_x, train_y, proto_classes, n_prototype=n_proto, return_indices=True
+            train_x, train_y, proto_classes, n_prototype=n_proto,
+            n_boundary=n_boundary_needed if n_boundary_needed > 0 else None,
+            n_inlier=n_inlier_needed if n_inlier_needed > 0 else None,
+            return_indices=True,
         )
         train_prototype_data, train_prototype_indices = trim_prototype_sets(
             train_prototype_data,
@@ -2903,91 +2907,148 @@ if __name__ == '__main__':
                 )
                 data = (train_x, train_y, test_x, test_y)
                 tuple_data = data
-                if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
-                        or args.train_input_inliers is not None or args.train_input_boundary is not None):
-                    prototype_data_for_aug, _ = generate_prototype_sets(
-                        train_x, train_y, proto_classes, n_prototype=n_proto, return_indices=True
-                    )
-                    prototype_data_for_aug, _ = trim_prototype_sets(
-                        prototype_data_for_aug,
-                        proto_classes,
-                        input_proto_counts,
-                        None,
-                    )
     elif holdout_mode == "boundary_inliers" and train_proto_source["mode"] not in (None, "none"):
         print("Warning: input prototype holdout requested but no indices were available; skipping holdout.")
 
-    if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
-            or args.train_input_inliers is not None or args.train_input_boundary is not None) and train_prototype_data is None:
-        raise ValueError("Training input outliers requires train-input-prototypes.")
+    has_injection = (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
+                     or args.train_input_inliers is not None or args.train_input_boundary is not None)
+
+    if has_injection and train_prototype_data is None:
+        raise ValueError("Training input injection requires train-input-prototypes.")
 
     train_outlier_tracking = {}
-    if (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
-            or args.train_input_inliers is not None or args.train_input_boundary is not None):
+    if has_injection:
         classes = proto_classes
         if len(classes) != 2:
             raise ValueError("Training input injection requires exactly two classes.")
+
+        # --- Partition the held-out pools for injection ---
+        # The saved prototype package contains:
+        #   boundary pool: all held-out boundary points
+        #   inliers pool:  all held-out inlier points (mutually exclusive with boundary)
+        #
+        # Injection partitions the inlier pool into three disjoint slices:
+        #   slice 0 → injected as inliers (correct label)
+        #   slice 1 → injected as y-outliers (flipped label)
+        #   slice 2 → injected as x-outliers (extrapolated, correct label)
+        # Boundary pool is injected directly.
+        # All partitioning uses deterministic per-class slicing (first N per class).
+
+        X_inlier_pool, Y_inlier_pool = prototype_data_for_aug["inliers"]
+        X_boundary_pool, Y_boundary_pool = prototype_data_for_aug["boundary"]
+
+        # Determine per-class counts needed from the inlier pool
+        n_inlier_inject = args.train_input_inliers or 0
+        n_y_outlier = args.train_input_y_outliers or 0
+        n_x_outlier = args.train_input_x_outliers or 0
+        n_boundary_inject = args.train_input_boundary or 0
+
+        # Validate pool sizes
+        inlier_labels = Y_inlier_pool.argmax(dim=1) if Y_inlier_pool.ndim > 1 else Y_inlier_pool.long()
+        boundary_labels = Y_boundary_pool.argmax(dim=1) if Y_boundary_pool.ndim > 1 else Y_boundary_pool.long()
+
+        inlier_needed_per_class = n_inlier_inject + n_y_outlier + n_x_outlier
+        for cls in classes:
+            n_avail_inlier = (inlier_labels == cls).sum().item()
+            if n_avail_inlier < inlier_needed_per_class:
+                raise ValueError(
+                    f"Inlier pool has {n_avail_inlier} samples for class {cls} but injection "
+                    f"needs {inlier_needed_per_class} (inlier={n_inlier_inject} + "
+                    f"y_outlier={n_y_outlier} + x_outlier={n_x_outlier}). "
+                    f"Increase the inlier pool size in the prototype package."
+                )
+            n_avail_boundary = (boundary_labels == cls).sum().item()
+            if n_avail_boundary < n_boundary_inject:
+                raise ValueError(
+                    f"Boundary pool has {n_avail_boundary} samples for class {cls} but "
+                    f"injection needs {n_boundary_inject}."
+                )
+
+        # Partition inlier pool by class into disjoint slices
         outlier_augments = []
-        seed_base = (args.dataset_seed or 0) + 100
 
-        if args.train_input_x_outliers is not None:
-            X_x, Y_x = prototype_data_for_aug["x_outlier"]
-            swapped_classes = (classes[1], classes[0])
-            swapped_proto = generate_prototype_sets(train_x, train_y, swapped_classes, n_prototype=n_proto)
-            X_x_swapped, Y_x_swapped = swapped_proto["x_outlier"]
-            X_x_all = torch.cat([X_x, X_x_swapped], dim=0)
-            Y_x_all = torch.cat([Y_x, Y_x_swapped], dim=0)
-            X_x_sel, Y_x_sel = _select_outlier_subset_by_class(
-                X_x_all,
-                Y_x_all,
-                classes,
-                args.train_input_x_outliers,
-                seed_base,
-                "x_outlier",
-            )
-            train_outlier_tracking["x_outlier"] = (X_x_sel, Y_x_sel)
-         #   prototype_data["x_outlier"] = (X_x_sel, Y_x_sel)
-            outlier_augments.append((X_x_sel, _coerce_labels_like(train_y, Y_x_sel)))
+        def _partition_pool_by_class(X, Y, classes, *slice_sizes):
+            """Split a pool into disjoint per-class slices.
 
-        if args.train_input_y_outliers is not None:
-            X_y, Y_y = prototype_data_for_aug["y_outlier"]
-            X_y_sel, Y_y_sel = _select_outlier_subset_by_class(
-                X_y,
-                Y_y,
-                classes,
-                args.train_input_y_outliers,
-                seed_base + 1,
-                "y_outlier",
-            )
-            train_outlier_tracking["y_outlier"] = (X_y_sel, Y_y_sel)
-      #      prototype_data["y_outlier"] = (X_y_sel, Y_y_sel)
-            outlier_augments.append((X_y_sel, _coerce_labels_like(train_y, Y_y_sel)))
+            Returns a list of (X_slice, Y_slice) tuples, one per slice_size entry.
+            """
+            labels = Y.argmax(dim=1) if Y.ndim > 1 else Y.long()
+            slices = [[] for _ in slice_sizes]
+            slice_labels = [[] for _ in slice_sizes]
+            for cls in classes:
+                cls_mask = labels == cls
+                cls_indices = cls_mask.nonzero(as_tuple=False).view(-1)
+                offset = 0
+                for i, sz in enumerate(slice_sizes):
+                    if sz > 0:
+                        sel = cls_indices[offset:offset + sz]
+                        slices[i].append(X[sel])
+                        slice_labels[i].append(Y[sel])
+                        offset += sz
+            result = []
+            for i in range(len(slice_sizes)):
+                if slice_sizes[i] > 0 and slices[i]:
+                    result.append((torch.cat(slices[i], dim=0), torch.cat(slice_labels[i], dim=0)))
+                else:
+                    result.append(None)
+            return result
 
-        if args.train_input_inliers is not None:
-            X_in, Y_in = prototype_data_for_aug["inliers"]
-            X_in_sel, Y_in_sel = _select_outlier_subset_by_class(
-                X_in,
-                Y_in,
-                classes,
-                args.train_input_inliers,
-                seed_base + 2,
-                "inliers",
-            )
-            train_outlier_tracking["inliers"] = (X_in_sel, Y_in_sel)
-            outlier_augments.append((X_in_sel, _coerce_labels_like(train_y, Y_in_sel)))
+        inlier_slices = _partition_pool_by_class(
+            X_inlier_pool, Y_inlier_pool, classes,
+            n_inlier_inject, n_y_outlier, n_x_outlier,
+        )
+        inlier_slice, y_outlier_source, x_outlier_source = inlier_slices
 
-        if args.train_input_boundary is not None:
-            X_b, Y_b = prototype_data_for_aug["boundary"]
-            X_b_sel, Y_b_sel = _select_outlier_subset_by_class(
-                X_b,
-                Y_b,
-                classes,
-                args.train_input_boundary,
-                seed_base + 3,
-                "boundary",
+        # Inject inliers (correct labels, as-is)
+        if inlier_slice is not None:
+            X_in, Y_in = inlier_slice
+            train_outlier_tracking["inliers"] = (X_in, Y_in)
+            outlier_augments.append((X_in, _coerce_labels_like(train_y, Y_in)))
+
+        # Inject y-outliers (same images, flipped labels)
+        if y_outlier_source is not None:
+            X_ysrc, Y_ysrc = y_outlier_source
+            # Flip labels: class_0 ↔ class_1
+            y_labels = Y_ysrc.argmax(dim=1) if Y_ysrc.ndim > 1 else Y_ysrc.long()
+            flipped = torch.where(y_labels == classes[0], classes[1], classes[0])
+            train_outlier_tracking["y_outlier"] = (X_ysrc, flipped)
+            outlier_augments.append((X_ysrc, _coerce_labels_like(train_y, flipped)))
+
+        # Inject x-outliers (extrapolate source images along centroid axis, correct labels)
+        if x_outlier_source is not None:
+            X_xsrc, Y_xsrc = x_outlier_source
+            x_labels = Y_xsrc.argmax(dim=1) if Y_xsrc.ndim > 1 else Y_xsrc.long()
+            # Compute centroid direction from the base training set (post-holdout)
+            labels_all = train_y.argmax(dim=1) if train_y.ndim > 1 else train_y.long()
+            mask_0 = labels_all == classes[0]
+            mask_1 = labels_all == classes[1]
+            c0 = train_x[mask_0].view(mask_0.sum(), -1).mean(dim=0, keepdim=True)
+            c1 = train_x[mask_1].view(mask_1.sum(), -1).mean(dim=0, keepdim=True)
+            v_diff = c1 - c0  # [1, D]
+
+            X_flat = X_xsrc.view(X_xsrc.shape[0], -1)
+            extrapolated = torch.zeros_like(X_flat)
+            for i in range(X_flat.shape[0]):
+                if x_labels[i] == classes[0]:
+                    extrapolated[i] = X_flat[i] - EXTRAPOLATION_FACTOR * v_diff
+                else:
+                    extrapolated[i] = X_flat[i] + EXTRAPOLATION_FACTOR * v_diff
+            X_x_out = extrapolated.view_as(X_xsrc)
+            Y_x_out = x_labels.clone()
+            train_outlier_tracking["x_outlier"] = (X_x_out, Y_x_out)
+            outlier_augments.append((X_x_out, _coerce_labels_like(train_y, Y_x_out)))
+
+        # Inject boundary (as-is from boundary pool)
+        if n_boundary_inject > 0:
+            boundary_slices = _partition_pool_by_class(
+                X_boundary_pool, Y_boundary_pool, classes,
+                n_boundary_inject,
             )
-            train_outlier_tracking["boundary"] = (X_b_sel, Y_b_sel)
-            outlier_augments.append((X_b_sel, _coerce_labels_like(train_y, Y_b_sel)))
+            boundary_slice = boundary_slices[0]
+            if boundary_slice is not None:
+                X_b, Y_b = boundary_slice
+                train_outlier_tracking["boundary"] = (X_b, Y_b)
+                outlier_augments.append((X_b, _coerce_labels_like(train_y, Y_b)))
 
         if outlier_augments:
             aug_X = [train_x] + [payload[0] for payload in outlier_augments]

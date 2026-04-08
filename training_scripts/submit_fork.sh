@@ -49,8 +49,7 @@ import wandb, json, sys
 api = wandb.Api()
 for proj in [
     'shaunakwag-massachusetts-institute-of-technology/fork-eoss-v2proto-full_gd-mlp-mse-cifar10_2cls',
-    'shaunakwag-massachusetts-institute-of-technology/eoss-fork-full_gd-mlp-mse-cifar10_2cls',
-    'shaunakwag-massachusetts-institute-of-technology/debugging-eoss-full_gd-mlp-mse-cifar10_2cls_cls3_cls5',
+    'shaunakwag-massachusetts-institute-of-technology/fork-eoss-v2proto-full_gd-cnn-mse-cifar10_2cls',
 ]:
     try:
         run = api.run(f'{proj}/{sys.argv[1]}')

@@ -15,15 +15,11 @@ def _build_counts(args):
         counts["boundary"] = args.input_prototypes_boundary_count
     if args.input_prototypes_inliers_count is not None:
         counts["inliers"] = args.input_prototypes_inliers_count
-    if args.input_prototypes_x_outlier_count is not None:
-        counts["x_outlier"] = args.input_prototypes_x_outlier_count
-    if args.input_prototypes_y_outlier_count is not None:
-        counts["y_outlier"] = args.input_prototypes_y_outlier_count
     return counts
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate deterministic input-space prototype sets.")
+    parser = argparse.ArgumentParser(description="Generate deterministic input-space prototype pools (boundary + inlier).")
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--model", type=str, required=True,
                         help="Model name used for results folder naming (does not affect prototypes).")
@@ -32,11 +28,12 @@ def main():
     parser.add_argument("--dataset-seed", type=int, default=888)
     parser.add_argument("--loss", type=str, default="mse", choices=["mse", "ce"])
     parser.add_argument("--input-prototypes-frac", type=float, default=None)
-    parser.add_argument("--input-prototypes-count", type=int, default=None)
-    parser.add_argument("--input-prototypes-boundary-count", type=int, default=None)
-    parser.add_argument("--input-prototypes-inliers-count", type=int, default=None)
-    parser.add_argument("--input-prototypes-x-outlier-count", type=int, default=None)
-    parser.add_argument("--input-prototypes-y-outlier-count", type=int, default=None)
+    parser.add_argument("--input-prototypes-count", type=int, default=None,
+                        help="Default per-class count for both pools (overridden by specific counts)")
+    parser.add_argument("--input-prototypes-boundary-count", type=int, default=None,
+                        help="Per-class count for boundary pool")
+    parser.add_argument("--input-prototypes-inliers-count", type=int, default=None,
+                        help="Per-class count for inlier pool")
     parser.add_argument("--tag", type=str, default="input_prototypes",
                         help="Suffix appended to the run folder name.")
     args = parser.parse_args()
@@ -52,12 +49,7 @@ def main():
     if args.input_prototypes_count is not None and args.input_prototypes_frac is not None:
         raise ValueError("Provide only one of --input-prototypes-count or --input-prototypes-frac")
 
-    for flag_name in (
-        "input_prototypes_boundary_count",
-        "input_prototypes_inliers_count",
-        "input_prototypes_x_outlier_count",
-        "input_prototypes_y_outlier_count",
-    ):
+    for flag_name in ("input_prototypes_boundary_count", "input_prototypes_inliers_count"):
         flag_value = getattr(args, flag_name)
         if flag_value is not None and flag_value < 1:
             raise ValueError(f"--{flag_name.replace('_', '-')} must be >= 1 when provided")
@@ -86,13 +78,18 @@ def main():
         n_proto = max(1, int(round(train_x.shape[0] * args.input_prototypes_frac)))
     else:
         n_proto = max(1, int(round(train_x.shape[0] * 0.05)))
-    
+
+    n_boundary = args.input_prototypes_boundary_count
+    n_inlier = args.input_prototypes_inliers_count
+
     proto_classes = (0, 1) if args.dataset == 'cifar10_2cls' else tuple(args.classes)
     prototypes, indices = generate_prototype_sets(
         train_x,
         train_y,
         proto_classes,
         n_prototype=n_proto,
+        n_boundary=n_boundary,
+        n_inlier=n_inlier,
         return_indices=True,
     )
 
@@ -112,6 +109,8 @@ def main():
         "loss_type": args.loss,
         "sizing": {
             "base_count": int(n_proto),
+            "n_boundary": n_boundary,
+            "n_inlier": n_inlier,
             "counts_by_subset": counts_by_subset,
         },
     }
