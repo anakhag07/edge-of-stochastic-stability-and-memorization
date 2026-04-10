@@ -44,21 +44,10 @@ if [[ -z "$DROP_MULT" ]]; then
     fi
 fi
 
-# ---------- Environment ----------
-source /home/kwags/eoss/bin/activate
-module load miniforge/24.3.0-0
-cd /home/kwags/eoss_shared
-
-RESULTS="/home/kwags/eos_results"
-
 # ---------- v2 prototype path (both-class x-outliers) ----------
 PROTO="$RESULTS/plaintext/cifar10_2cls_mlp/20260404_1350_54_input_prototypes/input_prototypes"
 
 # ---------- WANDB config (separate project) ----------
-export WANDB_PROJECT="fork-eoss-v2proto-full_gd-${MODEL}-${LOSS}-cifar10_2cls"
-export WANDB_ENTITY=shaunakwag-massachusetts-institute-of-technology
-export WANDB_DIR="$RESULTS/wandb_${WANDB_PROJECT}"
-mkdir -p "$WANDB_DIR"
 
 # ---------- Use large batch to guarantee full-batch GD ----------
 BATCH=100000

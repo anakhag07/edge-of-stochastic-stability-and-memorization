@@ -115,3 +115,31 @@ def test_sample_smoke_config_parses():
     assert args.steps == 20
     assert args.lambdamax is True
     assert args.batch_sharpness is True
+
+
+def test_scheduled_lr_drop_flags_parse():
+    args = parse_args_with_config(
+        build_parser(0.5),
+        ['--lr-drop-at-step', '42', '--lr-drop-to', '0.005'],
+    )
+
+    assert args.lr_drop_at_step == 42
+    assert args.lr_drop_to == 0.005
+
+
+def test_scheduled_lr_drop_flags_can_come_from_json_config():
+    config_path = _write_config(
+        {
+            'training': {
+                'lr': 0.01,
+                'lr_drop_at_step': 100,
+                'lr_drop_to': 0.002,
+            },
+        }
+    )
+
+    args = parse_args_with_config(build_parser(0.5), ['--config', config_path])
+
+    assert args.lr == 0.01
+    assert args.lr_drop_at_step == 100
+    assert args.lr_drop_to == 0.002

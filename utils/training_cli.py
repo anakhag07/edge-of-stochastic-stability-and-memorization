@@ -87,6 +87,8 @@ def build_parser(extrapolation_factor: float) -> argparse.ArgumentParser:
     parser.add_argument('--lmax-drop', action='store_true', help='One-time LR drop once lambda_max exceeds threshold (2/initial_lr).')
     parser.add_argument('--lmax-drop-mult', type=float, default=0.5, help='Multiply LR by this factor on trigger. (0.5 = 50%% drop, 0.8 = 20%% drop)')
     parser.add_argument('--lmax-drop-target-lr', type=float, default=None, help='Optional floor: LR after drop is max(LR*mult, target).')
+    parser.add_argument('--lr-drop-at-step', '--lr_drop_at_step', type=int, default=None, help='Apply a one-time scheduled LR change when global step reaches this value.')
+    parser.add_argument('--lr-drop-to', '--lr_drop_to', type=float, default=None, help='Learning rate to set when --lr-drop-at-step is reached.')
     parser.add_argument('--stop-loss', '--stop_loss', type=float, default=None, help='Stop training if loss goes below this value')
 
     # --- Dataset and Model Selection ---
