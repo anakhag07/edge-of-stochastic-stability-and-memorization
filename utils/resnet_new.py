@@ -117,11 +117,11 @@ class ResNet(nn.Module):
         return out
 
 
-def resnet14():
-    return ResNet(BasicBlock, [2, 2, 2])
+def resnet14(**kwargs):
+    return ResNet(BasicBlock, [2, 2, 2], **kwargs)
 
-def resnet20():
-    return ResNet(BasicBlock, [3, 3, 3])
+def resnet20(**kwargs):
+    return ResNet(BasicBlock, [3, 3, 3], **kwargs)
 
 
 def resnet32():

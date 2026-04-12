@@ -273,7 +273,7 @@ def prepare_net(model_type: str,
         net = CNN(params['hidden_dim'], params['output_dim'])
     
     if model_type == 'resnet':
-        net = resnet14()
+        net = resnet14(num_classes=params['output_dim'])
     
     if model_type == 'resnet_bn':
         raise "Not implemented - you are still using old resnet_bn"
