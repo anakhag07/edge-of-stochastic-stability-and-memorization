@@ -138,6 +138,21 @@ def _build_input_prototype_counts(args) -> Dict[str, int]:
     return build_input_subset_counts(args)
 
 
+def _generation_pool_sizes(counts_by_subset: Dict[str, int]) -> tuple[int | None, int | None, int | None]:
+    if not counts_by_subset:
+        return None, None, None
+
+    n_boundary = counts_by_subset.get("boundary")
+    n_inlier_pool = max(
+        counts_by_subset.get("inliers", 0),
+        counts_by_subset.get("x_outlier", 0),
+        counts_by_subset.get("y_outlier", 0),
+    )
+    n_inlier = n_inlier_pool or None
+    n_prototype = max(counts_by_subset.values())
+    return n_prototype, n_boundary, n_inlier
+
+
 def _validate_nonempty_prototype_subsets(
     prototype_data: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
     *,
@@ -695,6 +710,7 @@ class MeasurementRunner:
         prototype_data,
         full_inputs_test=None,
         subset_tracking_cfgs=None,
+        per_sample_cfg=None,
         log_every_step: bool = False,
         dense_window: tuple = None,
         precond_pi_vec = None,
@@ -731,10 +747,10 @@ class MeasurementRunner:
         self.gd_noise = gd_noise
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
-        self.memorization_outlier_frac = memorization_outlier_frac
         self._precond_pi_vec = precond_pi_vec
 
         self.full_inputs_test = full_inputs_test
+        self.per_sample_cfg = per_sample_cfg
         self.log_every_step = log_every_step
         self.dense_window = dense_window
 
@@ -2085,12 +2101,14 @@ if __name__ == '__main__':
         )
         print(f"Loaded input prototypes from {proto_path}")
     elif input_proto_source["mode"] == "generate":
-        n_prototype = max(input_proto_counts.values())
+        n_prototype, n_boundary, n_inlier = _generation_pool_sizes(input_proto_counts)
         all_prototype_data, all_prototype_indices = generate_prototype_sets(
             train_x,
             train_y,
             proto_classes,
             n_prototype=n_prototype,
+            n_boundary=n_boundary,
+            n_inlier=n_inlier,
             return_indices=True,
         )
         selected_prototype_data, selected_prototype_indices = select_input_prototype_subsets(
@@ -2296,10 +2314,10 @@ if __name__ == '__main__':
         subset_tracking_cfgs=subset_tracking_cfgs,
         prototype_data=prototype_data,
         log_every_step=args.log_every_step,
-        dense_window=tuple(args.dense_window) if args.dense_window else None,
-        lmax_decay=args.lmax_decay,
-        lmax_decay_target_lr=args.lmax_decay_target_lr,
-        lmax_decay_steps=args.lmax_decay_steps,
+        dense_window=tuple(getattr(args, "dense_window", ())) if getattr(args, "dense_window", None) else None,
+        lmax_decay=getattr(args, "lmax_decay", False),
+        lmax_decay_target_lr=getattr(args, "lmax_decay_target_lr", None),
+        lmax_decay_steps=getattr(args, "lmax_decay_steps", 10000),
         lmax_decay_initial_lr=args.lr,
         lmax_drop=args.lmax_drop,
         lmax_drop_mult=args.lmax_drop_mult,

@@ -11,10 +11,10 @@
 #SBATCH --array=0-1
 
 # =============================================================================
-# Fork-based EoS intervention using v2 prototypes (both-class x-outliers).
+# Fork-based EoS intervention using v2 input prototypes.
 #
 # Identical to fork_intervention.slurm except:
-#   - Uses v2 prototype path (20260404_1350_54) with symmetric x-outliers
+#   - Uses v2 prototype path (20260404_1350_54)
 #   - Logs to separate W&B project to avoid mixing with original results
 #
 # Usage:
@@ -63,13 +63,13 @@ COMMON_FLAGS="
     --init-scale   0.2
     --dataset-seed 888
     --init-seed    $SEED
-    --train-input-prototypes from:$PROTO
-    --input-prototypes-count 50
+    --input-prototype-source from:$PROTO
+    --input-prototypes-mode train
     --lambdamax
-    --train-input-x-outliers 25
-    --train-input-y-outliers 25
-    --train-input-inliers    25
-    --train-input-boundary   25
+    --input-x-outliers 25
+    --input-y-outliers 25
+    --input-inliers   25
+    --input-boundary  25
     --steps        $STEPS
 "
 

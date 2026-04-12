@@ -13,7 +13,7 @@
 # Full workflow:
 #   # 1. Submit baseline for each seed
 #   for SEED in 1234 3902 5678 8312; do
-#       sbatch --array=0 --export=ALL,SEED=$SEED fork_intervention.slurm
+#       sbatch --array=0 --export=ALL,SEED=$SEED fork_intervention_v2proto.slurm
 #   done
 #
 #   # 2. After baselines finish, sync wandb and read t* for each:
@@ -67,7 +67,7 @@ if [[ -z "$TSTAR_STEP" || "$TSTAR_STEP" == "NOT_FOUND" ]]; then
     echo "ERROR: Could not read t_star from W&B summary for run $BASELINE_RUN_ID"
     echo ""
     echo "You can manually specify the step:"
-    echo "  sbatch --array=1 --export=ALL,SEED=$SEED,BASELINE_RUN_ID=$BASELINE_RUN_ID,TSTAR_STEP=<step>,DROP_MULT=$DROP_MULT fork_intervention.slurm"
+    echo "  sbatch --array=1 --export=ALL,SEED=$SEED,BASELINE_RUN_ID=$BASELINE_RUN_ID,TSTAR_STEP=<step>,DROP_MULT=$DROP_MULT fork_intervention_v2proto.slurm"
     exit 1
 fi
 

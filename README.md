@@ -51,6 +51,7 @@ All four subset counts are per class.
 
 - In `train` mode, the selected prototype subsets are appended to the training set and tracked during training.
 - In `val` mode, the selected prototype subsets are tracked but not trained on. `boundary` and `inliers` are removed from the base training set, while `x_outlier` and `y_outlier` remain tracked-only synthetic subsets.
+- Generated prototype packages choose `boundary` points by class-mixing ambiguity with a centroid-distance fallback, then build `inliers`, `x_outlier`, and `y_outlier` from the remaining near-centroid pool.
 - `--batch` is over the full dataset, not per class. Use `--batch full` for explicit full-batch GD; it resolves against the effective training-set size after prototype inclusion or exclusion.
 
 Generate a reusable prototype package with:

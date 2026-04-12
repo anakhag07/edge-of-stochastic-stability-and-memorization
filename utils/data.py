@@ -12,6 +12,8 @@ from torch.utils.data import Dataset
 from pathlib import Path
 import torch.nn.functional as F
 
+from utils.measure import identify_knn_outliers_by_neighbor_mix
+
 
 
 
@@ -534,24 +536,29 @@ def generate_prototype_sets(
     n_prototype=None,
     prototype_frac=0.05,
     *,
+    n_boundary=None,
+    n_inlier=None,
     return_indices: bool = False,
 ):
 
     """
-    Generates prototype sets: boundary, x_outlier, y_outlier.
-    Works with image tensors [N, C, H, W] and one-hot labels.
+    Generates prototype sets: boundary, inliers, x_outlier, y_outlier.
+    Boundary points come from a k-NN ambiguity score with centroid fallback.
+    The remaining subsets are built from the non-boundary near-centroid pool.
     """
     if n_prototype is None:
         n_prototype = max(1, int(round(X_train.shape[0] * prototype_frac)))
+
+    k_boundary = n_boundary if n_boundary is not None else n_prototype
+    k_inlier = n_inlier if n_inlier is not None else n_prototype
 
     class_0, class_1 = classes
     X_0, X_1, idx_0, idx_1, class_labels = _split_by_classes(X_train, Y_train, classes)
 
     n0, n1 = X_0.size(0), X_1.size(0)
 
-    # How many prototypes per class we can actually take
-    k0 = min(n_prototype, n0)
-    k1 = min(n_prototype, n1)
+    kb0 = min(k_boundary, n0)
+    kb1 = min(k_boundary, n1)
 
     # Centroids in image space
     centroid_0 = X_0.mean(dim=0, keepdim=True)  # [1, C, H, W]
@@ -565,14 +572,50 @@ def generate_prototype_sets(
 
     v_diff_flat = c1_flat - c0_flat  # [1, D]
 
+    combined_inputs = torch.cat([X_0, X_1], dim=0)
+    combined_labels = torch.cat([
+        T.full((n0,), class_0, dtype=class_labels.dtype),
+        T.full((n1,), class_1, dtype=class_labels.dtype),
+    ])
+    combined_flat = combined_inputs.view(n0 + n1, -1)
+
     # ---------- 1. Boundary points ----------
     boundary_local_indices = {class_0: [], class_1: []}
+
+    if (n0 + n1) > 1:
+        knn_neighbors = min(32, n0 + n1 - 1)
+        if knn_neighbors >= 1:
+            knn_results = identify_knn_outliers_by_neighbor_mix(
+                combined_flat,
+                combined_labels,
+                k_neighbors=knn_neighbors,
+                top_k_per_class=max(kb0, kb1),
+                balance_target=0.5,
+                chunk_size=min(1024, n0 + n1),
+                normalize=True,
+                return_neighbor_indices=False,
+            )
+            for class_value, entries in knn_results.get("outliers", {}).items():
+                class_value = int(class_value)
+                if class_value not in boundary_local_indices:
+                    continue
+                limit = kb0 if class_value == class_0 else kb1
+                for entry in entries[:limit]:
+                    dataset_idx = int(entry["dataset_index"])
+                    if class_value == class_0:
+                        local_idx = dataset_idx
+                        if 0 <= local_idx < n0:
+                            boundary_local_indices[class_value].append(local_idx)
+                    else:
+                        local_idx = dataset_idx - n0
+                        if 0 <= local_idx < n1:
+                            boundary_local_indices[class_value].append(local_idx)
 
     # Select boundary candidates by cross-class centroid proximity.
     dist_0_to_1 = T.cdist(X0_flat, c1_flat).squeeze(1)  # [n0]
     dist_1_to_0 = T.cdist(X1_flat, c0_flat).squeeze(1)  # [n1]
-    _, idx_0_boundary_fallback = T.topk(dist_0_to_1, k=k0, largest=False)
-    _, idx_1_boundary_fallback = T.topk(dist_1_to_0, k=k1, largest=False)
+    _, idx_0_boundary_fallback = T.topk(dist_0_to_1, k=kb0, largest=False)
+    _, idx_1_boundary_fallback = T.topk(dist_1_to_0, k=kb1, largest=False)
 
     def _ensure_boundary(class_value, desired_count, fallback_idx):
         existing = boundary_local_indices[class_value]
@@ -586,8 +629,8 @@ def generate_prototype_sets(
                     break
         boundary_local_indices[class_value] = existing[:desired_count]
 
-    _ensure_boundary(class_0, k0, idx_0_boundary_fallback)
-    _ensure_boundary(class_1, k1, idx_1_boundary_fallback)
+    _ensure_boundary(class_0, kb0, idx_0_boundary_fallback)
+    _ensure_boundary(class_1, kb1, idx_1_boundary_fallback)
 
     idx_0_boundary = torch.tensor(boundary_local_indices[class_0], dtype=torch.long)
     idx_1_boundary = torch.tensor(boundary_local_indices[class_1], dtype=torch.long)
@@ -597,49 +640,66 @@ def generate_prototype_sets(
 
     X_boundary = T.cat([X_0[idx_0_boundary], X_1[idx_1_boundary]], dim=0)
     Y_boundary = T.cat([
-        T.full((k0,), class_0, dtype=class_labels.dtype),
-        T.full((k1,), class_1, dtype=class_labels.dtype),
+        T.full((kb0,), class_0, dtype=class_labels.dtype),
+        T.full((kb1,), class_1, dtype=class_labels.dtype),
     ])
 
-    # ---------- 2. X-outliers (extrapolate away from each class centroid pair) ----------
+    # ---------- 2. Non-boundary near-centroid pools ----------
+    boundary_set_0 = set(idx_0_boundary.tolist())
+    boundary_set_1 = set(idx_1_boundary.tolist())
+
     dist_0_to_0 = T.cdist(X0_flat, c0_flat).squeeze(1)  # [n0]
-    _, idx_0_near = T.topk(dist_0_to_0, k=k0, largest=False)
+    dist_1_to_1 = T.cdist(X1_flat, c1_flat).squeeze(1)  # [n1]
+
+    def _select_non_boundary_nearest(order, excluded, desired_count):
+        selected = []
+        for local_idx in order.tolist():
+            if local_idx not in excluded:
+                selected.append(local_idx)
+            if len(selected) == desired_count:
+                break
+        return torch.tensor(selected, dtype=torch.long)
+
+    ki0 = min(k_inlier, max(0, n0 - kb0))
+    ki1 = min(k_inlier, max(0, n1 - kb1))
+    idx_0_near = _select_non_boundary_nearest(dist_0_to_0.argsort(), boundary_set_0, ki0)
+    idx_1_near = _select_non_boundary_nearest(dist_1_to_1.argsort(), boundary_set_1, ki1)
+
+    # ---------- 3. X-outliers (extrapolate away from each class centroid pair) ----------
+    v_diff_flat = c1_flat - c0_flat  # [1, D]
 
     X_seed_0 = X0_flat[idx_0_near]
-    X_x_outlier_0 = (X_seed_0 - EXTRAPOLATION_FACTOR * v_diff_flat).view(k0, *X_0.shape[1:])
-    Y_x_outlier_0 = T.full((k0,), class_0, dtype=class_labels.dtype)
-
-    dist_1_to_1 = T.cdist(X1_flat, c1_flat).squeeze(1)  # [n1]
-    _, idx_1_near = T.topk(dist_1_to_1, k=k1, largest=False)
+    X_x_outlier_0 = (X_seed_0 - EXTRAPOLATION_FACTOR * v_diff_flat).view(idx_0_near.numel(), *X_0.shape[1:])
+    Y_x_outlier_0 = T.full((idx_0_near.numel(),), class_0, dtype=class_labels.dtype)
 
     X_seed_1 = X1_flat[idx_1_near]
-    X_x_outlier_1 = (X_seed_1 + EXTRAPOLATION_FACTOR * v_diff_flat).view(k1, *X_1.shape[1:])
-    Y_x_outlier_1 = T.full((k1,), class_1, dtype=class_labels.dtype)
+    X_x_outlier_1 = (X_seed_1 + EXTRAPOLATION_FACTOR * v_diff_flat).view(idx_1_near.numel(), *X_1.shape[1:])
+    Y_x_outlier_1 = T.full((idx_1_near.numel(),), class_1, dtype=class_labels.dtype)
 
     X_x_outlier = T.cat([X_x_outlier_0, X_x_outlier_1], dim=0)
     Y_x_outlier = T.cat([Y_x_outlier_0, Y_x_outlier_1], dim=0)
 
-    # ---------- 3. Y-outliers (flip labels near centroids) ----------
+    # ---------- 4. Y-outliers (flip labels near centroids) ----------
     # C0 near its own centroid, relabeled as class_1
     X_y_outlier_0 = X_0[idx_0_near]
-    Y_y_outlier_0 = T.full((k0,), class_1, dtype=class_labels.dtype)
+    Y_y_outlier_0 = T.full((idx_0_near.numel(),), class_1, dtype=class_labels.dtype)
 
     # C1 near its centroid, relabeled as class_0
     X_y_outlier_1 = X_1[idx_1_near]
-    Y_y_outlier_1 = T.full((k1,), class_0, dtype=class_labels.dtype)
+    Y_y_outlier_1 = T.full((idx_1_near.numel(),), class_0, dtype=class_labels.dtype)
 
     X_y_outlier = T.cat([X_y_outlier_0, X_y_outlier_1], dim=0)
     Y_y_outlier = T.cat([Y_y_outlier_0, Y_y_outlier_1], dim=0)
 
     
-    # ---------- 4. Inliers (close to centroids) ----------
+    # ---------- 5. Inliers (close to centroids, excluding boundary) ----------
     # Class 0 Inliers (Features from C0, Label = C0)
     X_inlier_0 = X_0[idx_0_near]
-    Y_inlier_0 = T.full((k0,), class_0, dtype=class_labels.dtype)
+    Y_inlier_0 = T.full((idx_0_near.numel(),), class_0, dtype=class_labels.dtype)
 
     # Class 1 Inliers (Features from C1, Label = C1)
     X_inlier_1 = X_1[idx_1_near]
-    Y_inlier_1 = T.full((k1,), class_1, dtype=class_labels.dtype)
+    Y_inlier_1 = T.full((idx_1_near.numel(),), class_1, dtype=class_labels.dtype)
     
     # Concatenate to form the final Inlier set
     X_inlier = T.cat([X_inlier_0, X_inlier_1], dim=0)

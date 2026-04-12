@@ -69,12 +69,20 @@ def main():
     )
 
     proto_classes = (0, 1) if args.dataset == "cifar10_2cls" else tuple(args.classes)
+    n_boundary = counts_by_subset.get("boundary")
+    n_inlier = max(
+        counts_by_subset.get("inliers", 0),
+        counts_by_subset.get("x_outlier", 0),
+        counts_by_subset.get("y_outlier", 0),
+    ) or None
     n_prototype = max(counts_by_subset.values())
     prototypes, indices = generate_prototype_sets(
         train_x,
         train_y,
         proto_classes,
         n_prototype=n_prototype,
+        n_boundary=n_boundary,
+        n_inlier=n_inlier,
         return_indices=True,
     )
     prototypes, indices = select_input_prototype_subsets(
