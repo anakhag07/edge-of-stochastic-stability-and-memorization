@@ -21,6 +21,7 @@ from utils.data import (
     get_dataset_presets,
     generate_prototype_sets,
     EXTRAPOLATION_FACTOR,
+    _select_indices_by_class,
 )
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
 from utils.nets import ResNet
@@ -46,7 +47,11 @@ from utils.wandb_utils import (
 
 from utils.noise import gd_with_noise, GradStorage, sde_integration
 from utils.measure import *
-from utils.measure import compute_train_test_gap_from_tensors
+from utils.measure import (
+    compute_train_test_gap_from_tensors,
+    compute_subset_metrics_from_tensors,
+    compute_subset_metrics,
+)
 from utils.frequency import frequency_calculator, MeasurementContext
 from utils.quadratic import QuadraticApproximation, flatten_params, set_model_params, unflatten_params
 from utils.training_cli import build_parser as cli_build_parser, parse_args_with_config as cli_parse_args_with_config
@@ -2078,6 +2083,8 @@ if __name__ == '__main__':
     proto_classes = (0, 1) if dataset == 'cifar10_2cls' else tuple(args.classes)
     selected_prototype_data = {}
     selected_prototype_indices = None
+    all_prototype_data: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    all_prototype_indices: Optional[Dict[str, torch.Tensor]] = None
     if input_proto_source["mode"] == "from":
         proto_path = resolve_input_prototype_path(
             input_proto_source["value"],
@@ -2093,11 +2100,18 @@ if __name__ == '__main__':
             dataset_seed=args.dataset_seed,
             num_data=args.num_data,
         )
+        # Only trim subsets actually present in the package/pool. Synthetic
+        # subsets (x_outlier / y_outlier) may be requested for train-mode
+        # injection but not exist in feb24-style packages; the train-mode
+        # injection block rebuilds them from the inlier pool.
+        available_counts = {
+            k: v for k, v in input_proto_counts.items() if k in all_prototype_data
+        }
         selected_prototype_data, selected_prototype_indices = select_input_prototype_subsets(
             all_prototype_data,
             all_prototype_indices,
             classes=proto_classes,
-            counts_by_subset=input_proto_counts,
+            counts_by_subset=available_counts,
         )
         print(f"Loaded input prototypes from {proto_path}")
     elif input_proto_source["mode"] == "generate":
@@ -2111,11 +2125,18 @@ if __name__ == '__main__':
             n_inlier=n_inlier,
             return_indices=True,
         )
+        # Only trim subsets actually present in the package/pool. Synthetic
+        # subsets (x_outlier / y_outlier) may be requested for train-mode
+        # injection but not exist in feb24-style packages; the train-mode
+        # injection block rebuilds them from the inlier pool.
+        available_counts = {
+            k: v for k, v in input_proto_counts.items() if k in all_prototype_data
+        }
         selected_prototype_data, selected_prototype_indices = select_input_prototype_subsets(
             all_prototype_data,
             all_prototype_indices,
             classes=proto_classes,
-            counts_by_subset=input_proto_counts,
+            counts_by_subset=available_counts,
         )
     input_proto_mode = args.input_prototypes_mode
     prototype_data = dict(selected_prototype_data)
@@ -2151,10 +2172,137 @@ if __name__ == '__main__':
                 data = (train_x, train_y, test_x, test_y)
                 tuple_data = data
     elif input_proto_mode == "train" and prototype_data:
-        outlier_augments = [
-            (X_p, _coerce_labels_like(train_y, Y_p))
-            for X_p, Y_p in prototype_data.values()
-        ]
+        # feb24-style injection: disjoint slices of the untrimmed inlier pool,
+        # post-holdout centroid for x_outlier extrapolation, holdout of source
+        # samples before augmenting. See docs/prototype_injection.md for rationale.
+        classes = proto_classes
+        if len(classes) != 2:
+            raise ValueError("Training input injection requires exactly two classes.")
+
+        n_inlier_inject = input_proto_counts.get("inliers", 0) or 0
+        n_y_outlier = input_proto_counts.get("y_outlier", 0) or 0
+        n_x_outlier = input_proto_counts.get("x_outlier", 0) or 0
+        n_boundary_inject = input_proto_counts.get("boundary", 0) or 0
+
+        pool_prototypes = all_prototype_data
+        pool_indices = all_prototype_indices or {}
+        X_inlier_pool, Y_inlier_pool = pool_prototypes["inliers"]
+        X_boundary_pool, Y_boundary_pool = pool_prototypes["boundary"]
+
+        inlier_labels = Y_inlier_pool.argmax(dim=1) if Y_inlier_pool.ndim > 1 else Y_inlier_pool.long()
+        boundary_labels = Y_boundary_pool.argmax(dim=1) if Y_boundary_pool.ndim > 1 else Y_boundary_pool.long()
+
+        inlier_needed_per_class = n_inlier_inject + n_y_outlier + n_x_outlier
+        for cls in classes:
+            n_avail_inlier = int((inlier_labels == cls).sum().item())
+            if n_avail_inlier < inlier_needed_per_class:
+                raise ValueError(
+                    f"Inlier pool has {n_avail_inlier} samples for class {cls} but train-mode injection "
+                    f"needs {inlier_needed_per_class} disjoint samples (inliers={n_inlier_inject} + "
+                    f"y_outlier={n_y_outlier} + x_outlier={n_x_outlier}). Regenerate the prototype "
+                    f"package with --input-inliers >= {inlier_needed_per_class}."
+                )
+            n_avail_boundary = int((boundary_labels == cls).sum().item())
+            if n_avail_boundary < n_boundary_inject:
+                raise ValueError(
+                    f"Boundary pool has {n_avail_boundary} samples for class {cls} but injection "
+                    f"needs {n_boundary_inject}."
+                )
+
+        # Holdout: remove source samples (boundary + the full inlier slice we're about to
+        # consume) from train_x before computing the centroid, so v_diff reflects what the
+        # model actually sees. Boundary holdout uses n_boundary_inject samples per class;
+        # inlier holdout uses the full (inliers + y + x) slice.
+        holdout_tensors = []
+        boundary_holdout_idx = pool_indices.get("boundary") if pool_indices else None
+        inlier_holdout_idx = pool_indices.get("inliers") if pool_indices else None
+        if boundary_holdout_idx is not None and n_boundary_inject > 0:
+            per_class = _select_indices_by_class(Y_boundary_pool, classes, n_boundary_inject)
+            holdout_tensors.append(boundary_holdout_idx.index_select(0, per_class.cpu()))
+        if inlier_holdout_idx is not None and inlier_needed_per_class > 0:
+            per_class = _select_indices_by_class(Y_inlier_pool, classes, inlier_needed_per_class)
+            holdout_tensors.append(inlier_holdout_idx.index_select(0, per_class.cpu()))
+        if holdout_tensors:
+            holdout_indices = torch.unique(torch.cat(holdout_tensors, dim=0))
+            if holdout_indices.numel() > 0:
+                orig_n = train_x.shape[0]
+                train_x, train_y = _drop_indices_from_dataset(train_x, train_y, holdout_indices)
+                removed = orig_n - train_x.shape[0]
+                print(
+                    f"[holdout] removed {removed} samples from training set for input prototype "
+                    f"injection ({holdout_indices.numel()} unique indices)"
+                )
+
+        def _partition_pool_by_class(X, Y, classes, *slice_sizes):
+            labels = Y.argmax(dim=1) if Y.ndim > 1 else Y.long()
+            slices = [[] for _ in slice_sizes]
+            slice_labels = [[] for _ in slice_sizes]
+            for cls in classes:
+                cls_indices = (labels == cls).nonzero(as_tuple=False).view(-1)
+                offset = 0
+                for i, sz in enumerate(slice_sizes):
+                    if sz > 0:
+                        sel = cls_indices[offset:offset + sz]
+                        slices[i].append(X[sel])
+                        slice_labels[i].append(Y[sel])
+                        offset += sz
+            result = []
+            for i, sz in enumerate(slice_sizes):
+                if sz > 0 and slices[i]:
+                    result.append((torch.cat(slices[i], dim=0), torch.cat(slice_labels[i], dim=0)))
+                else:
+                    result.append(None)
+            return result
+
+        inlier_slice, y_outlier_source, x_outlier_source = _partition_pool_by_class(
+            X_inlier_pool, Y_inlier_pool, classes,
+            n_inlier_inject, n_y_outlier, n_x_outlier,
+        )
+
+        outlier_augments = []
+
+        if inlier_slice is not None:
+            X_in, Y_in = inlier_slice
+            train_outlier_tracking["inliers"] = (X_in, Y_in)
+            outlier_augments.append((X_in, _coerce_labels_like(train_y, Y_in)))
+
+        if y_outlier_source is not None:
+            X_ysrc, Y_ysrc = y_outlier_source
+            y_labels = Y_ysrc.argmax(dim=1) if Y_ysrc.ndim > 1 else Y_ysrc.long()
+            flipped = torch.where(y_labels == classes[0], classes[1], classes[0])
+            train_outlier_tracking["y_outlier"] = (X_ysrc, flipped)
+            outlier_augments.append((X_ysrc, _coerce_labels_like(train_y, flipped)))
+
+        if x_outlier_source is not None:
+            X_xsrc, Y_xsrc = x_outlier_source
+            x_labels = Y_xsrc.argmax(dim=1) if Y_xsrc.ndim > 1 else Y_xsrc.long()
+            labels_all = train_y.argmax(dim=1) if train_y.ndim > 1 else train_y.long()
+            mask_0 = labels_all == classes[0]
+            mask_1 = labels_all == classes[1]
+            c0 = train_x[mask_0].view(int(mask_0.sum()), -1).mean(dim=0, keepdim=True)
+            c1 = train_x[mask_1].view(int(mask_1.sum()), -1).mean(dim=0, keepdim=True)
+            v_diff = c1 - c0
+            X_flat = X_xsrc.view(X_xsrc.shape[0], -1)
+            extrapolated = torch.zeros_like(X_flat)
+            for i in range(X_flat.shape[0]):
+                if x_labels[i] == classes[0]:
+                    extrapolated[i] = X_flat[i] - EXTRAPOLATION_FACTOR * v_diff
+                else:
+                    extrapolated[i] = X_flat[i] + EXTRAPOLATION_FACTOR * v_diff
+            X_x_out = extrapolated.view_as(X_xsrc)
+            Y_x_out = x_labels.clone()
+            train_outlier_tracking["x_outlier"] = (X_x_out, Y_x_out)
+            outlier_augments.append((X_x_out, _coerce_labels_like(train_y, Y_x_out)))
+
+        if n_boundary_inject > 0:
+            boundary_slices = _partition_pool_by_class(
+                X_boundary_pool, Y_boundary_pool, classes, n_boundary_inject,
+            )
+            if boundary_slices[0] is not None:
+                X_b, Y_b = boundary_slices[0]
+                train_outlier_tracking["boundary"] = (X_b, Y_b)
+                outlier_augments.append((X_b, _coerce_labels_like(train_y, Y_b)))
+
         if outlier_augments:
             aug_X = [train_x] + [payload[0] for payload in outlier_augments]
             aug_Y = [train_y] + [payload[1] for payload in outlier_augments]
