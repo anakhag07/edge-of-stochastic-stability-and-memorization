@@ -49,12 +49,14 @@ The prototype workflow has three moving parts:
 
 All four subset counts are per class.
 
-- In `train` mode, the selected prototype subsets are appended to the training set and tracked during training.
-- In `val` mode, the selected prototype subsets are tracked but not trained on. `boundary` and `inliers` are removed from the base training set, while `x_outlier` and `y_outlier` remain tracked-only synthetic subsets.
-- Generated prototype packages choose `boundary` points by class-mixing ambiguity with a centroid-distance fallback, then build `inliers`, `x_outlier`, and `y_outlier` from the remaining near-centroid pool.
-- `--batch` is over the full dataset, not per class. Use `--batch full` for explicit full-batch GD; it resolves against the effective training-set size after prototype inclusion or exclusion.
+- In `train` mode, prototype injection is a **swap**, not an append. Source samples (`n_boundary` per class from the boundary pool plus `n_inliers + n_y + n_x` per class from the inlier pool) are first held out from the base training set. The inlier pool is then partitioned into three disjoint per-class slices which are injected back as: `inliers` (correct labels), `y_outlier` (labels flipped), and `x_outlier` (images extrapolated along `±(c_1 − c_0)` with `EXTRAPOLATION_FACTOR = 3`, correct labels). Boundary samples are injected as-is. `c_0` / `c_1` are computed on the **post-holdout** training set so the extrapolation direction matches what the model learns from. The net effective training-set size is unchanged when the inject count equals the holdout count.
+- In `val` mode, the selected prototype subsets are tracked but not trained on. `boundary` and `inliers` are removed from the base training set, while `x_outlier` and `y_outlier` remain tracked-only synthetic subsets read directly from the package.
+- Generated prototype packages select `boundary` points by class-mixing ambiguity (with a centroid-distance fallback) and `inliers` as the top-k nearest their own class centroid, excluding the boundary set. The package also pre-materializes `x_outlier` and `y_outlier` tensors for val-mode use; train mode ignores these pre-baked synthetic subsets and rebuilds them at run time from the inlier pool so injected subsets come from disjoint source images.
+- `--batch` is over the full dataset, not per class. Use `--batch full` for explicit full-batch GD; it resolves against the effective training-set size after prototype holdout and injection.
 
-Generate a reusable prototype package with:
+**Package sizing for train mode**: when generating a reusable package intended for train-mode injection, `--input-inliers` on `tools/generate_input_prototypes.py` must be the **sum** of the train-time `inliers + y_outlier + x_outlier` counts — e.g., if training requests `25 / 25 / 25`, generate with `--input-inliers 75`. Undersized packages fail fast at training startup with a clear error telling you the minimum required size. Val-mode packages can use `--input-inliers` equal to just the val-time inlier count.
+
+Generate a reusable prototype package with (sized for train-mode injection of 25 per class in each subset):
 ```bash
 python tools/generate_input_prototypes.py \
   --dataset cifar10_2cls \
@@ -63,10 +65,10 @@ python tools/generate_input_prototypes.py \
   --num-data 10000 \
   --loss ce \
   --dataset-seed 888 \
-  --input-boundary 50 \
-  --input-inliers 50 \
-  --input-x-outliers 50 \
-  --input-y-outliers 50
+  --input-boundary 25 \
+  --input-inliers 75 \
+  --input-x-outliers 25 \
+  --input-y-outliers 25
 ```
 
 Train mode example:
