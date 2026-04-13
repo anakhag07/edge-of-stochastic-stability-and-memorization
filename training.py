@@ -329,14 +329,14 @@ def _validate_input_prototype_metadata(metadata: dict, *, dataset: str, classes:
 
 
 INPUT_PROTOTYPE_TRACKING_MAP = {
-    'boundary': 'input_space_prototypes/boundary_points',
-    'inliers': 'input_space_prototypes/inlier_points',
-    'x_outlier': 'input_space_prototypes/synthetic_x_outlier',
-    'y_outlier': 'input_space_prototypes/synthetic_y_outlier',
     'injected_x_outlier': 'input_space_prototypes/injected_x_outlier',
     'injected_y_outlier': 'input_space_prototypes/injected_y_outlier',
     'injected_inliers':   'input_space_prototypes/injected_inliers',
     'injected_boundary':  'input_space_prototypes/injected_boundary',
+    'heldout_x_outlier': 'input_space_prototypes/heldout_x_outlier',
+    'heldout_y_outlier': 'input_space_prototypes/heldout_y_outlier',
+    'heldout_inliers':   'input_space_prototypes/heldout_inliers',
+    'heldout_boundary':  'input_space_prototypes/heldout_boundary',
 }
 
 
@@ -2398,17 +2398,13 @@ if __name__ == '__main__':
         checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
     
     subset_tracking_cfgs = []
-    track_input_metrics = bool(prototype_data) or bool(train_outlier_tracking)
-    if track_input_metrics:
-        subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prototype_data, base_batch_size=batch_size))
-    
-    
     if train_outlier_tracking:
-        injected_tracking = {
-            f"injected_{name}": tensors
+        tracking_prefix = "injected" if input_proto_mode == "train" else "heldout"
+        prefixed_tracking = {
+            f"{tracking_prefix}_{name}": tensors
             for name, tensors in train_outlier_tracking.items()
         }
-        subset_tracking_cfgs.extend(prepare_prototype_subset_configs(injected_tracking, base_batch_size=batch_size))
+        subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prefixed_tracking, base_batch_size=batch_size))
 
 
     # ----- Training Invocation -----
