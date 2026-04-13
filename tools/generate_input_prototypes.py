@@ -70,26 +70,34 @@ def main():
 
     proto_classes = (0, 1) if args.dataset == "cifar10_2cls" else tuple(args.classes)
     n_boundary = counts_by_subset.get("boundary")
-    n_inlier = max(
-        counts_by_subset.get("inliers", 0),
-        counts_by_subset.get("x_outlier", 0),
-        counts_by_subset.get("y_outlier", 0),
+    n_inlier_pool = (
+        counts_by_subset.get("inliers", 0)
+        + counts_by_subset.get("x_outlier", 0)
+        + counts_by_subset.get("y_outlier", 0)
     ) or None
-    n_prototype = max(counts_by_subset.values())
     prototypes, indices = generate_prototype_sets(
         train_x,
         train_y,
         proto_classes,
-        n_prototype=n_prototype,
+        n_prototype=max(n_boundary or 0, n_inlier_pool or 0),
         n_boundary=n_boundary,
-        n_inlier=n_inlier,
+        n_inlier=n_inlier_pool,
         return_indices=True,
     )
+    # Package only stores the raw boundary and inlier pools. training.py
+    # rebuilds x_outlier / y_outlier at run time by partitioning the inlier
+    # pool into disjoint slices and extrapolating x_outlier from the
+    # post-holdout centroid; the helper lives in training.py next to the
+    # other injection logic.
+    saved_counts = {"boundary": n_boundary} if n_boundary else {}
+    if n_inlier_pool:
+        saved_counts["inliers"] = n_inlier_pool
+    prototypes = {k: v for k, v in prototypes.items() if k in saved_counts}
     prototypes, indices = select_input_prototype_subsets(
         prototypes,
         indices,
         classes=proto_classes,
-        counts_by_subset=counts_by_subset,
+        counts_by_subset=saved_counts,
     )
 
     metadata = build_input_prototype_metadata(
@@ -98,7 +106,7 @@ def main():
         dataset_seed=args.dataset_seed,
         num_data=args.num_data,
         loss_type=args.loss,
-        counts_by_subset=counts_by_subset,
+        counts_by_subset=saved_counts,
     )
 
     run_dir = create_plaintext_run_dir(results_root, args.dataset, args.model, tag=args.tag)

@@ -49,14 +49,15 @@ The prototype workflow has three moving parts:
 
 All four subset counts are per class.
 
-- In `train` mode, prototype injection is a **swap**, not an append. Source samples (`n_boundary` per class from the boundary pool plus `n_inliers + n_y + n_x` per class from the inlier pool) are first held out from the base training set. The inlier pool is then partitioned into three disjoint per-class slices which are injected back as: `inliers` (correct labels), `y_outlier` (labels flipped), and `x_outlier` (images extrapolated along `±(c_1 − c_0)` with `EXTRAPOLATION_FACTOR = 3`, correct labels). Boundary samples are injected as-is. `c_0` / `c_1` are computed on the **post-holdout** training set so the extrapolation direction matches what the model learns from. The net effective training-set size is unchanged when the inject count equals the holdout count.
-- In `val` mode, the selected prototype subsets are tracked but not trained on. `boundary` and `inliers` are removed from the base training set, while `x_outlier` and `y_outlier` remain tracked-only synthetic subsets read directly from the package.
-- Generated prototype packages select `boundary` points by class-mixing ambiguity (with a centroid-distance fallback) and `inliers` as the top-k nearest their own class centroid, excluding the boundary set. The package also pre-materializes `x_outlier` and `y_outlier` tensors for val-mode use; train mode ignores these pre-baked synthetic subsets and rebuilds them at run time from the inlier pool so injected subsets come from disjoint source images.
+- Both modes are a **swap**, not an append: source samples (`n_boundary` per class from the boundary pool plus `n_inliers + n_y + n_x` per class from the inlier pool) are held out from the base training set. The inlier pool is then partitioned into three disjoint per-class slices — `inliers` (correct labels), `y_outlier` (labels flipped), and `x_outlier` (images extrapolated along `±(c_1 − c_0)` with `EXTRAPOLATION_FACTOR = 3`, correct labels). Boundary samples are kept as-is. `c_0` / `c_1` are computed on the **post-holdout** training set so the extrapolation direction matches what the model learns from.
+- In `train` mode, the per-subset tensors are concatenated back into `train_x` / `train_y` so they contribute to the gradient signal. The net effective training-set size is unchanged when the inject count equals the holdout count.
+- In `val` mode, the per-subset tensors are held out from `train_x` but **not** added back: they're exposed only as tracked-only probes, so metrics are computed on them every measurement step without letting the model train on them.
+- Generated prototype packages select `boundary` points by class-mixing ambiguity (with a centroid-distance fallback) and `inliers` as the top-k nearest their own class centroid, excluding the boundary set. Packages store only the raw `boundary` and `inliers` pools; `x_outlier` / `y_outlier` are derived at run time.
 - `--batch` is over the full dataset, not per class. Use `--batch full` for explicit full-batch GD; it resolves against the effective training-set size after prototype holdout and injection.
 
-**Package sizing for train mode**: when generating a reusable package intended for train-mode injection, `--input-inliers` on `tools/generate_input_prototypes.py` must be the **sum** of the train-time `inliers + y_outlier + x_outlier` counts — e.g., if training requests `25 / 25 / 25`, generate with `--input-inliers 75`. Undersized packages fail fast at training startup with a clear error telling you the minimum required size. Val-mode packages can use `--input-inliers` equal to just the val-time inlier count.
+**Package sizing**: `tools/generate_input_prototypes.py` accepts the same `--input-*` flags as `training.py`. The tool internally sizes the saved inlier pool as `--input-inliers + --input-x-outliers + --input-y-outliers` per class so the same four counts can be copy-pasted between the generator and the training invocation. The `--input-x-outliers` and `--input-y-outliers` flags on the generator are sizing hints — they contribute to the pool size but the package itself only stores `boundary` and `inliers` tensors.
 
-Generate a reusable prototype package with (sized for train-mode injection of 25 per class in each subset):
+Generate a reusable prototype package with:
 ```bash
 python tools/generate_input_prototypes.py \
   --dataset cifar10_2cls \
@@ -66,7 +67,7 @@ python tools/generate_input_prototypes.py \
   --loss ce \
   --dataset-seed 888 \
   --input-boundary 25 \
-  --input-inliers 75 \
+  --input-inliers 25 \
   --input-x-outliers 25 \
   --input-y-outliers 25
 ```
