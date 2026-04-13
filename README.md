@@ -62,7 +62,7 @@ Generate a reusable prototype package with:
 python tools/generate_input_prototypes.py \
   --dataset cifar10_2cls \
   --model mlp \
-  --classes 3 5 \
+  --classes 1 9 \
   --num-data 10000 \
   --loss ce \
   --dataset-seed 888 \
@@ -76,7 +76,7 @@ Train mode example:
 ```bash
 python training.py \
   --dataset cifar10_2cls \
-  --classes 3 5 \
+  --classes 1 9 \
   --num-data 10000 \
   --model mlp \
   --loss ce \
@@ -100,7 +100,7 @@ Validation mode example:
 ```bash
 python training.py \
   --dataset cifar10_2cls \
-  --classes 3 5 \
+  --classes 1 9 \
   --num-data 10000 \
   --model mlp \
   --loss ce \
