@@ -65,7 +65,7 @@ python tools/generate_input_prototypes.py \
   --classes 1 9 \
   --num-data 10000 \
   --loss ce \
-  --dataset-seed 888 \
+  --dataset-seed 111 \
   --input-boundary 25 \
   --input-inliers 25 \
   --input-x-outliers 25 \
@@ -84,7 +84,7 @@ python training.py \
   --lr 0.01 \
   --steps 150000 \
   --init-scale 0.2 \
-  --dataset-seed 888 \
+  --dataset-seed 111 \
   --init-seed 8312 \
   --input-prototype-source from:$PROTO \
   --input-prototypes-mode train \
@@ -108,7 +108,7 @@ python training.py \
   --lr 0.01 \
   --steps 150000 \
   --init-scale 0.2 \
-  --dataset-seed 888 \
+  --dataset-seed 111 \
   --init-seed 8312 \
   --input-prototype-source generate \
   --input-prototypes-mode val \
