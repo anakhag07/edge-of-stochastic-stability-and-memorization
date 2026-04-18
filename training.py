@@ -148,10 +148,10 @@ def _generation_pool_sizes(counts_by_subset: Dict[str, int]) -> tuple[int | None
         return None, None, None
 
     n_boundary = counts_by_subset.get("boundary")
-    n_inlier_pool = max(
-        counts_by_subset.get("inliers", 0),
-        counts_by_subset.get("x_outlier", 0),
-        counts_by_subset.get("y_outlier", 0),
+    n_inlier_pool = (
+        counts_by_subset.get("inliers", 0)
+        + counts_by_subset.get("x_outlier", 0)
+        + counts_by_subset.get("y_outlier", 0)
     )
     n_inlier = n_inlier_pool or None
     n_prototype = max(counts_by_subset.values())
