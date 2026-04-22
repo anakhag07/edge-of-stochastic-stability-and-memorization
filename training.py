@@ -429,6 +429,8 @@ def _build_prototype_injection_subsets(
     train_x: torch.Tensor,
     train_y: torch.Tensor,
     classes: Tuple[int, int],
+    x_outlier_mode: str = "coherent",
+    random_direction_seed: int = 42,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -526,11 +528,24 @@ def _build_prototype_injection_subsets(
         v_diff = c1 - c0
         X_flat = X_xsrc.view(X_xsrc.shape[0], -1)
         extrapolated = torch.zeros_like(X_flat)
-        for i in range(X_flat.shape[0]):
-            if x_labels[i] == classes[0]:
-                extrapolated[i] = X_flat[i] - EXTRAPOLATION_FACTOR * v_diff
-            else:
-                extrapolated[i] = X_flat[i] + EXTRAPOLATION_FACTOR * v_diff
+        displacement_norm = EXTRAPOLATION_FACTOR * v_diff.norm().item()
+
+        if x_outlier_mode == "random_direction":
+            rng = torch.Generator()
+            rng.manual_seed(random_direction_seed)
+            D = X_flat.shape[1]
+            v_unit = v_diff.view(-1) / v_diff.norm()
+            for i in range(X_flat.shape[0]):
+                z = torch.randn(D, generator=rng)
+                z = z - (z @ v_unit) * v_unit
+                z = z / z.norm()
+                extrapolated[i] = X_flat[i] + displacement_norm * z
+        else:
+            for i in range(X_flat.shape[0]):
+                if x_labels[i] == classes[0]:
+                    extrapolated[i] = X_flat[i] - EXTRAPOLATION_FACTOR * v_diff
+                else:
+                    extrapolated[i] = X_flat[i] + EXTRAPOLATION_FACTOR * v_diff
         X_x_out = extrapolated.view_as(X_xsrc)
         Y_x_out = x_labels.clone()
         train_outlier_tracking["x_outlier"] = (X_x_out, Y_x_out)
@@ -1186,6 +1201,9 @@ class MeasurementRunner:
             if isinstance(optimizer, (optim.Adam, optim.AdamW)):
                 eos_threshold = 38.0 / optimizer.param_groups[0]['lr']
                 sharpness_metric = 'lmax_precond_adam'
+            elif self.batch_size is not None and self.batch_size < self.X.shape[0]:
+                eos_threshold = 2.0 / optimizer.param_groups[0]['lr']
+                sharpness_metric = 'batch_sharpness'
             else:
                 eos_threshold = 2.0 / optimizer.param_groups[0]['lr']
                 sharpness_metric = 'lmax'
@@ -2294,6 +2312,8 @@ if __name__ == '__main__':
             train_x=train_x,
             train_y=train_y,
             classes=proto_classes,
+            x_outlier_mode=args.x_outlier_mode,
+            random_direction_seed=args.random_direction_seed,
         )
         if input_proto_mode == "train" and outlier_augments:
             aug_X = [train_x] + [payload[0] for payload in outlier_augments]
