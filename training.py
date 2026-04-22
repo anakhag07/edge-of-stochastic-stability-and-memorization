@@ -10,36 +10,32 @@ from pathlib import Path
 import math
 import random
 import argparse
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch.nn.functional as F
 import time
 import torch.optim as optim
 
-import imageio.v2 as imageio
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 from utils.data import (
     prepare_dataset,
     get_dataset_presets,
     generate_prototype_sets,
-    generate_feature_space_prototype_sets,
     EXTRAPOLATION_FACTOR,
-    trim_prototype_sets,
+    _select_indices_by_class,
 )
 from utils.nets import SquaredLoss, MLP, CNN, prepare_net, initialize_net, prepare_optimizer, get_model_presets
 from utils.nets import ResNet
 from utils.storage import initialize_folders
 from utils.input_prototypes import (
+    build_input_subset_counts,
+    parse_input_prototype_source,
     resolve_input_prototype_path,
     load_input_prototype_package,
+    select_input_prototype_subsets,
 )
 from utils.wandb_utils import (
     init_wandb,
     log_metrics,
-    log_knn_outlier_results,
     save_checkpoint_wandb,
     find_closest_checkpoint_wandb,
     load_checkpoint_wandb,
@@ -51,21 +47,21 @@ from utils.wandb_utils import (
 
 from utils.noise import gd_with_noise, GradStorage, sde_integration
 from utils.measure import *
-from utils.measure import compute_train_test_gap_from_tensors
+from utils.measure import (
+    compute_train_test_gap_from_tensors,
+    compute_subset_metrics_from_tensors,
+    compute_subset_metrics,
+)
 from utils.frequency import frequency_calculator, MeasurementContext
 from utils.quadratic import QuadraticApproximation, flatten_params, set_model_params, unflatten_params
+from utils.training_cli import build_parser as cli_build_parser, parse_args_with_config as cli_parse_args_with_config
 
 from torch.autograd import grad
 import json
 
-if 'DATASETS' not in os.environ:
-    raise ValueError("Please set the environment variable 'DATASETS'. Use 'export DATASETS=/path/to/datasets'")
-if 'RESULTS' not in os.environ:
-    raise ValueError("Please set the environment variable 'RESULTS'. Use 'export RESULTS=/path/to/results'")
-
-DATASET_FOLDER = Path(os.environ.get('DATASETS'))
+DATASET_FOLDER = Path(os.environ['DATASETS']) if 'DATASETS' in os.environ else None
 # export RESULTS=/scratch/gpfs/andreyev/eoss/results
-RES_FOLDER = Path(os.environ.get('RESULTS'))
+RES_FOLDER = Path(os.environ['RESULTS']) if 'RESULTS' in os.environ else None
 
 KNN_TRACKING_METRICS = ["full_loss", "accuracy", "lambda_max", "grad_hessian_grad", "batch_sharpness","grad_vmax_cos2", "grad_norm"]
 TRAIN_OUTLIER_TRACKING_METRICS = [
@@ -77,109 +73,234 @@ TRAIN_OUTLIER_TRACKING_METRICS = [
 ]
 
 
-def _load_reference_knn_indices(dataset_name: str, model_name: str, run_name: str) -> Dict[int, List[int]]:
-    plaintext_root = RES_FOLDER / 'plaintext' / f"{dataset_name}_{model_name}"
-    ref_run_dir = plaintext_root / run_name
-    indices_path = ref_run_dir / 'knn_outlier_indices.json'
-    if not indices_path.exists():
-        raise FileNotFoundError(
-            f"Cannot find knn_outlier_indices.json at {indices_path}. "
-            "Ensure the reference run name is correct."
+def _refresh_runtime_paths() -> None:
+    global DATASET_FOLDER, RES_FOLDER
+
+    if 'DATASETS' not in os.environ:
+        raise ValueError("Please set the environment variable 'DATASETS'. Use 'export DATASETS=/path/to/datasets'")
+    if 'RESULTS' not in os.environ:
+        raise ValueError("Please set the environment variable 'RESULTS'. Use 'export RESULTS=/path/to/results'")
+
+    DATASET_FOLDER = Path(os.environ['DATASETS'])
+    RES_FOLDER = Path(os.environ['RESULTS'])
+
+
+def _is_config_comment_key(key: str) -> bool:
+    return key.startswith("__comment") or key.startswith("_comment")
+
+
+def _flatten_config_mapping(config_value, *, source_path: Path, flat_config: Optional[Dict[str, object]] = None):
+    if flat_config is None:
+        flat_config = {}
+
+    if not isinstance(config_value, dict):
+        raise ValueError(f"Config file must contain a JSON object at the top level: {source_path}")
+
+    for key, value in config_value.items():
+        if _is_config_comment_key(str(key)):
+            continue
+        if isinstance(value, dict):
+            _flatten_config_mapping(value, source_path=source_path, flat_config=flat_config)
+            continue
+        if key in flat_config:
+            raise ValueError(f"Duplicate config key '{key}' found in {source_path}")
+        flat_config[key] = value
+
+    return flat_config
+
+
+def _load_json_config_defaults(parser: argparse.ArgumentParser, config_path: str) -> Dict[str, object]:
+    path = Path(config_path)
+    with open(path, 'r', encoding='utf-8') as f:
+        payload = json.load(f)
+
+    flat_config = _flatten_config_mapping(payload, source_path=path)
+    valid_dests = {action.dest for action in parser._actions}
+    unknown_keys = sorted(key for key in flat_config if key not in valid_dests)
+    if unknown_keys:
+        raise ValueError(
+            f"Unknown config key(s) in {path}: {', '.join(unknown_keys)}"
         )
-
-    with open(indices_path, 'r') as f:
-        indices_payload = json.load(f)
-
-    per_class_indices = indices_payload.get('per_class_indices', {})
-    if not per_class_indices:
-        raise ValueError(f"No per-class indices found in {indices_path}")
-
-    cleaned = {}
-    for class_key, idx_list in per_class_indices.items():
-        class_id = int(class_key)
-        cleaned[class_id] = [int(idx) for idx in idx_list]
-    return cleaned
+    return flat_config
 
 
-def _build_tracked_subsets(per_class_indices: Dict[int, List[int]], track_top: int):
-    tracked_subsets = []
-    trimmed_by_class: Dict[int, List[int]] = {}
-    for class_id, idx_list in per_class_indices.items():
-        trimmed = [int(idx) for idx in idx_list[:track_top]]
-        if not trimmed:
-            continue
-        trimmed_by_class[class_id] = trimmed
-        tracked_subsets.append({
-            "name": f"class_{class_id}",
-            "class_id": class_id,
-            "indices": trimmed,
-        })
-    return tracked_subsets, trimmed_by_class
+def _extract_config_path(argv: Optional[List[str]] = None) -> Optional[str]:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument('--config', type=str, default=None)
+    config_args, _ = config_parser.parse_known_args(argv)
+    return config_args.config
 
 
-def _sample_inlier_subsets(
-    labels: torch.Tensor,
-    excluded_by_class: Dict[int, List[int]],
-    seed: int,
-) -> List[dict]:
-    if labels is None or not excluded_by_class:
-        return []
+def parse_args_with_config(parser: argparse.ArgumentParser, argv: Optional[List[str]] = None):
+    config_path = _extract_config_path(argv)
+    if config_path:
+        parser.set_defaults(**_load_json_config_defaults(parser, config_path))
+    return parser.parse_args(argv)
 
-    label_tensor = labels.detach().cpu()
-    if label_tensor.ndim > 1:
-        label_tensor = label_tensor.argmax(dim=1)
-    label_tensor = label_tensor.to(dtype=torch.long)
-    rng = random.Random(seed)
-
-    subsets = []
-    for class_id, excluded in excluded_by_class.items():
-        class_mask = (label_tensor == class_id)
-        class_indices = class_mask.nonzero(as_tuple=False).view(-1).tolist()
-        if not class_indices:
-            continue
-        excluded_set = set(excluded)
-        candidates = [idx for idx in class_indices if idx not in excluded_set]
-        if not candidates:
-            continue
-        desired = min(len(excluded), len(candidates))
-        if desired <= 0:
-            continue
-        if len(candidates) > desired:
-            sampled = rng.sample(candidates, desired)
-        else:
-            sampled = candidates
-        subsets.append({
-            "name": f"class_{class_id}",
-            "class_id": class_id,
-            "indices": sampled,
-        })
-    return subsets
-
-
-def _parse_input_prototype_source(raw: str):
-    if raw is None:
-        return {"mode": None, "value": None}
-
-    value = raw.strip()
-    lowered = value.lower()
-    if lowered in ("none", "off", "false"):
-        return {"mode": "none", "value": None}
-    if lowered in ("generate", "gen"):
-        return {"mode": "generate", "value": None}
-    if value.startswith("from:"):
-        return {"mode": "from", "value": value[5:]}
-    if value.startswith("run:"):
-        return {"mode": "from", "value": value[4:]}
-    return {"mode": "from", "value": value}
 
 
 def _build_input_prototype_counts(args) -> Dict[str, int]:
-    counts = {}
-    if args.input_prototypes_boundary_count is not None:
-        counts["boundary"] = args.input_prototypes_boundary_count
-    if args.input_prototypes_inliers_count is not None:
-        counts["inliers"] = args.input_prototypes_inliers_count
-    return counts
+    return build_input_subset_counts(args)
+
+
+def _generation_pool_sizes(counts_by_subset: Dict[str, int]) -> tuple[int | None, int | None, int | None]:
+    if not counts_by_subset:
+        return None, None, None
+
+    n_boundary = counts_by_subset.get("boundary")
+    n_inlier_pool = (
+        counts_by_subset.get("inliers", 0)
+        + counts_by_subset.get("x_outlier", 0)
+        + counts_by_subset.get("y_outlier", 0)
+    )
+    n_inlier = n_inlier_pool or None
+    n_prototype = max(counts_by_subset.values())
+    return n_prototype, n_boundary, n_inlier
+
+
+def _validate_nonempty_prototype_subsets(
+    prototype_data: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    *,
+    context: str,
+    require_nonempty: bool = False,
+):
+    if not prototype_data:
+        if require_nonempty:
+            raise ValueError(f"{context}: no prototype subsets were provided")
+        return
+    for name, tensors in prototype_data.items():
+        if name is None:
+            raise ValueError(f"{context}: prototype subset name is None")
+        if tensors is None:
+            raise ValueError(f"{context}: prototype subset '{name}' is missing tensors")
+        if not isinstance(tensors, (tuple, list)) or len(tensors) != 2:
+            raise ValueError(
+                f"{context}: prototype subset '{name}' must be a (X, Y) tuple"
+            )
+        X_p, Y_p = tensors
+        if X_p is None or Y_p is None:
+            raise ValueError(f"{context}: prototype subset '{name}' has missing tensors")
+        if not torch.is_tensor(X_p) or not torch.is_tensor(Y_p):
+            raise ValueError(
+                f"{context}: prototype subset '{name}' must use torch tensors"
+            )
+        if X_p.shape[0] == 0 or Y_p.shape[0] == 0:
+            raise ValueError(
+                f"{context}: prototype subset '{name}' is empty; provide nonzero counts"
+            )
+        if X_p.shape[0] != Y_p.shape[0]:
+            raise ValueError(
+                f"{context}: prototype subset '{name}' has mismatched X/Y sizes"
+            )
+
+
+def _split_prototype_subset_by_class(
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    classes: Tuple[int, int],
+    holdout_count: int,
+    seed: int,
+    subset_name: str,
+):
+    if holdout_count <= 0:
+        empty = (X[:0], Y[:0])
+        full_idx = torch.arange(X.shape[0], dtype=torch.long, device=X.device)
+        empty_idx = torch.empty((0,), dtype=torch.long, device=X.device)
+        return (X, Y), empty, full_idx, empty_idx
+
+    labels = Y
+    if labels.ndim > 1:
+        labels = labels.argmax(dim=1)
+    labels = labels.to(dtype=torch.long).cpu()
+
+    rng = np.random.default_rng(seed)
+    selected = []
+    for class_id in classes:
+        class_idx = (labels == class_id).nonzero(as_tuple=False).view(-1).cpu().numpy()
+        if len(class_idx) == 0:
+            print(
+                f"Warning: input prototype subset '{subset_name}' has no samples for class {class_id}; "
+                "skipping holdout for this class."
+            )
+            continue
+        if len(class_idx) < holdout_count:
+            raise ValueError(
+                f"Holdout count {holdout_count} for '{subset_name}' exceeds available "
+                f"samples ({len(class_idx)}) in class {class_id}."
+            )
+        chosen = rng.choice(class_idx, holdout_count, replace=False)
+        selected.append(torch.tensor(chosen, dtype=torch.long))
+
+    if not selected:
+        empty = (X[:0], Y[:0])
+        full_idx = torch.arange(X.shape[0], dtype=torch.long, device=X.device)
+        empty_idx = torch.empty((0,), dtype=torch.long, device=X.device)
+        return (X, Y), empty, full_idx, empty_idx
+
+    holdout_idx = torch.cat(selected, dim=0)
+    holdout_idx = torch.unique(holdout_idx, sorted=False).to(device=X.device)
+
+    mask = torch.ones(X.shape[0], dtype=torch.bool, device=X.device)
+    mask[holdout_idx] = False
+    train_idx = mask.nonzero(as_tuple=False).view(-1)
+
+    train_subset = (X.index_select(0, train_idx), Y.index_select(0, train_idx))
+    holdout_subset = (X.index_select(0, holdout_idx), Y.index_select(0, holdout_idx))
+    return train_subset, holdout_subset, train_idx, holdout_idx
+
+
+def _split_input_prototype_sets(
+    prototypes: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    indices: Optional[Dict[str, torch.Tensor]],
+    *,
+    classes: Tuple[int, int],
+    holdout_counts: Dict[str, int],
+    seed: int,
+):
+    if not prototypes:
+        return {}, {}, indices, None
+
+    missing = [name for name in holdout_counts.keys() if name not in prototypes]
+    if missing:
+        print(
+            "Warning: holdout counts specified for subsets missing from prototypes: "
+            f"{', '.join(sorted(missing))}."
+        )
+
+    train_sets = {}
+    holdout_sets = {}
+    train_indices = {} if indices is not None else None
+    holdout_indices = {} if indices is not None else None
+
+    for idx, (name, (X, Y)) in enumerate(prototypes.items()):
+        if X is None or Y is None:
+            continue
+        holdout_count = holdout_counts.get(name, 0)
+        train_subset, holdout_subset, train_idx, holdout_idx = _split_prototype_subset_by_class(
+            X,
+            Y,
+            classes,
+            holdout_count,
+            seed + idx * 17,
+            name,
+        )
+        train_sets[name] = train_subset
+        holdout_sets[name] = holdout_subset
+
+        if indices is not None and name in indices:
+            idx_tensor = indices[name]
+            if not torch.is_tensor(idx_tensor):
+                idx_tensor = torch.tensor(idx_tensor, dtype=torch.long)
+            idx_tensor = idx_tensor.to(dtype=torch.long)
+
+            if holdout_idx.numel() == 0:
+                train_indices[name] = idx_tensor
+                holdout_indices[name] = idx_tensor[:0]
+            else:
+                holdout_indices[name] = idx_tensor.index_select(0, holdout_idx.to(device=idx_tensor.device))
+                train_indices[name] = idx_tensor.index_select(0, train_idx.to(device=idx_tensor.device))
+
+    return train_sets, holdout_sets, train_indices, holdout_indices
 
 
 def _validate_input_prototype_metadata(metadata: dict, *, dataset: str, classes: List[int], dataset_seed: int, num_data: int):
@@ -207,22 +328,15 @@ def _validate_input_prototype_metadata(metadata: dict, *, dataset: str, classes:
         )
 
 
-FEATURE_PROTOTYPE_TRACKING_MAP = {
-    'feature_boundary': 'feature_space_prototypes/knn_outlier',
-    'feature_inliers': 'feature_space_prototypes/knn_inlier',
-    'feature_x_outlier': 'feature_space_prototypes/synthetic_x_outlier',
-    'feature_y_outlier': 'feature_space_prototypes/synthetic_y_outlier',
-}
-
 INPUT_PROTOTYPE_TRACKING_MAP = {
-    'boundary': 'input_space_prototypes/boundary_points',
-    'inliers': 'input_space_prototypes/inlier_points',
-    'x_outlier': 'input_space_prototypes/synthetic_x_outlier',
-    'y_outlier': 'input_space_prototypes/synthetic_y_outlier',
     'injected_x_outlier': 'input_space_prototypes/injected_x_outlier',
     'injected_y_outlier': 'input_space_prototypes/injected_y_outlier',
     'injected_inliers':   'input_space_prototypes/injected_inliers',
     'injected_boundary':  'input_space_prototypes/injected_boundary',
+    'heldout_x_outlier': 'input_space_prototypes/heldout_x_outlier',
+    'heldout_y_outlier': 'input_space_prototypes/heldout_y_outlier',
+    'heldout_inliers':   'input_space_prototypes/heldout_inliers',
+    'heldout_boundary':  'input_space_prototypes/heldout_boundary',
 }
 
 
@@ -285,6 +399,155 @@ def _drop_indices_from_dataset(
     return X[mask], Y[mask]
 
 
+def _partition_pool_by_class(X, Y, classes, *slice_sizes):
+    labels = Y.argmax(dim=1) if Y.ndim > 1 else Y.long()
+    slices = [[] for _ in slice_sizes]
+    slice_labels = [[] for _ in slice_sizes]
+    for cls in classes:
+        cls_indices = (labels == cls).nonzero(as_tuple=False).view(-1)
+        offset = 0
+        for i, sz in enumerate(slice_sizes):
+            if sz > 0:
+                sel = cls_indices[offset:offset + sz]
+                slices[i].append(X[sel])
+                slice_labels[i].append(Y[sel])
+                offset += sz
+    result = []
+    for i, sz in enumerate(slice_sizes):
+        if sz > 0 and slices[i]:
+            result.append((torch.cat(slices[i], dim=0), torch.cat(slice_labels[i], dim=0)))
+        else:
+            result.append(None)
+    return result
+
+
+def _build_prototype_injection_subsets(
+    *,
+    all_prototype_data: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    all_prototype_indices: Optional[Dict[str, torch.Tensor]],
+    input_proto_counts: Dict[str, int],
+    train_x: torch.Tensor,
+    train_y: torch.Tensor,
+    classes: Tuple[int, int],
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    List[Tuple[torch.Tensor, torch.Tensor]],
+    Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+]:
+    """Hold out source samples and rebuild the per-subset injection tensors.
+
+    Returns the post-holdout training tensors, the augmentation list
+    (label format already coerced to match ``train_y``), and a tracking
+    dict with per-subset tensors in their native label format.
+    """
+    if len(classes) != 2:
+        raise ValueError("Prototype injection requires exactly two classes.")
+
+    n_inlier_inject = input_proto_counts.get("inliers", 0) or 0
+    n_y_outlier = input_proto_counts.get("y_outlier", 0) or 0
+    n_x_outlier = input_proto_counts.get("x_outlier", 0) or 0
+    n_boundary_inject = input_proto_counts.get("boundary", 0) or 0
+
+    pool_indices = all_prototype_indices or {}
+    X_inlier_pool, Y_inlier_pool = all_prototype_data["inliers"]
+    X_boundary_pool, Y_boundary_pool = all_prototype_data["boundary"]
+
+    inlier_labels = Y_inlier_pool.argmax(dim=1) if Y_inlier_pool.ndim > 1 else Y_inlier_pool.long()
+    boundary_labels = Y_boundary_pool.argmax(dim=1) if Y_boundary_pool.ndim > 1 else Y_boundary_pool.long()
+
+    inlier_needed_per_class = n_inlier_inject + n_y_outlier + n_x_outlier
+    for cls in classes:
+        n_avail_inlier = int((inlier_labels == cls).sum().item())
+        if n_avail_inlier < inlier_needed_per_class:
+            raise ValueError(
+                f"Inlier pool has {n_avail_inlier} samples for class {cls} but injection "
+                f"needs {inlier_needed_per_class} disjoint samples (inliers={n_inlier_inject} "
+                f"+ y_outlier={n_y_outlier} + x_outlier={n_x_outlier}). Regenerate the prototype "
+                f"package with per-class counts matching the requested injection."
+            )
+        n_avail_boundary = int((boundary_labels == cls).sum().item())
+        if n_avail_boundary < n_boundary_inject:
+            raise ValueError(
+                f"Boundary pool has {n_avail_boundary} samples for class {cls} but injection "
+                f"needs {n_boundary_inject}."
+            )
+
+    # Hold out source samples from train_x before computing the centroid so that
+    # v_diff for x_outlier extrapolation reflects the post-holdout class means.
+    holdout_tensors = []
+    boundary_holdout_idx = pool_indices.get("boundary") if pool_indices else None
+    inlier_holdout_idx = pool_indices.get("inliers") if pool_indices else None
+    if boundary_holdout_idx is not None and n_boundary_inject > 0:
+        per_class = _select_indices_by_class(Y_boundary_pool, classes, n_boundary_inject)
+        holdout_tensors.append(boundary_holdout_idx.index_select(0, per_class.cpu()))
+    if inlier_holdout_idx is not None and inlier_needed_per_class > 0:
+        per_class = _select_indices_by_class(Y_inlier_pool, classes, inlier_needed_per_class)
+        holdout_tensors.append(inlier_holdout_idx.index_select(0, per_class.cpu()))
+    if holdout_tensors:
+        holdout_indices = torch.unique(torch.cat(holdout_tensors, dim=0))
+        if holdout_indices.numel() > 0:
+            orig_n = train_x.shape[0]
+            train_x, train_y = _drop_indices_from_dataset(train_x, train_y, holdout_indices)
+            removed = orig_n - train_x.shape[0]
+            print(
+                f"[holdout] removed {removed} samples from training set for input prototype "
+                f"injection ({holdout_indices.numel()} unique indices)"
+            )
+
+    inlier_slice, y_outlier_source, x_outlier_source = _partition_pool_by_class(
+        X_inlier_pool, Y_inlier_pool, classes,
+        n_inlier_inject, n_y_outlier, n_x_outlier,
+    )
+
+    outlier_augments: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    train_outlier_tracking: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    if inlier_slice is not None:
+        X_in, Y_in = inlier_slice
+        train_outlier_tracking["inliers"] = (X_in, Y_in)
+        outlier_augments.append((X_in, _coerce_labels_like(train_y, Y_in)))
+
+    if y_outlier_source is not None:
+        X_ysrc, Y_ysrc = y_outlier_source
+        y_labels = Y_ysrc.argmax(dim=1) if Y_ysrc.ndim > 1 else Y_ysrc.long()
+        flipped = torch.where(y_labels == classes[0], classes[1], classes[0])
+        train_outlier_tracking["y_outlier"] = (X_ysrc, flipped)
+        outlier_augments.append((X_ysrc, _coerce_labels_like(train_y, flipped)))
+
+    if x_outlier_source is not None:
+        X_xsrc, Y_xsrc = x_outlier_source
+        x_labels = Y_xsrc.argmax(dim=1) if Y_xsrc.ndim > 1 else Y_xsrc.long()
+        labels_all = train_y.argmax(dim=1) if train_y.ndim > 1 else train_y.long()
+        mask_0 = labels_all == classes[0]
+        mask_1 = labels_all == classes[1]
+        c0 = train_x[mask_0].view(int(mask_0.sum()), -1).mean(dim=0, keepdim=True)
+        c1 = train_x[mask_1].view(int(mask_1.sum()), -1).mean(dim=0, keepdim=True)
+        v_diff = c1 - c0
+        X_flat = X_xsrc.view(X_xsrc.shape[0], -1)
+        extrapolated = torch.zeros_like(X_flat)
+        for i in range(X_flat.shape[0]):
+            if x_labels[i] == classes[0]:
+                extrapolated[i] = X_flat[i] - EXTRAPOLATION_FACTOR * v_diff
+            else:
+                extrapolated[i] = X_flat[i] + EXTRAPOLATION_FACTOR * v_diff
+        X_x_out = extrapolated.view_as(X_xsrc)
+        Y_x_out = x_labels.clone()
+        train_outlier_tracking["x_outlier"] = (X_x_out, Y_x_out)
+        outlier_augments.append((X_x_out, _coerce_labels_like(train_y, Y_x_out)))
+
+    if n_boundary_inject > 0:
+        boundary_slices = _partition_pool_by_class(
+            X_boundary_pool, Y_boundary_pool, classes, n_boundary_inject,
+        )
+        if boundary_slices[0] is not None:
+            X_b, Y_b = boundary_slices[0]
+            train_outlier_tracking["boundary"] = (X_b, Y_b)
+            outlier_augments.append((X_b, _coerce_labels_like(train_y, Y_b)))
+
+    return train_x, train_y, outlier_augments, train_outlier_tracking
+
+
 def prepare_train_outlier_subset_configs(
     outlier_data: dict,
     base_batch_size: int,
@@ -326,28 +589,6 @@ def prepare_train_outlier_subset_configs(
         })
     return configs
 
-
-def prepare_feature_prototype_subset_configs(prototype_data: dict) -> List[dict]:
-    if not prototype_data:
-        return []
-
-    configs = []
-    for proto_key, log_prefix in FEATURE_PROTOTYPE_TRACKING_MAP.items():
-        if proto_key not in prototype_data:
-            continue
-        X_p, Y_p = prototype_data[proto_key]
-        configs.append({
-            "enabled": True,
-            "subsets": [{
-                "name": None,
-                "class_id": None,
-                "X_tensor": X_p.detach().cpu(),
-                "Y_tensor": Y_p.detach().cpu(),
-            }],
-            "metrics": KNN_TRACKING_METRICS,
-            "log_prefix": log_prefix,
-        })
-    return configs
 
 
 def prepare_prototype_subset_configs(prototype_data: dict, base_batch_size: int) -> List[dict]:
@@ -401,129 +642,6 @@ def prepare_prototype_subset_configs(prototype_data: dict, base_batch_size: int)
     return configs
 
 
-def _feature_prototype_dir(dataset_name: str, model_name: str, run_name: str) -> Path:
-    plaintext_root = RES_FOLDER / 'plaintext' / f"{dataset_name}_{model_name}"
-    return plaintext_root / run_name / 'feature_prototypes'
-
-
-def _metadata_to_cpu(payload):
-    if torch.is_tensor(payload):
-        return payload.detach().cpu()
-    if isinstance(payload, dict):
-        return {k: _metadata_to_cpu(v) for k, v in payload.items()}
-    if isinstance(payload, list):
-        return [_metadata_to_cpu(v) for v in payload]
-    return payload
-
-
-def _save_feature_prototype_package(
-    save_dir: Path,
-    prototypes: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
-    metadata: Dict[str, dict],
-):
-    target_dir = save_dir / 'feature_prototypes'
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    package = {
-        "prototypes": {
-            name: {
-                "inputs": X.detach().cpu(),
-                "labels": Y.detach().cpu(),
-            }
-            for name, (X, Y) in prototypes.items()
-        },
-        "metadata": _metadata_to_cpu(metadata),
-    }
-
-    torch.save(package, target_dir / 'prototypes.pt')
-
-    summary = {
-        "classes": metadata.get("classes"),
-        "counts": {name: int(payload["inputs"].shape[0]) for name, payload in package["prototypes"].items()},
-    }
-    indices = metadata.get("indices")
-    if indices:
-        summary["indices"] = {name: [int(idx) for idx in tensor.tolist()] for name, tensor in indices.items()}
-
-    with open(target_dir / 'summary.json', 'w') as f:
-        json.dump(summary, f, indent=2)
-
-
-def _load_reference_feature_prototypes(dataset_name: str, model_name: str, run_name: str):
-    proto_dir = _feature_prototype_dir(dataset_name, model_name, run_name)
-    proto_path = proto_dir / 'prototypes.pt'
-    if not proto_path.exists():
-        raise FileNotFoundError(
-            f"Cannot find feature prototype package at {proto_path}. "
-            "Ensure the reference run computed feature-space prototypes."
-        )
-
-    package = torch.load(proto_path, map_location='cpu')
-    proto_payload = package.get("prototypes", {})
-    if not proto_payload:
-        raise ValueError(f"No prototype tensors stored in {proto_path}")
-
-    prototypes = {}
-    for name, payload in proto_payload.items():
-        inputs = payload.get("inputs")
-        labels = payload.get("labels")
-        if inputs is None or labels is None:
-            continue
-        prototypes[name] = (inputs, labels)
-
-    if not prototypes:
-        raise ValueError(f"Feature prototype file {proto_path} did not contain usable tensors.")
-
-    metadata = package.get("metadata", {})
-    return prototypes, metadata
-
-
-def prepare_knn_subset_tracking_configs(args, dataset_name: str, model_name: str, data) -> List[dict]:
-    if not args.track_knn_outliers_from:
-        return []
-
-    per_class_indices = _load_reference_knn_indices(dataset_name, model_name, args.track_knn_outliers_from)
-    allowed_classes = set(args.classes or [])
-    if allowed_classes:
-        per_class_indices = {cid: idxs for cid, idxs in per_class_indices.items() if cid in allowed_classes}
-        if not per_class_indices:
-            raise ValueError(
-                f"No reference KNN indices for requested classes {sorted(allowed_classes)} "
-                f"in run {args.track_knn_outliers_from}"
-            )
-
-    track_top = max(1, args.track_knn_topk)
-
-    tracked_subsets, trimmed_by_class = _build_tracked_subsets(per_class_indices, track_top)
-    if not tracked_subsets:
-        raise ValueError(
-            f"No indices remained after applying --track-knn-topk={track_top} "
-            f"for run {args.track_knn_outliers_from}"
-        )
-
-    configs = [{
-        "enabled": True,
-        "subsets": tracked_subsets,
-        "metrics": KNN_TRACKING_METRICS,
-        "log_prefix": f"knn_outlier/{args.track_knn_outliers_from}",
-    }]
-
-    _, Y_train, _, _ = data
-    inlier_seed = (args.dataset_seed or 0) + 1337
-    inlier_subsets = _sample_inlier_subsets(Y_train, trimmed_by_class, seed=inlier_seed)
-    if inlier_subsets:
-        configs.append({
-            "enabled": True,
-            "subsets": inlier_subsets,
-            "metrics": KNN_TRACKING_METRICS,
-            "log_prefix": f"knn_inlier/{args.track_knn_outliers_from}",
-        })
-    else:
-        print("Warning: Unable to sample knn_inlier subsets; insufficient inlier candidates.")
-
-    return configs
-
-
 
 """
 # -------------------------------------
@@ -568,150 +686,6 @@ def compute_prototype_metrics(net, loss_fn, prototype_data, device, base_batch_s
 
 
 
-# -------------------------------------
-# NEW: Per-sample histograms setup
-# -------------------------------------
-class PerSampleHistograms:
-    def __init__(self, min_log10, max_log10, bins, metrics):
-        self.min_log10 = min_log10
-        self.max_log10 = max_log10
-        self.bins = bins
-        self.metrics = metrics
-        self.histograms = {metric: np.zeros((bins,)) for metric in metrics}
-        self.counts = {metric: 0 for metric in metrics}
-        self.quantiles = {metric: np.zeros((bins,)) for metric in metrics}
-
-# @torch.no_grad()
-
-def _per_sample_stats(net, loss_fn, X, Y, loss_type='ce', batch_size=1024, device='cuda'):
-    """
-    Return dict of numpy arrays: loss, resid_norm, kappa, grad_norm for dataset (X, Y).
-    loss_type: 'ce' (cross-entropy) or 'mse' (SquaredLoss: 0.5 * ||y - yhat||^2).
-    """
-    was_training = net.training
-    net.eval()
-
-    out_loss, out_resid, out_kappa, out_grad_norm = [], [], [], []
-
-    for i in range(0, len(X), batch_size):
-        xb = X[i:i + batch_size].to(device)
-        yb = Y[i:i + batch_size].to(device)
-
-        grad_norms_batch = []
-
-        for j in range(xb.shape[0]):
-            xb_j = xb[j:j + 1]  # [1, ...]
-            yb_j = yb[j:j + 1]  # [1] or [1, C]
-
-            net.zero_grad()
-
-            z_j = net(xb_j)
-
-            if loss_type == 'ce':
-                # Cross-entropy for a single sample
-                loss_j = F.cross_entropy(z_j, yb_j.long(), reduction='sum')
-            else:
-                # MSE: 0.5 * ||y - yhat||^2
-                zf = z_j
-                yf = yb_j
-
-                if zf.ndim > 1 and zf.size(-1) == 1:
-                    zf = zf.squeeze(-1)
-                if yf.ndim > 1 and yf.size(-1) == 1:
-                    yf = yf.squeeze(-1)
-
-                loss_j = 0.5 * (zf - yf).pow(2).sum()
-
-            loss_j.backward()
-
-            grads = []
-            for param in net.parameters():
-                if param.grad is not None:
-                    grads.append(param.grad.view(-1))
-
-            if grads:
-                g = torch.cat(grads)
-                grad_norms_batch.append(torch.linalg.norm(g).item())
-            else:
-                grad_norms_batch.append(0.0)
-
-        out_grad_norm.extend(grad_norms_batch)
-
-        # ----------------------------------------------------
-        # Loss / resid_norm / kappa
-        # ----------------------------------------------------
-        with torch.no_grad():
-            z = net(xb)
-
-            if loss_type == 'ce':
-                # Per-sample CE loss
-                loss = F.cross_entropy(z, yb.long(), reduction='none')
-
-                # Residual wrt logits: p - y_onehot
-                p = torch.softmax(z, dim=1)
-                y1 = F.one_hot(yb.long(), num_classes=z.size(1)).float()
-                resid = p - y1
-                resid_norm = resid.norm(dim=1)
-
-                # Curvature proxy: Frobenius norm of softmax Hessian
-                C = p.size(1)
-                I = torch.eye(C, device=p.device).unsqueeze(0)  # [1, C, C]
-                Hout = I * p.unsqueeze(2) - p.unsqueeze(2) * p.unsqueeze(1)
-                kappa = torch.linalg.norm(Hout, dim=(1, 2))
-
-            else:
-                # MSE: SquaredLoss 0.5 * ||y - yhat||^2
-                zf = z
-                yf = yb
-
-                if zf.ndim > 1 and zf.size(-1) == 1:
-                    zf = zf.squeeze(-1)
-                if yf.ndim > 1 and yf.size(-1) == 1:
-                    yf = yf.squeeze(-1)
-                if yf.ndim == 1 and zf.ndim == 2:
-                    yf = F.one_hot(yf.long(), num_classes=zf.size(-1)).float()
-
-                diff = zf - yf                       # [B] or [B, D]
-                loss = 0.5 * (diff ** 2)
-                if loss.ndim > 1:
-                    loss = loss.sum(dim=1)
-
-                if diff.ndim > 1:
-                    resid_norm = diff.norm(dim=1)
-                else:
-                    resid_norm = diff.abs()
-
-                # For plain MSE, output-space curvature is constant
-                kappa = torch.ones_like(loss)
-
-        out_loss.append(loss.cpu())
-        out_resid.append(resid_norm.cpu())
-        out_kappa.append(kappa.cpu())
-
-    if was_training:
-        net.train()
-
-    return {
-        'loss': torch.cat(out_loss).numpy(),
-        'resid': torch.cat(out_resid).numpy(),
-        'kappa': torch.cat(out_kappa).numpy(),
-        'grad_norm': np.asarray(out_grad_norm),
-    }
-
-def _hist_log10(values, bin_edges):
-    v = np.asarray(values)
-    v = np.clip(v, a_min=np.finfo(float).tiny, a_max=None)  # avoid log of 0
-    lv = np.log10(v)
-    counts, _ = np.histogram(lv, bins=bin_edges)
-    return counts
-
-def _quantiles(values, qs=(0.1,0.5,0.9,0.99)):
-    v = np.asarray(values)
-    return np.quantile(v, qs)
-
-def _ensure_dir(p):
-    Path(p).mkdir(parents=True, exist_ok=True)
-
 def _format_duration(seconds):
     seconds = max(int(seconds), 0)
     minutes, secs = divmod(seconds, 60)
@@ -721,20 +695,6 @@ def _format_duration(seconds):
     if minutes:
         return f"{minutes}m {secs}s"
     return f"{secs}s"
-
-def _render_frame(bin_edges, counts_train, counts_test, title, out_png_path):
-    plt.figure(figsize=(6,4))
-    centers = 0.5*(bin_edges[1:]+bin_edges[:-1])
-    plt.step(centers, counts_train, where='mid', label='train', alpha=0.8)
-    plt.step(centers, counts_test, where='mid', label='test', alpha=0.6)
-    plt.yscale('log') # log applied
-    plt.xlabel('log10(value)')
-    plt.ylabel('log10(count)')
-    plt.title(title)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_png_path, dpi=140)
-    plt.close()
 
 
 
@@ -900,12 +860,11 @@ class MeasurementRunner:
         gd_noise,
         proj_switch_step,
         quad_approx,
-        memorization_outlier_frac: float,
         # NEW:
         prototype_data,
         full_inputs_test=None,
-        per_sample_cfg=None,
         subset_tracking_cfgs=None,
+        per_sample_cfg=None,
         log_every_step: bool = False,
         dense_window: tuple = None,
         precond_pi_vec = None,
@@ -942,15 +901,13 @@ class MeasurementRunner:
         self.gd_noise = gd_noise
         self.proj_switch_step = proj_switch_step
         self.quad_approx = quad_approx
-        self.memorization_outlier_frac = memorization_outlier_frac
         self._precond_pi_vec = precond_pi_vec
 
-        # NEW: Per-sample config
         self.full_inputs_test = full_inputs_test
         self.per_sample_cfg = per_sample_cfg
         self.log_every_step = log_every_step
         self.dense_window = dense_window
-        
+
         # NEW: Per-sample initialization logic
         if per_sample_cfg is not None and per_sample_cfg.get('enabled', False):
             self.per_sample_histograms = PerSampleHistograms(
@@ -1014,7 +971,7 @@ class MeasurementRunner:
                         "subsets": tracked_subsets,
                         "metrics": cfg.get('metrics', ["full_loss", "accuracy", "lambda_max"]),
                         "metric_kwargs": cfg.get('metric_kwargs', {}),
-                        "log_prefix": cfg.get('log_prefix', "knn_outlier"),
+                        "log_prefix": cfg.get('log_prefix', "subset"),
                     })
 
         self.eigenvalues_log = []
@@ -1062,7 +1019,6 @@ class MeasurementRunner:
             'quadratic_loss_gn': None,
             'proj_grad_ratio': None,
             'hessian_trace': np.nan,
-            'memorization_hessian_outliers': None,
             'train_acc': np.nan, # NEW
             'test_acc': np.nan,  # NEW
             'train_test_gap': np.nan, # NEW
@@ -1268,21 +1224,7 @@ class MeasurementRunner:
                     eps=0.01,
                 )
 
-        # ----- Memorization via Hessian outliers -----
-        if 'memorization_hessian_outliers' in self.measurements:
-            if frequency_calculator.should_measure('memorization_hessian_outliers', ctx):
-                optimizer.zero_grad()
-                mem_stats = compute_outlier_vs_bulk_stats_hessian(
-                    net=self.net,
-                    X_train=self.X,
-                    Y_train=self.Y,
-                    loss_fn=self.loss_fn,
-                    optimizer=optimizer,
-                    frac=self.memorization_outlier_frac,
-                )
-                if mem_stats:
-                    metrics.update({f"memorization_hessian_outliers/{k}": v for k, v in mem_stats.items()})
-        
+
         # ----- NEW: Train/Test Gap -----
         if 'train_test_gap' in self.measurements and self.X_test is not None:
             if frequency_calculator.should_measure('train_test_gap',ctx):
@@ -1293,7 +1235,7 @@ class MeasurementRunner:
                 metrics['test_acc'] = vals['test_acc']
                 metrics['train_test_gap'] = vals['gap']
 
-        if self.subset_trackers and frequency_calculator.should_measure('knn_outlier_metrics', ctx):
+        if self.subset_trackers and frequency_calculator.should_measure('subset_metrics', ctx):
             for tracker in self.subset_trackers:
                 metric_kwargs = tracker.get('metric_kwargs', {})
                 for subset in tracker['subsets']:
@@ -1330,50 +1272,6 @@ class MeasurementRunner:
                         prefix = tracker['log_prefix']
                     for key, value in subset_results.items():
                         metrics[f"{prefix}/{key}"] = value
-
-        # ----- NEW: Per-sample histograms -----
-        if self.per_sample_cfg and self.per_sample_cfg['enabled']:
-            every = self.per_sample_cfg['every']
-            if step_number % every == 0:
-                loss_type = 'ce' if isinstance(self.loss_fn, nn.CrossEntropyLoss) else 'mse'
-                # train
-                stats_tr = _per_sample_stats(self.net, self.loss_fn, self.X, self.Y, loss_type=loss_type, batch_size=self.batch_size, device=self.device)
-                # test (if present)
-                if (self.X_test is not None) and (len(self.X_test) > 0):
-                    stats_te = _per_sample_stats(self.net, self.loss_fn, self.X_test, self.Y_test, loss_type=loss_type, batch_size=self.batch_size, device=self.device)
-                else:
-                    stats_te = {k: np.zeros_like(v) for k, v in stats_tr.items()}
-
-                # collect metrics
-                for metric in self.per_sample_histograms.metrics:
-                    # Quantiles (log to wandb)
-                    quantiles_tr = _quantiles(stats_tr[metric])
-                    quantiles_te = _quantiles(stats_te[metric])
-                    
-                    for q, name in zip((0.1, 0.5, 0.9, 0.99), ('q10','q50','q90','q99')):
-                        metrics[f'ps_quantiles/{metric}_train_{name}'] = np.quantile(stats_tr[metric], q)
-                        metrics[f'ps_quantiles/{metric}_test_{name}'] = np.quantile(stats_te[metric], q)
-
-                    # Histograms (save to file)
-                    counts_tr = _hist_log10(stats_tr[metric], self.bin_edges)
-                    counts_te = _hist_log10(stats_te[metric], self.bin_edges)
-
-                    # Store for saving to file later
-                    np.savez(
-                        self.ps_dir / f'step_{step_number:05d}_{metric}.npz',
-                        bin_edges=self.bin_edges,
-                        counts_train=counts_tr,
-                        counts_test=counts_te,
-                        quantiles_train=quantiles_tr,
-                        quantiles_test=quantiles_te
-                    )
-
-                    # Render frame
-                    if not self.per_sample_cfg.get('no_frames', False):
-                        title = f'Step {step_number}: log10({metric})'
-                        out_path = self.frames_dir / f'{step_number:05d}_{metric}.png'
-                        _render_frame(self.bin_edges, counts_tr, counts_te, title, out_path)
-
 
 
         # ----- Gradient-noise interaction (GNI) -----
@@ -1511,48 +1409,6 @@ class MeasurementRunner:
             )
 
 
-        # ----- NEW: Prototype per-sample stats over time -----
-        if self.prototype_data is not None and self.per_sample_cfg and self.per_sample_cfg['enabled']:
-            proto_every = self.per_sample_cfg["every"]
-            if step_number % proto_every == 0:
-                loss_type = 'ce' if isinstance(self.loss_fn, nn.CrossEntropyLoss) else 'mse'
-
-                proto_dir = self.ps_dir / "prototypes"
-                _ensure_dir(proto_dir)
-
-                for name, (X_p, Y_p) in self.prototype_data.items():
-                    X_p = X_p.to(self.device)
-                    Y_p = Y_p.to(self.device)
-
-                    # Per-sample stats
-                    stats = _per_sample_stats(
-                        self.net,
-                        self.loss_fn,
-                        X_p,
-                        Y_p,
-                        loss_type=loss_type,
-                        batch_size=len(X_p),
-                        device=self.device,
-                    )
-                    
-                    # NEW: Add batch sharpness for this prototype set
-                    # Compute full loss on this prototype set
-                    self.net.zero_grad()
-                    preds = self.net(X_p).squeeze(dim=-1)
-                    proto_loss = self.loss_fn(preds, Y_p)
-                    
-                    # Compute batch sharpness (gHg/g²)
-                    batch_sharpness = compute_grad_H_grad(proto_loss, self.net).item()
-                    
-                    # Add to stats
-                    stats['batch_sharpness'] = batch_sharpness
-                    stats['mean_loss'] = np.mean(stats['loss'])
-                    
-                    out_path = proto_dir / f"step_{step_number:05d}_{name}.npz"
-                    np.savez(out_path, **stats)
-
-
-
         metrics['epoch_loss_update'] = epoch_loss_update
         return metrics
  
@@ -1595,7 +1451,6 @@ def train(
             quad_switch_lr: float = None,  # lr to use after switching to quadratic approximation
             precise_plots: bool = False,  # Enable more frequent measurements for precise plotting
             rare_measure: bool = False,  # Make expensive measurements rarer
-            memorization_outlier_frac: float = 0.05,  # Fraction of samples marked as outliers for memorization metric
             # Gradient projection configuration
             proj_switch_step: int = None,  # Step to start projecting minibatch gradients
             proj_top_l: int = None,        # Number of top eigendirections to use for projection
@@ -1603,8 +1458,6 @@ def train(
             wandb_run=None,
             wandb_enabled: bool = False,
             wandb_run_id: str = None,
-            per_sample_cfg=None, #NEW 
-            knn_outlier_cfg=None,
             subset_tracking_cfgs=None,
             prototype_data=None,
             log_every_step: bool = False,
@@ -1651,13 +1504,9 @@ def train(
 
     X, Y = X_train, Y_train
 
-    # ----- Lmax Decay Setup -----
-    decay_active = False
-    decay_start_step = None
-    decay_start_lr = None
-    if lmax_decay_initial_lr is None:
-        lmax_decay_initial_lr = optimizer.param_groups[0]['lr']
-    lmax_decay_threshold = 2.0 / lmax_decay_initial_lr
+    # ----- LR Drop Setup -----
+    lmax_drop_applied = False
+    lmax_drop_threshold = 2.0 / optimizer.param_groups[0]['lr']
 
     # ----- Device Alignment -----
     net = net.to(device)
@@ -1757,8 +1606,6 @@ def train(
         gd_noise=gd_noise,
         proj_switch_step=proj_switch_step,
         quad_approx=quad_approx,
-        memorization_outlier_frac=memorization_outlier_frac,
-        per_sample_cfg=per_sample_cfg,
         subset_tracking_cfgs=subset_tracking_cfgs,
         prototype_data=prototype_data,    
         full_inputs_test=None,
@@ -1840,11 +1687,10 @@ def train(
                 step_number=step_number,
             )
             if lmax_drop:
-                # Adam: trigger off AEoS ratio ~ 1
                 if args.adam and ('adam_edge_ratio' in metrics):
                     r = metrics.get('adam_edge_ratio', float('nan'))
-                    if (not decay_active) and math.isfinite(r) and (r >= 1.0):
-                        decay_active = True
+                    if (not lmax_drop_applied) and math.isfinite(r) and (r >= 1.0):
+                        lmax_drop_applied = True
                         old_lr = optimizer.param_groups[0]['lr']
                         new_lr = old_lr * float(lmax_drop_mult)
                         if lmax_drop_target_lr is not None:
@@ -1854,17 +1700,17 @@ def train(
                         print(f"[ADAM LR DROP] step={step_number} edge_ratio={r:.3f} lr: {old_lr:g} -> {new_lr:g}")
                 else:
                     lmax_value = metrics.get('lmax', float('nan'))
-                    if (not decay_active) and math.isfinite(lmax_value) and (lmax_value >= lmax_decay_threshold):
-                        decay_active = True  # reuse as "already dropped"
+                    if (not lmax_drop_applied) and math.isfinite(lmax_value) and (lmax_value >= lmax_drop_threshold):
+                        lmax_drop_applied = True
                         old_lr = optimizer.param_groups[0]['lr']
                         new_lr = old_lr * float(lmax_drop_mult)
                         if lmax_drop_target_lr is not None:
                             new_lr = max(new_lr, float(lmax_drop_target_lr))
                         for pg in optimizer.param_groups:
                             pg['lr'] = new_lr
-                        print(f"[LR DROP] step={step_number} lmax={lmax_value:.4f} thresh={lmax_decay_threshold:.4f} lr: {old_lr:g} -> {new_lr:g}")
+                        print(f"[LR DROP] step={step_number} lmax={lmax_value:.4f} thresh={lmax_drop_threshold:.4f} lr: {old_lr:g} -> {new_lr:g}")
 
-                
+
             # --- Lmax-based Learning Rate Decay Logic ---
             if lmax_decay:
                 lmax_value = metrics.get('lmax', float('nan'))
@@ -1884,7 +1730,7 @@ def train(
                     new_lr = decay_start_lr + t * (lmax_decay_target_lr - decay_start_lr)
                     for pg in optimizer.param_groups:
                         pg['lr'] = new_lr
-    
+
             if lmax_drop and lmax_decay:
                 raise ValueError("Use either --lmax-drop or --lmax-decay, not both.")
 
@@ -2183,31 +2029,6 @@ def train(
     )
     print(f"Final checkpoint saved: {final_checkpoint_path}")
 
-    # ----- NEW: per-sample stats on prototype sets -----
-    if prototype_data is not None:
-        print("Computing per-sample metrics for prototype sets...")
-        loss_type = 'ce' if isinstance(loss_fn, nn.CrossEntropyLoss) else 'mse'
-
-        proto_dir = save_to / "prototype_final"
-        _ensure_dir(proto_dir)
-
-        for name, (X_p, Y_p) in prototype_data.items():
-            X_p = X_p.to(device)
-            Y_p = Y_p.to(device)
-
-            stats = _per_sample_stats(
-                net,
-                loss_fn,
-                X_p,
-                Y_p,
-                loss_type=loss_type,
-                batch_size=batch_size,
-                device=device,
-            )
-            out_path = proto_dir / f"final_{name}.npz"
-            np.savez(out_path, **stats)
-            print(f"  saved {name} -> {out_path}")
-
     results_file.close()
 
     measurement_runner.close()
@@ -2217,106 +2038,6 @@ def train(
         _log_train_time()
         wandb_run.finish()
         wandb_finished = True
-
-    if knn_outlier_cfg and knn_outlier_cfg.get('enabled', False):
-        print("Computing k-NN neighbor-mix outliers...")
-        feature_batch = knn_outlier_cfg.get('feature_batch_size', 512)
-        k_neighbors = knn_outlier_cfg.get('k_neighbors', 32)
-        top_k_per_class = knn_outlier_cfg.get('top_k_per_class', 5)
-        balance_target = knn_outlier_cfg.get('balance_target', 0.5)
-        chunk_size = knn_outlier_cfg.get('chunk_size', 1024)
-        normalize = knn_outlier_cfg.get('normalize', True)
-        return_indices = knn_outlier_cfg.get('return_neighbor_indices', True)
-
-        features = extract_feature_matrix(
-            net,
-            X,
-            batch_size=feature_batch,
-            flatten_outputs=True,
-        )
-        label_tensor = Y.detach().cpu()
-
-        outlier_summary = identify_knn_outliers_by_neighbor_mix(
-            features,
-            label_tensor,
-            k_neighbors=k_neighbors,
-            top_k_per_class=top_k_per_class,
-            balance_target=balance_target,
-            chunk_size=chunk_size,
-            normalize=normalize,
-            return_neighbor_indices=return_indices,
-        )
-
-        per_class_indices = {}
-        per_class_stats = {}
-        flattened_rows = []
-        global_balance_dev = []
-        global_entropy = []
-        global_gap = []
-
-        for class_id, entries in outlier_summary.get("outliers", {}).items():
-            if not entries:
-                continue
-            per_class_indices[int(class_id)] = [int(e["dataset_index"]) for e in entries]
-
-            ratios = np.array([e["same_class_ratio"] for e in entries], dtype=np.float32)
-            devs = np.array([e["balance_deviation"] for e in entries], dtype=np.float32)
-            entropies = np.array([e["neighbor_entropy"] for e in entries], dtype=np.float32)
-            gaps = np.array([e["top_two_gap"] for e in entries], dtype=np.float32)
-
-            per_class_stats[int(class_id)] = {
-                "count": len(entries),
-                "mean_same_class_ratio": float(ratios.mean()),
-                "mean_balance_deviation": float(devs.mean()),
-                "mean_neighbor_entropy": float(entropies.mean()),
-                "mean_top_two_gap": float(gaps.mean()),
-            }
-
-            global_balance_dev.extend(devs.tolist())
-            global_entropy.extend(entropies.tolist())
-            global_gap.extend(gaps.tolist())
-
-            for entry in entries:
-                flattened_rows.append({
-                    "dataset_index": int(entry["dataset_index"]),
-                    "class_id": int(class_id),
-                    "same_class_ratio": float(entry["same_class_ratio"]),
-                    "balance_deviation": float(entry["balance_deviation"]),
-                    "neighbor_entropy": float(entry["neighbor_entropy"]),
-                    "top_two_gap": float(entry["top_two_gap"]),
-                    "avg_neighbor_distance": float(entry["avg_neighbor_distance"]),
-                })
-
-        outlier_path = save_to / 'knn_outliers.json'
-        with open(outlier_path, 'w') as f:
-            json.dump(outlier_summary, f, indent=2)
-
-        indices_payload = {
-            "k_neighbors": k_neighbors,
-            "top_k_per_class": top_k_per_class,
-            "class_ids": outlier_summary.get("class_ids", []),
-            "per_class_indices": {str(k): v for k, v in per_class_indices.items()},
-            "flat_indices": sorted({idx for v in per_class_indices.values() for idx in v}),
-        }
-        with open(save_to / 'knn_outlier_indices.json', 'w') as f:
-            json.dump(indices_payload, f, indent=2)
-
-        if wandb_enabled and wandb_run is not None:
-            total_flagged = len(flattened_rows)
-            wandb_metrics = {
-                "knn_outliers/total_flagged": total_flagged,
-                "knn_outliers/mean_balance_deviation": float(np.mean(global_balance_dev)) if global_balance_dev else float('nan'),
-                "knn_outliers/mean_neighbor_entropy": float(np.mean(global_entropy)) if global_entropy else float('nan'),
-                "knn_outliers/mean_top_two_gap": float(np.mean(global_gap)) if global_gap else float('nan'),
-            }
-            for class_id, stats in per_class_stats.items():
-                prefix = f"knn_outliers/class_{class_id}"
-                for name, value in stats.items():
-                    wandb_metrics[f"{prefix}/{name}"] = value
-
-            log_knn_outlier_results(wandb_metrics, flattened_rows)
-
-        print(f"k-NN outlier summary saved to {outlier_path}")
 
 
     # ----- Optional Final Measurements -----
@@ -2330,7 +2051,12 @@ def train(
 
 
 
+def build_parser() -> argparse.ArgumentParser:
+    return cli_build_parser(EXTRAPOLATION_FACTOR)
+
+
 if __name__ == '__main__':
+    _refresh_runtime_paths()
     # -------------------------------------
     # Section: Runtime Setup
     # -------------------------------------
@@ -2346,233 +2072,8 @@ if __name__ == '__main__':
     # -------------------------------------
     # Section: Argument Parser
     # -------------------------------------
-    parser = argparse.ArgumentParser(description='Training script')
-    # --- Seed ---
-    parser.add_argument("--seed", type=int, default=88881)
-
-    # --- Training Parameters ---
-    parser.add_argument('--batch', type=int, default=64, help='Input batch size for training')
-    parser.add_argument('--epochs', type=int, help='Number of epochs to train')
-    parser.add_argument('--steps', type=int, default=10000, help='Number of steps to train. Either epochs or steps should be provided')
-    parser.add_argument('--cpu', action='store_true', help='Force training to run on CPU even if CUDA is available')
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for training')
-
-    # --- Lmax LR Decay Configuration ---
-    parser.add_argument('--lmax-decay', action='store_true',
-                        help='Enable linear lr decay once lambda_max >= 2/initial_lr')
-    parser.add_argument('--lmax-decay-target-lr', type=float, default=0.0001,
-                        help='Target lr for linear decay after lmax trigger')
-    parser.add_argument('--lmax-decay-steps', type=int, default=10000,
-                        help='Number of steps to linearly decay to target lr')
-
-    # --- LR Drop Configuration ---
-    parser.add_argument('--lr-drop-at-step', type=int, default=None,
-                        help='Exact step at which to drop the learning rate (for fork runs). '
-                             'Use with --lr-drop-to. The run starts at --lr and switches at this step.')
-    parser.add_argument('--lr-drop-to', type=float, default=None,
-                        help='Target LR after --lr-drop-at-step fires.')
-    parser.add_argument('--lmax-drop', action='store_true',
-                        help='One-time LR drop once lambda_max exceeds threshold (2/initial_lr).')
-    parser.add_argument('--lmax-drop-mult', type=float, default=0.5,
-                        help='Multiply LR by this factor on trigger. (0.5 = 50%% drop, 0.8 = 20%% drop)')
-    parser.add_argument('--lmax-drop-target-lr', type=float, default=None,
-                        help='Optional floor: LR after drop is max(LR*mult, target).')
-
-    # --- Loss Configuration ---
-    parser.add_argument('--stop-loss', '--stop_loss', type=float, default=None, help='Stop training if loss goes below this value')
-    parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'ce'], help='Loss function to use (mse or ce)')
-
-    # --- Dataset Configuration ---
-    parser.add_argument('--dataset', type=str, default='cifar10', help='Dataset to use for training')
-    parser.add_argument('--classes', type=int, nargs=2, default=[1, 9], help='Two class labels to use for training. Default is [1, 9], as being probably the most difficult classes to separate')
-    parser.add_argument('--num-data', '--num_data', type=int, default=1024, help='Number of datapoints to train on')
-
-    # --- Model Configuration ---
-    parser.add_argument('--model', type=str, default='mlp', help='Network architecture to use for training')
-    parser.add_argument('--init-scale', '--init_scale', type=float, default=0.2, help='Initialization scale for network weights')
-    parser.add_argument('--no-init', '--no_init', action='store_true', help='If set, do not initialize network weights')
-
-    # --- wandb Continuation Options ---
-    parser.add_argument('--cont-run-id', '--cont_run_id', type=str, default=None, help='Wandb run ID to continue training from')
-    parser.add_argument('--cont-step', '--cont_step', type=int, default=None, help='Step to continue training from (uses closest available checkpoint)')
-    parser.add_argument('--checkpoint-every', '--checkpoint_every', type=int, default=None, help='Save checkpoint every N steps (default: auto-calculated based on total steps)')
-
-    # --- Optimizer Variants ---
-    parser.add_argument('--momentum', type=float, default=None, help='Momentum for SGD optimizer')
-    parser.add_argument('--adam', action='store_true', help='If set, use Adam optimizer instead of SGD')
-    parser.add_argument('--weight-decay', type=float, default=0.0)
-    parser.add_argument('--precond-lmax', action='store_true',
-        help='Log Adam-preconditioned top Hessian eigenvalue (AEoS sharpness).')
-
-    # --- Measurement Flags (Primary) ---
-    # parser.add_argument('--fullbs', action='store_true', help='If set, compute the lambda_max, aka FullBS')
-    parser.add_argument('--lambdamax', '--lmax', action='store_true', help='If set, compute the lambda_max, aka FullBS')
-    parser.add_argument('--batch-sharpness', '--batch-sharpness-step', '--bs', action='store_true', dest='batch_sharpness',
-                        help='If set, compute the batch sharpness: E[gHg/g²] with the expectation taken across mini-batches. Use --batch-sharpness-step for backward compatibility.')
-    parser.add_argument('--step-sharpness', action='store_true', dest='step_sharpness',
-                        help='If set, compute the step sharpness: the current-mini-batch Rayleigh quotient g·Hg/g². Average across steps to recover the traditional batch sharpness.')
-    parser.add_argument('--gni', action='store_true', help='If set, compute the Gradient-Noise Interaction quantity.')
-
-    # --- Measurement Flags (Secondary, aka still useful) ---
-    parser.add_argument('--hessian-trace', action='store_true', help='Estimate the trace of the full-batch loss Hessian via a Hutchinson-style estimator')
-    parser.add_argument('--grad-projection', action='store_true', help='Compute grad_projection_i: fraction of full-batch gradient lying in span of top-i cached Hessian eigenvectors (i up to 20); uses cached eigenvectors only; only for plain SGD')
-    parser.add_argument('--one-step-loss-change', action='store_true', help='If set, compute the expected one-step change in loss using Monte Carlo estimation')
-    parser.add_argument('--gradient-norm', action='store_true', help='If set, compute the Monte Carlo estimate of squared norm of mini-batch gradients')
-    parser.add_argument('--final', action='store_true', help='If set, compute the lambda_max and step sharpness at the end')
-    
-    # --- Measurement Flags (Tertiary, aka almost completely useless) ---
-    parser.add_argument('--batch-sharpness-exp-inside', action='store_true', help='If set, compute the batch sharpness using E[gHg]/E[g²], where the expectation is inside the ratio. Compare with step-sharpness, where the expectation stays outside the ratio.')
-    parser.add_argument('--batch-lambdamax','--batchlmax', action='store_true', help='If set, compute the batch lambda_max(H_B), aka batch lambda max')
-    parser.add_argument('--fisher', action='store_true', help='If set, compute Fisher information matrix eigenvalue. Currently only works with one-dim output')
-    parser.add_argument('--param-distance', '--param_distance', action='store_true', help='If set, compute the distance from the reference weights')
-    parser.add_argument('--param-file', '--param_file', type=str, default=None, help='Path to reference parameters for computing parameter distance')
-    parser.add_argument('--log-every-step', action='store_true', help='Force all configured measurements to log every training step, bypassing frequency rules.')
-    parser.add_argument('--dense-window', nargs=3, type=int, metavar=('START', 'END', 'EVERY'),
-                        default=None,
-                        help='Dense measurement window: measure every EVERY steps in [START, END]. '
-                             'E.g. --dense-window 400 3000 16 measures every 16 steps from step 400 to 3000.')
-
-    # --- Measurement Configuration ---
-    parser.add_argument('--disable-cache-eigenvectors', '--disable_cache_eigenvectors', action='store_true', help='If set, disable eigenvector caching for warm starts to improve eigenvalue computation performance')
-    parser.add_argument('--use-power-iteration', '--use_power_iteration', action='store_true', help='If set, use power iteration method instead of LOBPCG for eigenvalue computation')
-    parser.add_argument('--num-eigenvalues', '--num_eigenvalues', '--k', type=int, default=1, help='Number of eigenvalues to compute when computing lambda_max (default: 1)')
-
-    parser.add_argument('--results-rarely', '--results_rarely', action='store_true', help='If set, results will be recorded less frequently')
-    parser.add_argument('--precise-plots', action='store_true', help='Enable more frequent measurements for precise plotting')
-    parser.add_argument('--rare-measure', dest='rare_measure', action='store_true', help='Activate regime where expensive measurements are performed rarely')
-
-    # --- Noise Configuration ---
-    parser.add_argument('--gd-noise', '--gd_noise', type=str, default=None, help='Do noisy GD, to simulate SGD. Supported noises: sgd, diag, iso, const')
-    parser.add_argument('--noise-mag', '--noise_mag', type=float, default=None, help='The noise magnitude for the constant noise')
-    
-    # --- SDE Configuration ---
-    parser.add_argument('--sde', action='store_true', help='Simulate the SDE dynamics (the one that correspond to the SGD). It integrates the SDE using the Euler-Maruyama method')
-    parser.add_argument('--sde-h', '--sde_h', type=float, default=0.01, help='SDE *integration* time step size (default: 0.01)')
-    parser.add_argument('--sde-eta', '--sde_eta', type=float, default=None, help='Learning rate for SDE (uses --lr if not specified)')
-    parser.add_argument('--sde-seed', '--sde_seed', type=int, default=888, help='Random seed for SDE noise generation (default: 888)')
-
-    # --- Quadratic Approximation Configuration ---
-    parser.add_argument('--quad-switch-step', '--quad_switch_step', type=int, default=None, help='Step at which to switch from true NN dynamics to quadratic Taylor approximation dynamics')
-    parser.add_argument('--use-gauss-newton', '--use_gauss_newton', action='store_true', help='Use Gauss-Newton matrix instead of Hessian for quadratic approximation')
-    parser.add_argument('--quad-switch-lr', '--quad_switch_lr', type=float, default=None, help='lr to use after switching, used to test explosion')
-
-    # --- Gradient Projection Configuration ---
-    parser.add_argument('--proj-switch-step', dest='proj_switch_step', type=int, default=None,
-                        help='Step number to start projecting minibatch gradient onto top-l Hessian eigendirections (full batch)')
-    parser.add_argument('--proj-top-l', dest='proj_top_l', type=int, default=None,
-                        help='Number of top Hessian eigendirections to project against/onto after switch step')
-    parser.add_argument('--proj-to-residual', dest='proj_to_residual', action='store_true',
-                        help='After --proj-switch-step, apply gradient projected to orthogonal complement of top-l eigenspace')
-
-    # --- Randomness Settings ---
-    parser.add_argument('--dataset-seed', '--dataset_seed', type=int, default=888, help='Random seed for dataset preparation')
-    parser.add_argument('--init-seed', '--init_seed', type=int, default=8888, help='Random seed for network initialization')
-
-    # --- wandb Settings ---
-    parser.add_argument('--wandb-tag', type=str, default=None, help='Tag to add to the wandb run')
-    parser.add_argument('--wandb-name', type=str, default=None, help='Optional suffix appended to default wandb run name (sanitized)')
-    parser.add_argument('--wandb-notes', type=str, default=None, help='Optional notes/description attached to the wandb run')
-    parser.add_argument('--disable-wandb', action='store_true', help='Disable Weights & Biases logging for debugging/testing')
-
-    # --- New Measurement Flag ---
-    parser.add_argument('--train-test-gap', action='store_true', help='If set, compute the training and testing accuracy and gap (heavy, runs rarely)')
-
-    # --- NEW: Per-Sample Histogram Configuration ---
-
-    parser.add_argument('--per-sample', action='store_true',
-                        help='Track per-sample loss/residual/curvature histograms over time and save frames')
-    parser.add_argument('--per-sample-every', type=int, default=100,
-                        help='Snapshot cadence in steps for per-sample histograms (default: 100)')
-    parser.add_argument('--hist-min-log10', type=float, default=-6.0,
-                        help='Left edge for log10 binning (default: -6)')
-    parser.add_argument('--hist-max-log10', type=float, default=2.0,
-                        help='Right edge for log10 binning (default: 2)')
-    parser.add_argument('--hist-bins', type=int, default=80,
-                        help='Number of bins for log10 histograms (default: 80)')
-    parser.add_argument('--per-sample-metrics', type=str, nargs='+',
-                        default=['loss','resid','kappa'],
-                        choices=['loss','resid','kappa'],
-                        help='Which metrics to histogram (default: loss resid kappa)')
-    parser.add_argument('--no-frames', action='store_true',
-                        help='Only save counts/quantiles as .npz; do not render PNG frames')
-
-
-    # --- NEW: Memorization via Outliers identified by Alignment with Top Hessian Eigenvector ---
-    parser.add_argument('--memorization-hessian-outliers', action='store_true', help='Compute memorization stats based on alignment with top Hessian eigenvector (heavy; runs rarely)')
-    parser.add_argument('--memorization-outlier-frac', type=float, default=0.05, help='Fraction of examples treated as outliers for Hessian-alignment memorization stats')
-
-    # --- NEW: Outlier Mining Configuration ---
-    parser.add_argument('--knn-outliers', action='store_true',
-                        help='After training, run a k-NN pass to flag ambiguous samples')
-    parser.add_argument('--knn-neighbors', type=int, default=32,
-                        help='Number of neighbors used for the ambiguity score')
-    parser.add_argument('--knn-top-per-class', type=int, default=10,
-                        help='How many outliers to keep per class')
-    parser.add_argument('--knn-feature-batch', type=int, default=512,
-                        help='Batch size used during the post-hoc embedding pass')
-    parser.add_argument('--knn-chunk-size', type=int, default=1024,
-                        help='Chunk size used while computing the k-NN graph')
-    parser.add_argument('--knn-no-normalize', action='store_true',
-                        help='Disable L2-normalization of feature vectors before k-NN')
-    parser.add_argument('--track-knn-outliers-from', type=str, default=None,
-                        help='Existing plaintext run folder name (e.g., 20251124_0820_35_lr0.01000_b8) whose knn_outlier_indices.json should be tracked during training')
-    parser.add_argument('--track-knn-topk', type=int, default=5,
-                        help='Number of stored outliers per class to track from the reference run')
-
-    # --- NEW: Feature-space Prototype Tracking ---
-    parser.add_argument('--feature-prototypes', action='store_true',
-                        help='After training, export feature-space prototype sets for reuse')
-    parser.add_argument('--feature-prototype-batch', type=int, default=512,
-                        help='Batch size for feature extraction when exporting feature prototypes')
-    parser.add_argument('--feature-prototype-topk', type=int, default=50,
-                        help='Maximum prototypes per class to store from feature space')
-    parser.add_argument('--feature-prototype-kneighbors', type=int, default=32,
-                        help='k-NN neighborhood size when identifying boundary points in feature space')
-    parser.add_argument('--feature-prototype-no-normalize', action='store_true',
-                        help='Disable L2 normalization before computing feature-space prototypes')
-    parser.add_argument('--feature-prototype-extrapolation', type=float, default=EXTRAPOLATION_FACTOR,
-                        help='Extrapolation factor used when building feature-space x-outliers')
-    parser.add_argument('--track-feature-prototypes-from', type=str, default=None,
-                        help='Existing plaintext run folder whose feature-space prototype sets should be tracked during training')
-    parser.add_argument('--train-input-prototypes', type=str, default=None,
-                        help='Input prototype source for training run: generate | from:<path or run> | none')
-    parser.add_argument('--test-input-prototypes', type=str, default=None,
-                        help='Input prototype source for logging/eval: from:<path or run> | none (defaults to train-input-prototypes when unset)')
-    parser.add_argument('--input-prototypes-frac', type=float, default=None,
-                        help='Fraction of training set (per class) to use for input prototypes when generating')
-    parser.add_argument('--input-prototypes-count', type=int, default=None,
-                        help='Count per class to use for all input prototype subsets when generating')
-    parser.add_argument('--input-prototypes-boundary-count', type=int, default=None,
-                        help='Override count per class for boundary prototypes')
-    parser.add_argument('--input-prototypes-inliers-count', type=int, default=None,
-                        help='Override count per class for inlier prototypes')
-    parser.add_argument('--input-prototypes-x-outlier-count', type=int, default=None,
-                        help='Override count per class for x-outlier prototypes')
-    parser.add_argument('--input-prototypes-y-outlier-count', type=int, default=None,
-                        help='Override count per class for y-outlier prototypes')
-    parser.add_argument('--input-prototypes-holdout', type=str, default='auto',
-                        choices=['auto', 'boundary_inliers', 'none'],
-                        help='Hold out boundary/inlier indices from training when using train-input-prototypes (auto => boundary_inliers for new flags)')
-    parser.add_argument('--track-input-prototypes', action='store_true',
-                        help='DEPRECATED: Track/log input-space prototype subsets (boundary/inliers/synthetic outliers) on wandb')
-    parser.add_argument('--input-prototype-holdout-per-class', type=int, default=None,
-                        help='DEPRECATED: hold out this many boundary/inlier points per class from training')
-    parser.add_argument('--input-prototype-holdout-frac', type=float, default=None,
-                        help='DEPRECATED: hold out this fraction of the training set per class (used to size boundary/inlier prototypes)')
-    parser.add_argument('--train-input-x-outliers', type=int, default=None,
-                        help='Augment the training set with this many input-space x-outliers per class; '
-                             'also logs input-space prototype subsets')
-    parser.add_argument('--train-input-y-outliers', type=int, default=None,
-                        help='Augment the training set with this many input-space y-outliers per class; '
-                             'also logs input-space prototype subsets')
-    parser.add_argument('--train-input-inliers', type=int, default=None,
-                        help='Augment the training set with this many input inliers per class; '
-                             'also logs input-space prototype subsets')
-    parser.add_argument('--train-input-boundary', type=int, default=None,
-                        help='Augment the training set with this many input boundary points per class; '
-                             'also logs input-space prototype subsets')
-    # ----- Argument Parsing -----
-    args = parser.parse_args()
+    parser = cli_build_parser(EXTRAPOLATION_FACTOR)
+    args = cli_parse_args_with_config(parser)
 
 
     # -------------------------------------
@@ -2601,7 +2102,8 @@ if __name__ == '__main__':
     # -------------------------------------
     # ----- Argument Post-processing -----
     # --- Parameter Extraction ---
-    batch_size = args.batch
+    full_batch_requested = args.batch == 'full'
+    batch_size = None if full_batch_requested else args.batch
     dataset = args.dataset
     if args.cpu:
         if T.cuda.is_available():
@@ -2626,44 +2128,30 @@ if __name__ == '__main__':
 
     if args.steps is not None and args.epochs is not None:
         raise ValueError("You should provide either epochs or steps, not both")
-    # Allow tracking input prototypes even when training with input outliers.
-
-    for flag_name in ("train_input_x_outliers", "train_input_y_outliers"):
-        flag_value = getattr(args, flag_name)
-        if flag_value is not None and flag_value < 1:
-            raise ValueError(f"--{flag_name.replace('_', '-')} must be >= 1 when provided")
-
-    if args.input_prototypes_count is not None and args.input_prototypes_count < 1:
-        raise ValueError("--input-prototypes-count must be >= 1 when provided")
-    if args.input_prototypes_frac is not None:
-        if args.input_prototypes_frac <= 0 or args.input_prototypes_frac >= 1:
-            raise ValueError("--input-prototypes-frac must be in (0, 1)")
-    if args.input_prototypes_count is not None and args.input_prototypes_frac is not None:
-        raise ValueError("Provide only one of --input-prototypes-count or --input-prototypes-frac")
-
+    if batch_size is not None and batch_size < 1:
+        raise ValueError("--batch must be >= 1 when provided as an integer")
     for flag_name in (
-        "input_prototypes_boundary_count",
-        "input_prototypes_inliers_count",
-        "input_prototypes_x_outlier_count",
-        "input_prototypes_y_outlier_count",
+        "input_x_outliers",
+        "input_y_outliers",
+        "input_inliers",
+        "input_boundary",
     ):
         flag_value = getattr(args, flag_name)
         if flag_value is not None and flag_value < 1:
             raise ValueError(f"--{flag_name.replace('_', '-')} must be >= 1 when provided")
 
-    if args.input_prototype_holdout_per_class is not None and args.input_prototype_holdout_per_class < 1:
-        raise ValueError("--input-prototype-holdout-per-class must be >= 1 when provided")
-    if args.input_prototype_holdout_frac is not None:
-        if args.input_prototype_holdout_frac <= 0 or args.input_prototype_holdout_frac >= 1:
-            raise ValueError("--input-prototype-holdout-frac must be in (0, 1)")
-    if (
-        args.input_prototype_holdout_per_class is not None
-        or args.input_prototype_holdout_frac is not None
-    ) and not args.track_input_prototypes and args.train_input_prototypes is None:
-        print("Warning: input prototype holdout sizing was provided without input prototype tracking; ignoring holdout.")
-
-    if args.memorization_outlier_frac <= 0 or args.memorization_outlier_frac >= 1:
-        raise ValueError("--memorization-outlier-frac must be in (0, 1)")
+    input_proto_counts = _build_input_prototype_counts(args)
+    input_proto_source = parse_input_prototype_source(args.input_prototype_source)
+    if input_proto_counts and input_proto_source["mode"] is None:
+        raise ValueError("Input prototype subset counts require --input-prototype-source.")
+    if input_proto_source["mode"] not in (None, "generate", "from", "none"):
+        raise ValueError("Unsupported input prototype source mode.")
+    if input_proto_source["mode"] == "none" and input_proto_counts:
+        raise ValueError("--input-prototype-source none cannot be combined with input prototype subset counts.")
+    if input_proto_source["mode"] in ("generate", "from") and not input_proto_counts:
+        raise ValueError(
+            "Provide at least one of --input-boundary, --input-inliers, --input-x-outliers, or --input-y-outliers."
+        )
 
     # Validate gradient projection feature flags and conflicts
     if (args.proj_switch_step is not None) or (args.proj_top_l is not None) or args.proj_to_residual:
@@ -2696,17 +2184,6 @@ if __name__ == '__main__':
     if len(exclusive_modes) > 1:
         raise ValueError(f"Cannot use multiple training modes simultaneously: {', '.join(exclusive_modes)}. Please choose only one.")
 
-    if args.feature_prototypes and (args.classes is None or len(args.classes) != 2):
-        raise ValueError("--feature-prototypes requires specifying exactly two classes via --classes")
-
-    if args.lmax_decay_steps < 1:
-        raise ValueError("--lmax-decay-steps must be >= 1")
-    if args.lmax_decay_target_lr < 0:
-        raise ValueError("--lmax-decay-target-lr must be >= 0")
-    if args.lmax_decay and not args.lambdamax:
-        print("--lmax-decay requires --lambdamax; enabling lambda_max measurement.")
-        args.lambdamax = True
-    
     # ----- Measurement Selection -----
     measurements = {name for name, enabled in [
     ('lmax', args.lambdamax),
@@ -2722,7 +2199,6 @@ if __name__ == '__main__':
     ('final', args.final),
     ('param_distance', args.param_distance),
     ('hessian_trace', args.hessian_trace),
-    ('memorization_hessian_outliers', args.memorization_hessian_outliers),
     ('train_test_gap', args.train_test_gap),
     ('lmax_precond_adam', args.precond_lmax),
     ] if enabled}
@@ -2748,54 +2224,24 @@ if __name__ == '__main__':
     # --- Unpack dataset and build tuple_data ---
     train_x, train_y, test_x, test_y = data  
     tuple_data = (train_x, train_y, test_x, test_y)
+    original_train_len = int(train_x.shape[0])
 
-
-    use_new_proto_flags = args.train_input_prototypes is not None or args.test_input_prototypes is not None
-    train_proto_source = _parse_input_prototype_source(args.train_input_prototypes)
-    test_proto_source = _parse_input_prototype_source(args.test_input_prototypes)
-
-    if train_proto_source["mode"] is None and args.track_input_prototypes:
-        train_proto_source = {"mode": "generate", "value": None}
-
-    if test_proto_source["mode"] is None and train_proto_source["mode"] not in (None, "none"):
-        test_proto_source = {"mode": train_proto_source["mode"], "value": train_proto_source["value"]}
 
     input_proto_counts = _build_input_prototype_counts(args)
-
-    def _base_proto_count():
-        if args.input_prototypes_count is not None:
-            return args.input_prototypes_count
-        if args.input_prototypes_frac is not None:
-            return max(1, int(round(train_x.shape[0] * args.input_prototypes_frac)))
-        if not use_new_proto_flags:
-            if args.input_prototype_holdout_per_class is not None:
-                return args.input_prototype_holdout_per_class
-            if args.input_prototype_holdout_frac is not None:
-                return max(1, int(round(train_x.shape[0] * args.input_prototype_holdout_frac)))
-        return max(1, int(round(train_x.shape[0] * 0.05)))
-
-    n_proto = _base_proto_count()
+    input_proto_source = parse_input_prototype_source(args.input_prototype_source)
     proto_classes = (0, 1) if dataset == 'cifar10_2cls' else tuple(args.classes)
-    # Inlier pool must be large enough for inlier + y-outlier + x-outlier injection
-    n_inlier_needed = (
-        (args.train_input_inliers or 0)
-        + (args.train_input_y_outliers or 0)
-        + (args.train_input_x_outliers or 0)
-    )
-    n_boundary_needed = args.train_input_boundary or 0
-    if n_inlier_needed > 0 or n_boundary_needed > 0:
-        n_proto = max(n_proto, n_inlier_needed, n_boundary_needed)
-
-    train_prototype_data = None
-    train_prototype_indices = None
-    if train_proto_source["mode"] == "from":
+    selected_prototype_data = {}
+    selected_prototype_indices = None
+    all_prototype_data: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    all_prototype_indices: Optional[Dict[str, torch.Tensor]] = None
+    if input_proto_source["mode"] == "from":
         proto_path = resolve_input_prototype_path(
-            train_proto_source["value"],
+            input_proto_source["value"],
             results_root=RES_FOLDER,
             dataset=dataset,
             model=args.model,
         )
-        train_prototype_data, train_prototype_indices, proto_meta = load_input_prototype_package(proto_path)
+        all_prototype_data, all_prototype_indices, proto_meta = load_input_prototype_package(proto_path)
         _validate_input_prototype_metadata(
             proto_meta,
             dataset=dataset,
@@ -2803,265 +2249,72 @@ if __name__ == '__main__':
             dataset_seed=args.dataset_seed,
             num_data=args.num_data,
         )
-        train_prototype_data, train_prototype_indices = trim_prototype_sets(
-            train_prototype_data,
-            tuple(args.classes),
-            input_proto_counts,
-            train_prototype_indices,
+        # Only trim subsets actually present in the loaded package. The
+        # injection helper rebuilds x_outlier / y_outlier at run time from
+        # the inlier pool, so packages only need to store boundary + inliers.
+        available_counts = {
+            k: v for k, v in input_proto_counts.items() if k in all_prototype_data
+        }
+        selected_prototype_data, selected_prototype_indices = select_input_prototype_subsets(
+            all_prototype_data,
+            all_prototype_indices,
+            classes=proto_classes,
+            counts_by_subset=available_counts,
         )
         print(f"Loaded input prototypes from {proto_path}")
-    elif train_proto_source["mode"] == "generate":
-        train_prototype_data, train_prototype_indices = generate_prototype_sets(
-            train_x, train_y, proto_classes, n_prototype=n_proto,
-            n_boundary=n_boundary_needed if n_boundary_needed > 0 else None,
-            n_inlier=n_inlier_needed if n_inlier_needed > 0 else None,
+    elif input_proto_source["mode"] == "generate":
+        n_prototype, n_boundary, n_inlier = _generation_pool_sizes(input_proto_counts)
+        all_prototype_data, all_prototype_indices = generate_prototype_sets(
+            train_x,
+            train_y,
+            proto_classes,
+            n_prototype=n_prototype,
+            n_boundary=n_boundary,
+            n_inlier=n_inlier,
             return_indices=True,
         )
-        train_prototype_data, train_prototype_indices = trim_prototype_sets(
-            train_prototype_data,
-            proto_classes,
-            input_proto_counts,
-            train_prototype_indices,
+        available_counts = {
+            k: v for k, v in input_proto_counts.items() if k in all_prototype_data
+        }
+        selected_prototype_data, selected_prototype_indices = select_input_prototype_subsets(
+            all_prototype_data,
+            all_prototype_indices,
+            classes=proto_classes,
+            counts_by_subset=available_counts,
         )
+    input_proto_mode = args.input_prototypes_mode
+    prototype_data = dict(selected_prototype_data)
+    train_outlier_tracking: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
 
-    log_prototype_data = None
-    if test_proto_source["mode"] == "from":
-        proto_path = resolve_input_prototype_path(
-            test_proto_source["value"],
-            results_root=RES_FOLDER,
-            dataset=dataset,
-            model=args.model,
+    if prototype_data and input_proto_mode in ("train", "val"):
+        train_x, train_y, outlier_augments, train_outlier_tracking = _build_prototype_injection_subsets(
+            all_prototype_data=all_prototype_data,
+            all_prototype_indices=all_prototype_indices,
+            input_proto_counts=input_proto_counts,
+            train_x=train_x,
+            train_y=train_y,
+            classes=proto_classes,
         )
-        log_prototype_data, _, proto_meta = load_input_prototype_package(proto_path)
-        _validate_input_prototype_metadata(
-            proto_meta,
-            dataset=dataset,
-            classes=args.classes,
-            dataset_seed=args.dataset_seed,
-            num_data=args.num_data,
-        )
-        log_prototype_data, _ = trim_prototype_sets(
-            log_prototype_data,
-            tuple(args.classes),
-            input_proto_counts,
-            None,
-        )
-        print(f"Loaded test input prototypes from {proto_path}")
-    elif test_proto_source["mode"] == "generate":
-        log_prototype_data, _ = generate_prototype_sets(
-            train_x, train_y, proto_classes, n_prototype=n_proto, return_indices=True
-        )
-        log_prototype_data, _ = trim_prototype_sets(
-            log_prototype_data,
-            proto_classes,
-            input_proto_counts,
-            None,
-        )
-
-    prototype_data = log_prototype_data or train_prototype_data or {}
-    combined_prototype_data = dict(prototype_data)
-    if args.track_feature_prototypes_from:
-        tracked_feature_prototypes, _ = _load_reference_feature_prototypes(
-            dataset,
-            args.model,
-            args.track_feature_prototypes_from,
-        )
-        for name, tensors in tracked_feature_prototypes.items():
-            combined_prototype_data[name] = tensors
-        print(
-            f"Loaded feature-space prototypes from run {args.track_feature_prototypes_from} "
-            f"({len(tracked_feature_prototypes)} subsets)"
-        )
-
-    prototype_data = combined_prototype_data
-    prototype_data_for_aug = train_prototype_data
-
-    holdout_mode = args.input_prototypes_holdout
-    if holdout_mode == "auto":
-        if use_new_proto_flags and train_proto_source["mode"] not in (None, "none"):
-            holdout_mode = "boundary_inliers"
-        elif args.track_input_prototypes and (
-            args.input_prototype_holdout_per_class is not None or args.input_prototype_holdout_frac is not None
-        ):
-            holdout_mode = "boundary_inliers"
-        else:
-            holdout_mode = "none"
-
-    if holdout_mode == "boundary_inliers" and train_prototype_indices:
-        holdout_tensors = []
-        boundary_idx = train_prototype_indices.get("boundary") if train_prototype_indices else None
-        inlier_idx = train_prototype_indices.get("inliers") if train_prototype_indices else None
-        if boundary_idx is not None:
-            holdout_tensors.append(boundary_idx)
-        if inlier_idx is not None:
-            holdout_tensors.append(inlier_idx)
-        if holdout_tensors:
-            holdout_indices = torch.unique(torch.cat(holdout_tensors, dim=0))
-            if holdout_indices.numel() > 0:
-                orig_n = train_x.shape[0]
-                train_x, train_y = _drop_indices_from_dataset(train_x, train_y, holdout_indices)
-                removed = orig_n - train_x.shape[0]
-                print(
-                    f"[holdout] removed {removed} samples from training set for input prototypes "
-                    f"(boundary+inliers, {holdout_indices.numel()} unique indices)"
-                )
-                data = (train_x, train_y, test_x, test_y)
-                tuple_data = data
-    elif holdout_mode == "boundary_inliers" and train_proto_source["mode"] not in (None, "none"):
-        print("Warning: input prototype holdout requested but no indices were available; skipping holdout.")
-
-    has_injection = (args.train_input_x_outliers is not None or args.train_input_y_outliers is not None
-                     or args.train_input_inliers is not None or args.train_input_boundary is not None)
-
-    if has_injection and train_prototype_data is None:
-        raise ValueError("Training input injection requires train-input-prototypes.")
-
-    train_outlier_tracking = {}
-    if has_injection:
-        classes = proto_classes
-        if len(classes) != 2:
-            raise ValueError("Training input injection requires exactly two classes.")
-
-        # --- Partition the held-out pools for injection ---
-        # The saved prototype package contains:
-        #   boundary pool: all held-out boundary points
-        #   inliers pool:  all held-out inlier points (mutually exclusive with boundary)
-        #
-        # Injection partitions the inlier pool into three disjoint slices:
-        #   slice 0 → injected as inliers (correct label)
-        #   slice 1 → injected as y-outliers (flipped label)
-        #   slice 2 → injected as x-outliers (extrapolated, correct label)
-        # Boundary pool is injected directly.
-        # All partitioning uses deterministic per-class slicing (first N per class).
-
-        X_inlier_pool, Y_inlier_pool = prototype_data_for_aug["inliers"]
-        X_boundary_pool, Y_boundary_pool = prototype_data_for_aug["boundary"]
-
-        # Determine per-class counts needed from the inlier pool
-        n_inlier_inject = args.train_input_inliers or 0
-        n_y_outlier = args.train_input_y_outliers or 0
-        n_x_outlier = args.train_input_x_outliers or 0
-        n_boundary_inject = args.train_input_boundary or 0
-
-        # Validate pool sizes
-        inlier_labels = Y_inlier_pool.argmax(dim=1) if Y_inlier_pool.ndim > 1 else Y_inlier_pool.long()
-        boundary_labels = Y_boundary_pool.argmax(dim=1) if Y_boundary_pool.ndim > 1 else Y_boundary_pool.long()
-
-        inlier_needed_per_class = n_inlier_inject + n_y_outlier + n_x_outlier
-        for cls in classes:
-            n_avail_inlier = (inlier_labels == cls).sum().item()
-            if n_avail_inlier < inlier_needed_per_class:
-                raise ValueError(
-                    f"Inlier pool has {n_avail_inlier} samples for class {cls} but injection "
-                    f"needs {inlier_needed_per_class} (inlier={n_inlier_inject} + "
-                    f"y_outlier={n_y_outlier} + x_outlier={n_x_outlier}). "
-                    f"Increase the inlier pool size in the prototype package."
-                )
-            n_avail_boundary = (boundary_labels == cls).sum().item()
-            if n_avail_boundary < n_boundary_inject:
-                raise ValueError(
-                    f"Boundary pool has {n_avail_boundary} samples for class {cls} but "
-                    f"injection needs {n_boundary_inject}."
-                )
-
-        # Partition inlier pool by class into disjoint slices
-        outlier_augments = []
-
-        def _partition_pool_by_class(X, Y, classes, *slice_sizes):
-            """Split a pool into disjoint per-class slices.
-
-            Returns a list of (X_slice, Y_slice) tuples, one per slice_size entry.
-            """
-            labels = Y.argmax(dim=1) if Y.ndim > 1 else Y.long()
-            slices = [[] for _ in slice_sizes]
-            slice_labels = [[] for _ in slice_sizes]
-            for cls in classes:
-                cls_mask = labels == cls
-                cls_indices = cls_mask.nonzero(as_tuple=False).view(-1)
-                offset = 0
-                for i, sz in enumerate(slice_sizes):
-                    if sz > 0:
-                        sel = cls_indices[offset:offset + sz]
-                        slices[i].append(X[sel])
-                        slice_labels[i].append(Y[sel])
-                        offset += sz
-            result = []
-            for i in range(len(slice_sizes)):
-                if slice_sizes[i] > 0 and slices[i]:
-                    result.append((torch.cat(slices[i], dim=0), torch.cat(slice_labels[i], dim=0)))
-                else:
-                    result.append(None)
-            return result
-
-        inlier_slices = _partition_pool_by_class(
-            X_inlier_pool, Y_inlier_pool, classes,
-            n_inlier_inject, n_y_outlier, n_x_outlier,
-        )
-        inlier_slice, y_outlier_source, x_outlier_source = inlier_slices
-
-        # Inject inliers (correct labels, as-is)
-        if inlier_slice is not None:
-            X_in, Y_in = inlier_slice
-            train_outlier_tracking["inliers"] = (X_in, Y_in)
-            outlier_augments.append((X_in, _coerce_labels_like(train_y, Y_in)))
-
-        # Inject y-outliers (same images, flipped labels)
-        if y_outlier_source is not None:
-            X_ysrc, Y_ysrc = y_outlier_source
-            # Flip labels: class_0 ↔ class_1
-            y_labels = Y_ysrc.argmax(dim=1) if Y_ysrc.ndim > 1 else Y_ysrc.long()
-            flipped = torch.where(y_labels == classes[0], classes[1], classes[0])
-            train_outlier_tracking["y_outlier"] = (X_ysrc, flipped)
-            outlier_augments.append((X_ysrc, _coerce_labels_like(train_y, flipped)))
-
-        # Inject x-outliers (extrapolate source images along centroid axis, correct labels)
-        if x_outlier_source is not None:
-            X_xsrc, Y_xsrc = x_outlier_source
-            x_labels = Y_xsrc.argmax(dim=1) if Y_xsrc.ndim > 1 else Y_xsrc.long()
-            # Compute centroid direction from the base training set (post-holdout)
-            labels_all = train_y.argmax(dim=1) if train_y.ndim > 1 else train_y.long()
-            mask_0 = labels_all == classes[0]
-            mask_1 = labels_all == classes[1]
-            c0 = train_x[mask_0].view(mask_0.sum(), -1).mean(dim=0, keepdim=True)
-            c1 = train_x[mask_1].view(mask_1.sum(), -1).mean(dim=0, keepdim=True)
-            v_diff = c1 - c0  # [1, D]
-
-            X_flat = X_xsrc.view(X_xsrc.shape[0], -1)
-            extrapolated = torch.zeros_like(X_flat)
-            for i in range(X_flat.shape[0]):
-                if x_labels[i] == classes[0]:
-                    extrapolated[i] = X_flat[i] - EXTRAPOLATION_FACTOR * v_diff
-                else:
-                    extrapolated[i] = X_flat[i] + EXTRAPOLATION_FACTOR * v_diff
-            X_x_out = extrapolated.view_as(X_xsrc)
-            Y_x_out = x_labels.clone()
-            train_outlier_tracking["x_outlier"] = (X_x_out, Y_x_out)
-            outlier_augments.append((X_x_out, _coerce_labels_like(train_y, Y_x_out)))
-
-        # Inject boundary (as-is from boundary pool)
-        if n_boundary_inject > 0:
-            boundary_slices = _partition_pool_by_class(
-                X_boundary_pool, Y_boundary_pool, classes,
-                n_boundary_inject,
-            )
-            boundary_slice = boundary_slices[0]
-            if boundary_slice is not None:
-                X_b, Y_b = boundary_slice
-                train_outlier_tracking["boundary"] = (X_b, Y_b)
-                outlier_augments.append((X_b, _coerce_labels_like(train_y, Y_b)))
-
-        if outlier_augments:
+        if input_proto_mode == "train" and outlier_augments:
             aug_X = [train_x] + [payload[0] for payload in outlier_augments]
             aug_Y = [train_y] + [payload[1] for payload in outlier_augments]
             train_x = torch.cat(aug_X, dim=0)
             train_y = torch.cat(aug_Y, dim=0)
-            data = (train_x, train_y, test_x, test_y)
-            tuple_data = data
+        data = (train_x, train_y, test_x, test_y)
+        tuple_data = data
+
+    _validate_nonempty_prototype_subsets(
+        prototype_data,
+        context=f"prototype data ({input_proto_mode} mode)",
+        require_nonempty=(input_proto_mode == "val"),
+    )
 
     effective_train_len = int(train_x.shape[0])
     if effective_train_len == 0:
         raise ValueError("Training set is empty after holdout/augmentation.")
-    if batch_size > effective_train_len:
+    if full_batch_requested:
+        batch_size = effective_train_len
+    elif batch_size > effective_train_len:
         print(f"[batch] reducing batch size from {batch_size} to {effective_train_len} to match training set size")
         batch_size = effective_train_len
 
@@ -3144,49 +2397,15 @@ if __name__ == '__main__':
     else:
         checkpoint_every_n_steps = max(args.steps // 200, 1) if args.steps else None
     
-    knn_outlier_cfg = None
-    if args.knn_outliers:
-        if args.knn_neighbors < 2:
-            raise ValueError("--knn-neighbors must be >= 2 when --knn-outliers is set")
-        if args.knn_top_per_class < 1:
-            raise ValueError("--knn-top-per-class must be >= 1 when --knn-outliers is set")
-
-        knn_outlier_cfg = {
-            "enabled": True,
-            "k_neighbors": args.knn_neighbors,
-            "top_k_per_class": args.knn_top_per_class,
-            "feature_batch_size": args.knn_feature_batch,
-            "chunk_size": args.knn_chunk_size,
-            "normalize": not args.knn_no_normalize,
-            "return_neighbor_indices": True,
-        }
-
-    subset_tracking_cfgs = prepare_knn_subset_tracking_configs(args, dataset, args.model, data) if args.track_knn_outliers_from else []
-    subset_tracking_cfgs.extend(prepare_feature_prototype_subset_configs(prototype_data))
-    track_input_metrics = bool(prototype_data) or bool(train_outlier_tracking)
-    if track_input_metrics:
-        subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prototype_data, base_batch_size=batch_size))
-    
-    
+    subset_tracking_cfgs = []
     if train_outlier_tracking:
-        injected_tracking = {
-            f"injected_{name}": tensors
+        tracking_prefix = "injected" if input_proto_mode == "train" else "heldout"
+        prefixed_tracking = {
+            f"{tracking_prefix}_{name}": tensors
             for name, tensors in train_outlier_tracking.items()
         }
-        subset_tracking_cfgs.extend(prepare_prototype_subset_configs(injected_tracking, base_batch_size=batch_size))
+        subset_tracking_cfgs.extend(prepare_prototype_subset_configs(prefixed_tracking, base_batch_size=batch_size))
 
-
-    per_sample_cfg = None
-    if args.per_sample:
-        per_sample_cfg = {
-            'enabled': True,
-            'every': max(1, int(args.per_sample_every)),
-            'hist_min_log10': args.hist_min_log10,
-            'hist_max_log10': args.hist_max_log10,
-            'hist_bins': args.hist_bins,
-            'metrics': args.per_sample_metrics,   # ['loss','resid','kappa']
-            'no_frames': args.no_frames,
-        }
 
     # ----- Training Invocation -----
     train(
@@ -3221,7 +2440,6 @@ if __name__ == '__main__':
         use_gauss_newton=args.use_gauss_newton,
         precise_plots=args.precise_plots,
         rare_measure=args.rare_measure,
-        memorization_outlier_frac=args.memorization_outlier_frac,
         proj_switch_step=args.proj_switch_step,
         proj_top_l=args.proj_top_l,
         proj_to_residual=args.proj_to_residual,
@@ -3229,15 +2447,13 @@ if __name__ == '__main__':
         wandb_enabled=wandb_enabled,
         wandb_run_id=wandb_run_id,
         #NEW
-        per_sample_cfg=per_sample_cfg,
-        knn_outlier_cfg=knn_outlier_cfg,
         subset_tracking_cfgs=subset_tracking_cfgs,
         prototype_data=prototype_data,
         log_every_step=args.log_every_step,
-        dense_window=tuple(args.dense_window) if args.dense_window else None,
-        lmax_decay=args.lmax_decay,
-        lmax_decay_target_lr=args.lmax_decay_target_lr,
-        lmax_decay_steps=args.lmax_decay_steps,
+        dense_window=tuple(getattr(args, "dense_window", ())) if getattr(args, "dense_window", None) else None,
+        lmax_decay=getattr(args, "lmax_decay", False),
+        lmax_decay_target_lr=getattr(args, "lmax_decay_target_lr", None),
+        lmax_decay_steps=getattr(args, "lmax_decay_steps", 10000),
         lmax_decay_initial_lr=args.lr,
         lmax_drop=args.lmax_drop,
         lmax_drop_mult=args.lmax_drop_mult,
@@ -3245,26 +2461,3 @@ if __name__ == '__main__':
         lr_drop_at_step=args.lr_drop_at_step,
         lr_drop_to=args.lr_drop_to,
     )
-
-    if args.feature_prototypes:
-        print("Computing feature-space prototypes for export...")
-        feature_batch = args.feature_prototype_batch
-        features = extract_feature_matrix(
-            net=net,
-            inputs=train_x,
-            batch_size=feature_batch,
-            flatten_outputs=True,
-        )
-        proto_sets, proto_meta = generate_feature_space_prototype_sets(
-            net=None,
-            Y_train=train_y,
-            classes=tuple(args.classes),
-            precomputed_features=features,
-            original_inputs=train_x,
-            normalize_features=not args.feature_prototype_no_normalize,
-            k_neighbors=args.feature_prototype_kneighbors,
-            prototypes_per_class=args.feature_prototype_topk,
-            extrapolation_factor=args.feature_prototype_extrapolation,
-        )
-        _save_feature_prototype_package(run_folder, proto_sets, proto_meta)
-        print(f"Feature-space prototypes saved to {run_folder / 'feature_prototypes'}")
