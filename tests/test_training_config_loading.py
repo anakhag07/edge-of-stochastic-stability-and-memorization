@@ -143,3 +143,26 @@ def test_scheduled_lr_drop_flags_can_come_from_json_config():
     assert args.lr == 0.01
     assert args.lr_drop_at_step == 100
     assert args.lr_drop_to == 0.002
+
+
+def test_dense_window_flags_parse():
+    args = parse_args_with_config(
+        build_parser(0.5),
+        ['--dense-window', '0', '2000', '32'],
+    )
+
+    assert args.dense_window == [0, 2000, 32]
+
+
+def test_dense_window_can_come_from_json_config():
+    config_path = _write_config(
+        {
+            'training': {
+                'dense_window': [0, 2000, 32],
+            },
+        }
+    )
+
+    args = parse_args_with_config(build_parser(0.5), ['--config', config_path])
+
+    assert args.dense_window == [0, 2000, 32]

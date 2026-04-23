@@ -137,6 +137,7 @@ def build_parser(extrapolation_factor: float) -> argparse.ArgumentParser:
     parser.add_argument('--results-rarely', '--results_rarely', action='store_true', help='If set, results will be recorded less frequently')
     parser.add_argument('--precise-plots', action='store_true', help='Enable more frequent measurements for precise plotting')
     parser.add_argument('--rare-measure', dest='rare_measure', action='store_true', help='Activate regime where expensive measurements are performed rarely')
+    parser.add_argument('--dense-window', dest='dense_window', nargs=3, type=int, default=None, metavar=('START', 'END', 'EVERY'), help='Temporarily increase measurement frequency inside a step window: start, end, and cadence.')
 
     # --- Noise and SDE Controls ---
     parser.add_argument('--gd-noise', '--gd_noise', type=str, default=None, help='Do noisy GD, to simulate SGD. Supported noises: sgd, diag, iso, const')
