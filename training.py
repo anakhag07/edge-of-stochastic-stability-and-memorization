@@ -1208,7 +1208,7 @@ class MeasurementRunner:
                 eos_threshold = 2.0 / optimizer.param_groups[0]['lr']
                 sharpness_metric = 'lmax'
             
-            if not getattr(self, '_t_star_logged', False) and metrics.get(sharpness_metric, float('nan')) >= eos_threshold:
+            if not getattr(self, '_t_star_logged', False) and step_number > 50 and metrics.get(sharpness_metric, float('nan')) >= eos_threshold:
                 self._t_star_logged = True
                 metrics['t_star'] = step_number
                 try:
