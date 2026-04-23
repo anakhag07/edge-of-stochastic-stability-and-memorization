@@ -82,7 +82,7 @@ python training.py \
   --loss ce \
   --batch full \
   --lr 0.01 \
-  --steps 150000 \
+  --steps 10000 \
   --init-scale 0.2 \
   --dataset-seed 888 \
   --init-seed 8312 \
@@ -92,8 +92,7 @@ python training.py \
   --input-inliers 25 \
   --input-x-outliers 25 \
   --input-y-outliers 25 \
-  --lambdamax \
-  --batch-sharpness
+  --lambdamax
 ```
 
 Validation mode example:
@@ -106,7 +105,7 @@ python training.py \
   --loss ce \
   --batch full \
   --lr 0.01 \
-  --steps 150000 \
+  --steps 10000 \
   --init-scale 0.2 \
   --dataset-seed 888 \
   --init-seed 8312 \
@@ -116,8 +115,7 @@ python training.py \
   --input-inliers 25 \
   --input-x-outliers 25 \
   --input-y-outliers 25 \
-  --lambdamax \
-  --batch-sharpness
+  --lambdamax
 ```
 
 ## Standard Training Run
