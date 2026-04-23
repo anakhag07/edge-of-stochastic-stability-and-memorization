@@ -65,7 +65,7 @@ python tools/generate_input_prototypes.py \
   --classes 1 9 \
   --num-data 10000 \
   --loss ce \
-  --dataset-seed 111 \
+  --dataset-seed 888 \
   --input-boundary 25 \
   --input-inliers 25 \
   --input-x-outliers 25 \
@@ -84,7 +84,7 @@ python training.py \
   --lr 0.01 \
   --steps 150000 \
   --init-scale 0.2 \
-  --dataset-seed 111 \
+  --dataset-seed 888 \
   --init-seed 8312 \
   --input-prototype-source from:$PROTO \
   --input-prototypes-mode train \
@@ -108,7 +108,7 @@ python training.py \
   --lr 0.01 \
   --steps 150000 \
   --init-scale 0.2 \
-  --dataset-seed 111 \
+  --dataset-seed 888 \
   --init-seed 8312 \
   --input-prototype-source generate \
   --input-prototypes-mode val \
@@ -141,7 +141,7 @@ python training.py \
   ```bash
   python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 \
     --steps 150000 --num-data 8192 \
-    --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
+    --init-scale 0.2 --dataset-seed 888 --init-seed 8312 \
     --stop-loss 0.00001 
     --lambdamax --batch-sharpness
   ```
@@ -209,7 +209,7 @@ Resume a run witch changed hyperparameters (e.g. reducing learning rate)
   ```bash
 python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 \
   --steps 150000 --num-data 8192 \
-  --init-scale 0.2 --dataset-seed 111 --init-seed 8312 \
+  --init-scale 0.2 --dataset-seed 888 --init-seed 8312 \
   --cont-run-id <run_id> --cont-step <approx_step> \
   ```
 

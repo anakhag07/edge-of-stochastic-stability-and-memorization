@@ -168,6 +168,11 @@ def build_parser(extrapolation_factor: float) -> argparse.ArgumentParser:
     parser.add_argument('--input-prototypes-mode', type=str, default='train', choices=['train', 'val'], help='Input prototype mode: train includes the selected prototype subsets in training; val excludes real-data subsets from training and tracks them as held-out evaluation sets.')
     parser.add_argument('--input-prototype-source', type=str, default=None, help='Input prototype source: generate | from:<path or run> | none')
     parser.add_argument('--input-x-outliers', type=int, default=None, help='Number of input-space x-outlier prototypes per class to include/track')
+    parser.add_argument('--x-outlier-mode', choices=['coherent', 'random_direction'], default='coherent',
+                        help='X-outlier displacement mode: "coherent" (along v_diff, default) or '
+                             '"random_direction" (random orthogonal directions, same displacement magnitude)')
+    parser.add_argument('--random-direction-seed', type=int, default=42,
+                        help='RNG seed for random_direction x-outlier mode (default 42)')
     parser.add_argument('--input-y-outliers', type=int, default=None, help='Number of input-space y-outlier prototypes per class to include/track')
     parser.add_argument('--input-inliers', type=int, default=None, help='Number of input-space inlier prototypes per class to include/track')
     parser.add_argument('--input-boundary', type=int, default=None, help='Number of input-space boundary prototypes per class to include/track')
