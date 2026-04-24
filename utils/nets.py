@@ -2,7 +2,7 @@ import torch as T
 import torch
 import torch.nn as nn
 
-from utils.resnet_new import resnet14, resnet20, ResNet
+from utils.resnet_new import resnet14, resnet20, ResNet, BasicBlock
 from utils.resnet_bn import resnet10 as resnet10_bn, ResNet as ResNetBN
 import torch.nn.functional as F
 
@@ -351,7 +351,11 @@ def initialize_resnet(net, scale=None):
             # torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
                 torch.nn.init.constant_(m.bias, 0)
-        
+
+    for m in net.modules():
+        if isinstance(m, BasicBlock):
+            torch.nn.init.zeros_(m.conv2.weight)
+
     T.nn.init.normal_(net.linear.weight, std=scale)
 
 
