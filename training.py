@@ -1230,6 +1230,9 @@ class MeasurementRunner:
             if isinstance(optimizer, (optim.Adam, optim.AdamW)):
                 eos_threshold = 38.0 / optimizer.param_groups[0]['lr']
                 sharpness_metric = 'lmax_precond_adam'
+            elif self.batch_size < self.X.shape[0]:
+                eos_threshold = 2.0 / optimizer.param_groups[0]['lr']
+                sharpness_metric = 'batch_sharpness'
             else:
                 eos_threshold = 2.0 / optimizer.param_groups[0]['lr']
                 sharpness_metric = 'lmax'
@@ -2562,6 +2565,11 @@ if __name__ == '__main__':
     parser.add_argument('--train-input-x-outliers', type=int, default=None,
                         help='Augment the training set with this many input-space x-outliers per class; '
                              'also logs input-space prototype subsets')
+    parser.add_argument('--x-outlier-mode', choices=['coherent', 'random_direction'], default='coherent',
+                        help='X-outlier displacement mode: "coherent" (along v_diff, default) or '
+                             '"random_direction" (random orthogonal directions, same displacement magnitude)')
+    parser.add_argument('--random-direction-seed', type=int, default=42,
+                        help='RNG seed for random_direction x-outlier mode (default 42)')
     parser.add_argument('--train-input-y-outliers', type=int, default=None,
                         help='Augment the training set with this many input-space y-outliers per class; '
                              'also logs input-space prototype subsets')
@@ -3014,25 +3022,37 @@ if __name__ == '__main__':
             train_outlier_tracking["y_outlier"] = (X_ysrc, flipped)
             outlier_augments.append((X_ysrc, _coerce_labels_like(train_y, flipped)))
 
-        # Inject x-outliers (extrapolate source images along centroid axis, correct labels)
         if x_outlier_source is not None:
             X_xsrc, Y_xsrc = x_outlier_source
             x_labels = Y_xsrc.argmax(dim=1) if Y_xsrc.ndim > 1 else Y_xsrc.long()
-            # Compute centroid direction from the base training set (post-holdout)
             labels_all = train_y.argmax(dim=1) if train_y.ndim > 1 else train_y.long()
             mask_0 = labels_all == classes[0]
             mask_1 = labels_all == classes[1]
             c0 = train_x[mask_0].view(mask_0.sum(), -1).mean(dim=0, keepdim=True)
             c1 = train_x[mask_1].view(mask_1.sum(), -1).mean(dim=0, keepdim=True)
-            v_diff = c1 - c0  # [1, D]
+            v_diff = c1 - c0
 
             X_flat = X_xsrc.view(X_xsrc.shape[0], -1)
             extrapolated = torch.zeros_like(X_flat)
-            for i in range(X_flat.shape[0]):
-                if x_labels[i] == classes[0]:
-                    extrapolated[i] = X_flat[i] - EXTRAPOLATION_FACTOR * v_diff
-                else:
-                    extrapolated[i] = X_flat[i] + EXTRAPOLATION_FACTOR * v_diff
+            displacement_norm = EXTRAPOLATION_FACTOR * v_diff.norm().item()
+
+            if args.x_outlier_mode == "random_direction":
+                rng = torch.Generator()
+                rng.manual_seed(args.random_direction_seed)
+                D = X_flat.shape[1]
+                v_unit = v_diff.view(-1) / v_diff.norm()
+                for i in range(X_flat.shape[0]):
+                    z = torch.randn(D, generator=rng)
+                    z = z - (z @ v_unit) * v_unit
+                    z = z / z.norm()
+                    extrapolated[i] = X_flat[i] + displacement_norm * z
+            else:
+                for i in range(X_flat.shape[0]):
+                    if x_labels[i] == classes[0]:
+                        extrapolated[i] = X_flat[i] - EXTRAPOLATION_FACTOR * v_diff
+                    else:
+                        extrapolated[i] = X_flat[i] + EXTRAPOLATION_FACTOR * v_diff
+
             X_x_out = extrapolated.view_as(X_xsrc)
             Y_x_out = x_labels.clone()
             train_outlier_tracking["x_outlier"] = (X_x_out, Y_x_out)
