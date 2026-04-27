@@ -61,16 +61,15 @@ Generate a reusable prototype package with:
 ```bash
 python tools/generate_input_prototypes.py \
   --dataset cifar10_2cls \
-  --model mlp \
   --classes 1 9 \
   --num-data 10000 \
-  --loss ce \
   --dataset-seed 888 \
   --input-boundary 25 \
   --input-inliers 25 \
   --input-x-outliers 25 \
   --input-y-outliers 25
 ```
+The generator's CLI is intentionally model- and loss-agnostic: prototypes are selected purely from input-space geometry (k-NN class ambiguity for boundary; nearest-centroid for inliers) and are therefore independent of the architecture or loss function used downstream.
 
 Train mode example:
 ```bash
