@@ -22,21 +22,13 @@ from utils.storage import create_plaintext_run_dir
 def main():
     parser = argparse.ArgumentParser(description="Generate deterministic input-space prototype sets.")
     parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="Model name used for results folder naming (does not affect prototypes).",
-    )
     parser.add_argument("--num-data", type=int, required=True)
     parser.add_argument("--classes", type=int, nargs="+", required=True)
     parser.add_argument("--dataset-seed", type=int, default=888)
-    parser.add_argument("--loss", type=str, default="mse", choices=["mse", "ce"])
     parser.add_argument("--input-boundary", type=int, default=None, help="Boundary prototypes per class")
     parser.add_argument("--input-inliers", type=int, default=None, help="Inlier prototypes per class")
     parser.add_argument("--input-x-outliers", type=int, default=None, help="X-outlier prototypes per class")
     parser.add_argument("--input-y-outliers", type=int, default=None, help="Y-outlier prototypes per class")
-    parser.add_argument("--tag", type=str, default="input_prototypes", help="Suffix appended to the run folder name.")
     args = parser.parse_args()
 
     if len(args.classes) != 2:
@@ -65,7 +57,7 @@ def main():
         args.num_data,
         args.classes,
         args.dataset_seed,
-        loss_type=args.loss,
+        loss_type="mse",
     )
 
     proto_classes = (0, 1) if args.dataset == "cifar10_2cls" else tuple(args.classes)
@@ -105,11 +97,11 @@ def main():
         classes=args.classes,
         dataset_seed=args.dataset_seed,
         num_data=args.num_data,
-        loss_type=args.loss,
+        loss_type="mse",
         counts_by_subset=saved_counts,
     )
 
-    run_dir = create_plaintext_run_dir(results_root, args.dataset, args.model, tag=args.tag)
+    run_dir = create_plaintext_run_dir(results_root, args.dataset, "geometric", tag="input_prototypes")
     target_dir = save_input_prototype_package(run_dir, prototypes, indices=indices, metadata=metadata)
     print(f"Saved input prototypes to {target_dir}")
 
