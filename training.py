@@ -2570,6 +2570,9 @@ if __name__ == '__main__':
                              '"random_direction" (random orthogonal directions, same displacement magnitude)')
     parser.add_argument('--random-direction-seed', type=int, default=42,
                         help='RNG seed for random_direction x-outlier mode (default 42)')
+    parser.add_argument('--input-extrapolation-factor', type=float, default=EXTRAPOLATION_FACTOR,
+                        help=f'Override extrapolation factor alpha for input-space x-outlier generation '
+                             f'(default {EXTRAPOLATION_FACTOR}).')
     parser.add_argument('--train-input-y-outliers', type=int, default=None,
                         help='Augment the training set with this many input-space y-outliers per class; '
                              'also logs input-space prototype subsets')
@@ -3034,7 +3037,8 @@ if __name__ == '__main__':
 
             X_flat = X_xsrc.view(X_xsrc.shape[0], -1)
             extrapolated = torch.zeros_like(X_flat)
-            displacement_norm = EXTRAPOLATION_FACTOR * v_diff.norm().item()
+            alpha = float(getattr(args, "input_extrapolation_factor", EXTRAPOLATION_FACTOR))
+            displacement_norm = alpha * v_diff.norm().item()
 
             if args.x_outlier_mode == "random_direction":
                 rng = torch.Generator()
@@ -3049,9 +3053,9 @@ if __name__ == '__main__':
             else:
                 for i in range(X_flat.shape[0]):
                     if x_labels[i] == classes[0]:
-                        extrapolated[i] = X_flat[i] - EXTRAPOLATION_FACTOR * v_diff
+                        extrapolated[i] = X_flat[i] - alpha * v_diff
                     else:
-                        extrapolated[i] = X_flat[i] + EXTRAPOLATION_FACTOR * v_diff
+                        extrapolated[i] = X_flat[i] + alpha * v_diff
 
             X_x_out = extrapolated.view_as(X_xsrc)
             Y_x_out = x_labels.clone()
