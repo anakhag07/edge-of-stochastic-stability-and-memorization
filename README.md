@@ -1,13 +1,10 @@
-# edge-of-stochastic-stability-and-memorization
-This repository builds on edge-of-stochastic-stability repo to quantify memorization during training and relationship to edge of stochastic stability and progressive sharpening. The information on the repository follows here. 
-
-## Edge of Stochastic Stability (EoSS)
-
-This repository accompanies the paper [Edge of Stochastic Stability: Revisiting the Edge of Stability for SGD](https://arxiv.org/abs/2412.20553) by Arseniy Andreyev and Pierfrancesco Beneventano. Feel free to reuse it in any way - if you ended up using this code, please consider citing it by citing our paper.
+# edge-of-stability-and-memorization
+This repository builds on edge-of-stochastic-stability repo [Edge of Stochastic Stability: Revisiting the Edge of Stability for SGD](https://arxiv.org/abs/2412.20553), with additional capabilities in tracking performance on different subsets of the data.
 
 ## Key Capabilities
 - Run training for MLP/CNN/ResNet on CIFAR-10/Fashion-MNIST/SVHN with SGD, SGDM, or Adam.
-- Measure core quantities: Batch Sharpness, $\lambda_{\max}$ (and other top eigenvalues of the Hessian of the loss), GNI, and Hessian trace.
+- Measure core quantities: $\lambda_{\max}$ (and other top eigenvalues of the Hessian of the loss), GNI, and Hessian trace.
+- Measure per-group metrics: loss, gradient norm, alignment to top eigenvector
 - Log to Weights & Biases for visualization, sweeps, and plots.
 - Restart runs from a checkpoint and change hyper-parameters mid-training.
 
@@ -84,7 +81,7 @@ python training.py \
   --steps 10000 \
   --init-scale 0.2 \
   --dataset-seed 888 \
-  --init-seed 8312 \
+  --init-seed 6543 \
   --input-prototype-source from:$PROTO \
   --input-prototypes-mode train \
   --input-boundary 25 \
@@ -107,7 +104,7 @@ python training.py \
   --steps 10000 \
   --init-scale 0.2 \
   --dataset-seed 888 \
-  --init-seed 8312 \
+  --init-seed 6543 \
   --input-prototype-source generate \
   --input-prototypes-mode val \
   --input-boundary 25 \
@@ -138,7 +135,7 @@ python training.py \
   ```bash
   python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 \
     --steps 150000 --num-data 8192 \
-    --init-scale 0.2 --dataset-seed 888 --init-seed 8312 \
+    --init-scale 0.2 --dataset-seed 888 --init-seed 6543 \
     --stop-loss 0.00001 
     --lambdamax --batch-sharpness
   ```
@@ -206,7 +203,7 @@ Resume a run witch changed hyperparameters (e.g. reducing learning rate)
   ```bash
 python training.py --dataset cifar10 --model mlp --batch 8 --lr 0.01 \
   --steps 150000 --num-data 8192 \
-  --init-scale 0.2 --dataset-seed 888 --init-seed 8312 \
+  --init-scale 0.2 --dataset-seed 888 --init-seed 6543 \
   --cont-run-id <run_id> --cont-step <approx_step> \
   ```
 
