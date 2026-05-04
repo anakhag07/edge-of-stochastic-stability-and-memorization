@@ -1,4 +1,4 @@
-# edge-of-stability-and-memorization
+# edge-of-stability-and-generalization
 This repository builds on edge-of-stochastic-stability repo [Edge of Stochastic Stability: Revisiting the Edge of Stability for SGD](https://arxiv.org/abs/2412.20553), with additional capabilities in tracking performance on different subsets of the data.
 
 ## Key Capabilities
